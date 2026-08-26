@@ -1,0 +1,13 @@
+# Credenciais reais - nunca sobe (ver titan_credenciais.ps1.example pro template)
+titan_credenciais.ps1
+
+# Dependencias / estado local de ferramentas
+node_modules/
+__pycache__/
+.wrangler/
+
+# Saidas/diagnosticos locais com dados reais de pedidos - nao sao codigo
+titan_debug/
+titan_exports/
+saida.json
+*.log

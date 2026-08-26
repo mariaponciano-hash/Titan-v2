@@ -1,0 +1,346 @@
+{
+  "name": "[Maria] Resposta automática do email - Gobeaute (CORRIGIDO - proposta)",
+  "nodes": [
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "tem-anexos",
+              "leftValue": "={{ $json.temAnexos }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1153997c-d10b-47bb-b7ce-b3ba5062de4b",
+      "name": "IF — Tem anexos?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Caminho SEM anexos — passa dados adiante limpo\nconst d = $input.first().json;\nreturn [{ json: d }];"
+      },
+      "id": "a04486a7-d25a-4e2a-9375-4c1d69bb3cf2",
+      "name": "Code — Sem anexos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst anexos = d.anexos || [];\n\n// Monta o email MIME multipart manualmente\nconst boundary = 'boundary_' + Date.now();\n\nconst toBase64Url = (str) => Buffer.from(str).toString('base64').replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');\n\n// CORRIGIDO (18/08/2026): adiciona Cc/Bcc ao cabecalho quando presentes -\n// antes o codigo nem lia esses campos. Gmail API processa Cc/Bcc dentro do\n// MIME 'raw' normalmente (Bcc e removido do que os outros destinatarios veem,\n// igual SMTP padrao).\nconst cabecalhos = [\n  'MIME-Version: 1.0',\n  'To: ' + d.para,\n];\nif (d.cc) cabecalhos.push('Cc: ' + d.cc);\nif (d.bcc) cabecalhos.push('Bcc: ' + d.bcc);\ncabecalhos.push('Subject: ' + d.assunto);\ncabecalhos.push('Content-Type: multipart/mixed; boundary=\"' + boundary + '\"');\ncabecalhos.push('');\n\nlet mime = cabecalhos.join('\\r\\n') + [\n  '--' + boundary,\n  'Content-Type: text/plain; charset=utf-8',\n  '',\n  d.mensagem,\n  ''\n].join('\\r\\n');\n\nanexos.forEach(function(anexo) {\n  mime += [\n    '--' + boundary,\n    'Content-Type: ' + (anexo.type || 'application/octet-stream') + '; name=\"' + anexo.name + '\"',\n    'Content-Transfer-Encoding: base64',\n    'Content-Disposition: attachment; filename=\"' + anexo.name + '\"',\n    '',\n    anexo.data,\n    ''\n  ].join('\\r\\n');\n});\n\nmime += '--' + boundary + '--';\n\nconst rawEmail = toBase64Url(mime);\n\nreturn [{ json: { ...d, rawEmail } }];"
+      },
+      "id": "119146e0-7a01-4bea-8915-681621244127",
+      "name": "Code — Montar MIME com anexos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        704
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "gmailOAuth2",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "raw",
+              "value": "={{ $json.rawEmail }}"
+            },
+            {
+              "name": "threadId",
+              "value": "={{ $json.threadId }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "eb76a4f7-d9b7-437e-99b2-f93e134a4ac5",
+      "name": "HTTP — Enviar com anexos",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -208,
+        704
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "yly35fkCSvwzvBly",
+          "name": "Tickets Gobeaute"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "thread",
+        "operation": "reply",
+        "threadId": "={{ $json.threadId }}",
+        "messageId": "={{ $json.messageId }}",
+        "message": "={{ $json.mensagem }}",
+        "options": {}
+      },
+      "id": "e98739f7-1485-4ab0-a780-a8e9c269a274",
+      "name": "Gmail — Enviar sem anexos",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        -208,
+        1056
+      ],
+      "webhookId": "1b4adaf3-2a34-42a0-a82f-b98fe9651362",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "yly35fkCSvwzvBly",
+          "name": "Tickets Gobeaute"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "enviar-resposta-ticket",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "ed69ad01-53f6-4064-9509-f93be74d7600",
+      "name": "Webhook1",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -848,
+        880
+      ],
+      "webhookId": "a5f1ce92-7572-48cb-bc78-1312c84e60cc"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\n\nconst paraRaw = body.para || '';\nconst ccRaw    = body.cc  || '';\nconst bccRaw   = body.bcc || '';\nconst assunto  = body.assunto   || '';\nconst mensagem = body.mensagem  || '';\nconst threadId  = body.thread_id  || '';\nconst messageId = body.message_id || '';\nconst anexos   = body.anexos || [];\n\n// CORRIGIDO (18/08/2026):\n// 1) match() sem /g so pegava o PRIMEIRO e-mail de uma lista separada por\n//    virgula - agora extrai todos.\n// 2) Le tambem cc/bcc, que antes nem eram lidos do body.\nconst extrairEmails = (raw) => (raw.match(/[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g) || []);\n\nconst para = extrairEmails(paraRaw).join(', ');\nconst cc   = extrairEmails(ccRaw).join(', ');\nconst bcc  = extrairEmails(bccRaw).join(', ');\n\nif (!para || !mensagem) {\n  throw new Error('Campos obrigatórios: para, mensagem');\n}\n\n// CORRIGIDO (18/08/2026): quando NAO existe thread previa (ticket novo, sem\n// nenhuma troca de e-mail ainda - ex: contato proativo de logistica), o node\n// nativo do Gmail no caminho \"sem anexos\" (operation: reply) EXIGE\n// threadId/messageId reais e vai falhar com threadId/messageId vazios. Por\n// isso, quando nao ha thread existente, forcamos o caminho de MIME manual\n// (que so chama messages.send da API do Gmail - nao depende de thread\n// existente) mesmo sem nenhum anexo de verdade.\nconst semThreadExistente = !threadId;\n\nreturn [{ json: { para, cc, bcc, assunto, mensagem, threadId, messageId, anexos, temAnexos: anexos.length > 0 || semThreadExistente } }];"
+      },
+      "id": "8a17438d-56c1-4707-bd8a-0e0f807b4075",
+      "name": "Code — Validar dados1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "tickets_gobeaute",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "thread_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Code — Validar dados1').item.json.threadId }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Precisa responder?",
+              "fieldValue": "=false"
+            },
+            {
+              "fieldId": "updated_at",
+              "fieldValue": "={{ new Date().toISOString() }}"
+            }
+          ]
+        }
+      },
+      "id": "76e565b1-06de-4573-aa24-dbc12b39c606",
+      "name": "Supabase — Marcar respondido1",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        32,
+        880
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "dinisx5zVBLlVfAL",
+          "name": "Supabase account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"success\": true, \"message\": \"Email enviado com sucesso\" }",
+        "options": {}
+      },
+      "id": "877dc9f2-c81e-4f88-b8b2-314f23500d9f",
+      "name": "Response — Sucesso1",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        240,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"success\": false, \"message\": \"Erro ao enviar email\" }",
+        "options": {
+          "responseCode": 500
+        }
+      },
+      "id": "2085f7be-ca87-49e5-89ee-898a40cdbbfd",
+      "name": "Response — Erro1",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        240,
+        992
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "IF — Tem anexos?": {
+      "main": [
+        [
+          {
+            "node": "Code — Montar MIME com anexos",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code — Sem anexos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Montar MIME com anexos": {
+      "main": [
+        [
+          {
+            "node": "HTTP — Enviar com anexos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Sem anexos": {
+      "main": [
+        [
+          {
+            "node": "Gmail — Enviar sem anexos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP — Enviar com anexos": {
+      "main": [
+        [
+          {
+            "node": "Supabase — Marcar respondido1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail — Enviar sem anexos": {
+      "main": [
+        [
+          {
+            "node": "Supabase — Marcar respondido1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Code — Validar dados1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Validar dados1": {
+      "main": [
+        [
+          {
+            "node": "IF — Tem anexos?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase — Marcar respondido1": {
+      "main": [
+        [
+          {
+            "node": "Response — Sucesso1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Response — Erro1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "82d71aaa-8830-4d82-8390-34d75de0743a",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "171f99811848621122d69c9bd23f7df7cdb206bf5e783e87001278135248b4a7"
+  },
+  "nodeGroups": [],
+  "id": "N7GyB1fJL9N0tYIm",
+  "tags": []
+}

@@ -1,0 +1,26 @@
+name = "titan-watcher-worker"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+# Conta RPA GOGROUP (migrado de Ivna.fragoso@gocase.com's Account em
+# 26/08/2026 - decisao da Ivna, envolve cobranca recorrente do Workers Paid
+# pro Browser Rendering funcionar de forma confiavel).
+account_id = "76a6687a71df8132dfbf4b4c761714ba"
+
+# Browser Rendering (25/08/2026) - substitui o titan_watcher.py que a Ivna
+# tinha que deixar rodando aberto no proprio PC. Isso roda um Chromium de
+# verdade dentro da infraestrutura da Cloudflare (nao e um Worker puro - Workers
+# sozinhos nao tem processo de navegador, ver conversa com a Ivna 25/08/2026).
+[browser]
+binding = "MYBROWSER"
+
+# Acorda sozinho a cada 5 minutos e processa o que estiver 'pendente' em
+# infos_titan (mesma tabela que a Torre/Unilog CD ja usam) - substitui o loop
+# "while True: sleep(15)" do titan_watcher.py por um agendamento de verdade.
+# Ajuste a frequencia aqui se quiser mais/menos frequente (sintaxe cron padrao).
+[triggers]
+crons = ["*/5 * * * *"]
+
+# Segredos (NAO colar aqui - configure via `wrangler secret put <NOME>` ou
+# pelo painel Cloudflare, Workers & Pages > titan-watcher-worker > Settings >
+# Variables > Encrypt): TITAN_EMAIL, TITAN_SENHA, TITAN_SB_URL, TITAN_SB_KEY.

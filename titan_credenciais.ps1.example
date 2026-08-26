@@ -1,0 +1,6 @@
+# Copie este arquivo pra "titan_credenciais.ps1" (sem o .example) na mesma
+# pasta e preencha com a senha real - titan_credenciais.ps1 fica de fora do
+# Git (.gitignore) de proposito, nunca sobe pro GitHub. Sem esse arquivo,
+# rodar_titan_backfill_diario.ps1 e rodar_titan_watcher.ps1 nao funcionam.
+$env:TITAN_EMAIL = 'sacgobeauty@unilog.com'
+$env:TITAN_SENHA = 'sua-senha-aqui'
