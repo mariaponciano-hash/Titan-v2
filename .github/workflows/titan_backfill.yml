@@ -1,0 +1,48 @@
+name: Titan backfill diario
+
+# Roda o titan_backfill.py duas vezes por dia (06h e 20h horario de Brasilia,
+# = 09h e 23h UTC - Brasil nao tem horario de verao desde 2019, entao esse
+# offset fixo de -3h nao muda ao longo do ano) pra uma janela deslizante dos
+# ultimos 10 dias ate hoje, sem depender do PC da Ivna estar ligado - mesmo
+# motivo do titan_watcher.py ter virado titan_cf_worker. Substitui a Tarefa
+# Agendada "TitanBackfillDiario" do Windows (ver rodar_titan_backfill_diario.ps1)
+# - desativar essa tarefa localmente depois de confirmar que isso funciona,
+# pra nao rodar em duplicidade (upsert e idempotente, mas gasta tempo/execucao
+# a toa).
+on:
+  schedule:
+    - cron: '0 9 * * *'   # 06:00 BRT
+    - cron: '0 23 * * *'  # 20:00 BRT
+  workflow_dispatch: {}   # permite rodar manualmente pela aba Actions, pra testar
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: |
+          pip install playwright openpyxl
+          playwright install --with-deps chromium
+
+      - name: Calcular janela de 10 dias
+        id: janela
+        run: |
+          echo "inicial=$(date -d '-10 days' +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
+          echo "final=$(date +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
+
+      - name: Rodar backfill
+        env:
+          TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
+          TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
+        run: |
+          python titan_backfill.py \
+            --data-inicial "${{ steps.janela.outputs.inicial }}" \
+            --data-final "${{ steps.janela.outputs.final }}" \
+            --headless
