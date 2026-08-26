@@ -1580,7 +1580,17 @@ function renderTorre() {
   var el = document.getElementById('main-content');
   if (!el) return;
   el.classList.add('torre-ativo');
-  var marcaOpts = TORRE_MARCAS.map(function(m) {
+  // So mostra as marcas do contexto atual (Gobeaute x Gocase, mesmo toggle
+  // do sidebar - 26/08/2026, a pedido da Ivna): evita oferecer Gocase como
+  // opcao quando ela esta trabalhando em Gobeaute, e vice-versa.
+  var marcasContexto = TORRE_MARCAS.filter(function(m) {
+    if (m.id === 'auto') return true;
+    return CURRENT_MARCA === 'gocase' ? m.id === 'gocase' : m.id !== 'gocase';
+  });
+  if (torreState.marca !== 'auto' && !marcasContexto.some(function(m) { return m.id === torreState.marca; })) {
+    torreState.marca = 'auto';
+  }
+  var marcaOpts = marcasContexto.map(function(m) {
     return '<option value="' + m.id + '"' + (torreState.marca === m.id ? ' selected' : '') + '>' + tEsc(m.nome) + '</option>';
   }).join('');
 
@@ -1589,7 +1599,7 @@ function renderTorre() {
     +   '<div class="torre-search-row">'
     +     '<div class="torre-search-field">'
     +       '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4.3-4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
-    +       '<input type="text" id="torre-termo" placeholder="Buscar por NF, nº do pedido ou CPF..." value="' + tEsc(torreState.termo) + '" onkeydown="if(event.key===\'Enter\')torreBuscar()">'
+    +       '<input type="text" id="torre-termo" placeholder="Buscar por nº do pedido ou CPF..." value="' + tEsc(torreState.termo) + '" onkeydown="if(event.key===\'Enter\')torreBuscar()">'
     +     '</div>'
     +     '<select class="filter-select" id="torre-marca" style="padding:11px 14px;border-radius:24px">' + marcaOpts + '</select>'
     +     '<button class="torre-btn" id="torre-btn-buscar" onclick="torreBuscar()"' + (torreState.carregando ? ' disabled' : '') + '>'
@@ -2411,7 +2421,7 @@ function torreBuscar() {
   var sel = document.getElementById('torre-marca');
   var termo = inp ? inp.value.trim() : '';
   if (sel) torreState.marca = sel.value;
-  if (!termo) { alert('Digite a NF, o nº do pedido ou o CPF do cliente.'); return; }
+  if (!termo) { alert('Digite o nº do pedido ou o CPF do cliente.'); return; }
   torreState.termo = termo;
   torreState.formAberto = false;
   torreState.resultadoEnvio = null;

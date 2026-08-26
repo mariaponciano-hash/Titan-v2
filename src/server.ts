@@ -2338,6 +2338,25 @@ export default {
         if (termo.length > 60) return Response.json({ error: 'termo muito longo' }, { status: 400 });
 
         const tipo = classificarTermo(termo);
+        // Busca por NF pura desativada (26/08/2026, a pedido da Ivna): a
+        // Intelipost nao aceita NF como chave, entao o unico caminho era
+        // resolver via ticket historico OU (sem ticket) mandar o mesmo numero
+        // pra Intelipost/Shopify como se fosse pedido/rastreio - e isso ja
+        // gerou um bug real de PEDIDO ERRADO por coincidencia numerica (ver
+        // comentario grande em torreBuscarNaMarca, tipo==='nf', 25/08/2026).
+        // A validacao adicionada la mitiga mas nao elimina o risco pra
+        // pedidos sem NF preenchida ainda. Mais seguro nao tentar: pedido sem
+        // ticket e sem NF/pedido resolvivel direto fica pro Unilog CD (que
+        // le o infos_titan) ou pro numero do pedido mesmo.
+        if (tipo === 'nf') {
+          return Response.json({
+            encontrado: false,
+            termo,
+            tipo_busca: tipo,
+            marcas_tentadas: [],
+            error: `Busca por NF não é suportada com segurança pela Torre (risco de achar o pedido errado por coincidência numérica) - use o número do pedido, ou confira na Unilog CD/Titan BI se só tiver a NF.`,
+          }, { status: 400 });
+        }
         let candidatas: MarcaLogistica[];
         if (marcaId && marcaId !== 'auto') {
           const m = getMarcaLogistica(marcaId);
