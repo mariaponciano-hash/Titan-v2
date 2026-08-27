@@ -49,10 +49,16 @@ DUPLICATA DE ARQUIVO: se mais de um PDF bater pro mesmo romaneio
 (aconteceu no print real - 166282 apareceu duas vezes, datas diferentes),
 pega o mais recente por modifiedTime.
 
-PAGINACAO NO SUPABASE (corrigido 27/08/2026): a primeira versao nao
-paginava - PostgREST corta em 1000 linhas por padrao, e "1000
-pedido(s)... " no primeiro log era bem provavelmente esse teto, nao o
-total real. Agora pagina em blocos ate a pagina vir vazia.
+PAGINACAO E JANELA DE TEMPO (corrigido 27/08/2026, dois problemas reais):
+1. A primeira versao nao paginava - PostgREST corta em 1000 linhas por
+   padrao, e "1000 pedido(s)..." no primeiro log era esse teto, nao o
+   total real. Ainda pagina em blocos (PAGINA=1000).
+2. Sem limite de data, a consulta achou mais de 249 MIL linhas historicas
+   sem link (o backfill original cobre meses de pedidos ja embarcados ha
+   tempo) - OFFSET tao fundo (pagina ~250) estourou statement timeout do
+   Postgres (57014). Agora so considera pedidos EMBARCADO nos ultimos
+   JANELA_DIAS (45) dias, por atualizado_em - suficiente, ja que EMBARCADO
+   e status final e atualizado_em nao muda mais depois disso.
 
 SEM LIMITE DE TENTATIVAS: um romaneio que nunca acha PDF correspondente
 (documento ainda nao subiu na pasta) e retentado em toda execucao pra
@@ -69,6 +75,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 SUPABASE_URL = "https://ozwcyrkzsqzmavjtsmsp.supabase.co"
 SUPABASE_KEY = "sb_publishable_CPF6bT_HC0jkTvYWnxHmDg_61qaWqSQ"
@@ -79,6 +86,15 @@ GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 ROMANEIOS_FOLDER_ID = "1EHi3gB7b0fYZ7nDODjWWyzcRRAlBFdlj"
 
 PAGINA = 1000
+# So considera pedidos EMBARCADO recentemente (por atualizado_em, que pra um
+# pedido ja EMBARCADO reflete quando ele chegou nesse status - o recheck
+# nao toca mais nele depois, EMBARCADO e status final). Motivo (27/08/2026):
+# sem essa janela, a consulta achou mais de 249 MIL linhas historicas sem
+# link (o backfill original cobriu meses de pedidos ja embarcados havia
+# tempo) - paginar isso com OFFSET estourava statement timeout do Postgres
+# depois de ~250 paginas, e documento de romaneio de pedido tao antigo
+# provavelmente nem serve mais pra nada pratico.
+JANELA_DIAS = 45
 
 
 def _http_json(method, url, headers=None, data=None, form=False, tentativas=3):
@@ -147,13 +163,24 @@ def buscar_pendentes_de_link():
     de 1000 linhas do PostgREST."""
     resultado = []
     offset = 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=JANELA_DIAS)).isoformat()
     while True:
         q = (
             f"{TABELA}?situacao=eq.EMBARCADO&romaneio=not.is.null"
-            f"&romaneio_link=is.null&select=numero_nf,marca,romaneio"
+            f"&romaneio_link=is.null&atualizado_em=gte.{urllib.parse.quote(cutoff)}"
+            f"&select=numero_nf,marca,romaneio"
             f"&limit={PAGINA}&offset={offset}"
         )
-        pagina = _supabase_request("GET", q) or []
+        try:
+            pagina = _supabase_request("GET", q) or []
+        except urllib.error.HTTPError as e:
+            # 57014 = statement timeout do Postgres (aconteceu com OFFSET
+            # fundo antes da janela de dias existir, 27/08/2026 - mais de
+            # 249 mil linhas historicas sem link). Com a janela isso nao
+            # deve mais acontecer, mas se acontecer, usa o que ja tem em vez
+            # de derrubar a execucao inteira - a proxima rodada continua.
+            print(f"  pagina offset={offset} falhou ({e.code}), parando com o que ja tenho.", file=sys.stderr)
+            break
         resultado.extend(pagina)
         if len(pagina) < PAGINA:
             break
