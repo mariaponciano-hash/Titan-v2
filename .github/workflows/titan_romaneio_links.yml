@@ -1,0 +1,30 @@
+name: Titan romaneio links
+
+# Roda 15 min depois do backfill (09h15 e 23h15 UTC = 06h15/20h15 BRT), pra
+# dar tempo do backfill ja ter deixado situacao=EMBARCADO fresquinho antes
+# desta rodada tentar casar com os PDFs da pasta Romaneios do Drive. So
+# leitura no Drive (escopo drive.readonly) e escrita no Supabase - nunca
+# mexe no Titan/Cloudflare.
+on:
+  schedule:
+    - cron: '15 9 * * *'   # 06:15 BRT
+    - cron: '15 23 * * *'  # 20:15 BRT
+  workflow_dispatch: {}
+
+jobs:
+  romaneio-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Rodar
+        env:
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+        run: python titan_romaneio_links.py
