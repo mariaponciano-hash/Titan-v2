@@ -164,9 +164,17 @@ def login(page, email, senha):
         raise
 
     try:
-        page.get_by_role("button", name="Entrar", exact=True).click()
+        try:
+            page.get_by_role("button", name="Entrar", exact=True).click()
+        except PWTimeout:
+            page.get_by_text("Entrar", exact=True).first.click()
     except PWTimeout:
-        page.get_by_text("Entrar", exact=True).first.click()
+        # Unico ponto do login que nao salvava diagnostico nenhum na falha
+        # (achado 27/08/2026 rodando no GitHub Actions - sem isso, nao dava
+        # pra saber se o botao simplesmente nao apareceu, se um CAPTCHA/
+        # bloqueio por IP de datacenter surgiu, ou outra coisa).
+        salvar_diagnostico(page, "login_botao_entrar_nao_encontrado")
+        raise
 
     # Depois do clique, o botao mostra "Autenticando no TitanBI..." com um
     # spinner por um tempo - networkidle sozinho dispara ANTES desse processo

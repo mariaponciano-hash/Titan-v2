@@ -46,3 +46,15 @@ jobs:
             --data-inicial "${{ steps.janela.outputs.inicial }}" \
             --data-final "${{ steps.janela.outputs.final }}" \
             --headless
+
+      # O runner some ao fim do job - sem isso, o print/HTML que
+      # salvar_diagnostico() grava em titan_debug/ na falha ficaria
+      # inacessivel (diferente de rodar no PC, onde a pasta fica ali pra
+      # abrir direto). "if: failure()" so sobe quando o passo anterior falhou.
+      - name: Subir diagnostico (so se falhar)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: titan_debug
+          path: titan_debug/
+          retention-days: 7
