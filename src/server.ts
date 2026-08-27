@@ -2100,6 +2100,9 @@ async function torreBuscarNaMarca(env: any, marca: MarcaLogistica, termo: string
   let shopify: any = null;
   let termoIntelipost = termo;
   let outrosPedidos: any[] = [];
+  // So true quando o achado veio do endpoint exato /invoice/{nf} - usado pra
+  // saber se a validacao de seguranca abaixo se aplica (ver tipo==='nf').
+  let resolvidoPorNf = false;
   // Preenche o papel que a Shopify faz pras outras marcas (achar o pedido a
   // partir de NF/CPF/rastreio, endereco, itens) - a Gocase nao tem Shopify,
   // entao usa o Factory (ver buscarPedidoGocase). O rastreio em si vem da
@@ -2139,20 +2142,27 @@ async function torreBuscarNaMarca(env: any, marca: MarcaLogistica, termo: string
     }));
     outrosPedidos = outrosPedidos.filter((p) => p.numero_pedido !== termoIntelipost);
   } else if (tipo === 'nf') {
-    // NF E buscavel direto na Intelipost via GET /shipment_order/invoice/{nf}
-    // (achado 26/08/2026 na documentacao oficial - docs.intelipost.com.br -
-    // depois de pesquisar por "nota fiscal": o comentario antigo aqui dizia
-    // que NF nao era buscavel porque so tinham sido testados os 3 endpoints
-    // por pedido/rastreio/sales_order_number, nunca esse). Isso substitui o
-    // caminho antigo (tabela de tickets como tradutora NF->pedido, com
-    // fallback de mandar a NF pra Intelipost como se fosse pedido quando nao
-    // achava ticket - fallback que causou um bug real de PEDIDO ERRADO por
-    // coincidencia numerica, ver validacao de seguranca logo abaixo). Esse
-    // endpoint e a propria Intelipost resolvendo a NF, sem chute nenhum.
+    // So chega aqui pra Apice (o handler de /api/logistica/buscar bloqueia
+    // tipo==='nf' pra qualquer outra marca/"auto" - NF colide entre marcas
+    // diferentes, ver comentario la). NF E buscavel direto na Intelipost via
+    // GET /shipment_order/invoice/{nf} (achado 26/08/2026 na documentacao
+    // oficial - docs.intelipost.com.br - depois de pesquisar por "nota
+    // fiscal": o comentario antigo aqui dizia que NF nao era buscavel porque
+    // so tinham sido testados os 3 endpoints por pedido/rastreio, nunca
+    // esse). Tenta a NF primeiro (exato, sem chute). Apice tambem e a unica
+    // marca cujo numero de pedido e so digitos (sem sufixoPedido em
+    // MARCAS_LOGISTICA) - o mesmo termo pode ser um NUMERO DE PEDIDO em vez
+    // de NF, entao se a NF nao achar nada tenta como pedido antes de
+    // desistir (bug real, 26/08/2026: sem esse fallback, buscar um pedido
+    // Apice pelo proprio numero simplesmente nunca achava nada).
     intelipost = await buscarIntelipostPorNF(env, marca, termo);
     if (intelipost && intelipost.order_number) {
+      resolvidoPorNf = true;
       termoIntelipost = String(intelipost.order_number);
       shopify = await buscarShopifyPorNome(env, marca, termoIntelipost);
+    } else {
+      intelipost = await buscarIntelipost(env, marca, termo);
+      shopify = await buscarShopifyPorNome(env, marca, termo);
     }
     if (!intelipost && !shopify) return null;
   } else {
@@ -2179,15 +2189,20 @@ async function torreBuscarNaMarca(env: any, marca: MarcaLogistica, termo: string
     ? normalizarIntelipost(intelipost)
     : { encontrado: false, pedido: {}, transportadora: {}, remetente: {}, destinatario: {}, kpi: {}, timeline: [] };
 
-  // VALIDACAO DE SEGURANCA pra busca por NF - hoje redundante (buscarIntelipostPorNF
-  // ja resolve pela propria Intelipost, sem chute), mas mantida como
-  // cinto-e-suspensorio barato: ate 25/08/2026 o caminho antigo (fallback que
-  // mandava a NF pra Intelipost como se fosse pedido quando nao achava ticket
-  // historico) causou um bug real de PEDIDO ERRADO por coincidencia numerica
-  // (NF 886691 sem ticket bateu num pedido real da Apice cuja NF de verdade
-  // era 231787). So valida quando o pedido encontrado TEM uma NF preenchida
-  // (pedido novo sem NF ainda emitida nao tem o que comparar).
-  if (tipo === 'nf' && base.pedido && base.pedido.numero_nf && String(base.pedido.numero_nf).trim() !== String(termo).trim()) {
+  // VALIDACAO DE SEGURANCA pra busca por NF - so entra quando o achado veio
+  // mesmo do endpoint exato /invoice/{nf} (resolvidoPorNf), NUNCA quando
+  // tipo==='nf' caiu no fallback por numero de pedido (achado real,
+  // 26/08/2026: um pedido Apice achado pelo PROPRIO numero de pedido quase
+  // sempre tem uma NF DIFERENTE desse numero - comparar contra o termo
+  // rejeitaria toda busca por pedido legitima). Mantida como
+  // cinto-e-suspensorio barato pro caminho que ainda importa: ate 25/08/2026
+  // o fallback antigo (mandava a NF pra Intelipost como se fosse pedido
+  // quando nao achava ticket historico) causou um bug real de PEDIDO ERRADO
+  // por coincidencia numerica (NF 886691 sem ticket bateu num pedido real da
+  // Apice cuja NF de verdade era 231787). So valida quando o pedido
+  // encontrado TEM uma NF preenchida (pedido novo sem NF ainda emitida nao
+  // tem o que comparar).
+  if (resolvidoPorNf && base.pedido && base.pedido.numero_nf && String(base.pedido.numero_nf).trim() !== String(termo).trim()) {
     return null;
   }
 
@@ -2348,17 +2363,26 @@ export default {
         if (!termo) return Response.json({ error: 'informe um termo de busca' }, { status: 400 });
         if (termo.length > 60) return Response.json({ error: 'termo muito longo' }, { status: 400 });
 
-        let tipo = classificarTermo(termo);
-        // Apice e a unica marca cujo numero de pedido e so digitos, sem
-        // prefixo "SH..." (ver tabela real: 1504369, 1503462... - nenhum
-        // sufixoPedido em MARCAS_LOGISTICA pra ela por causa disso). Sem essa
-        // excecao, um pedido Apice buscado com a marca ja selecionada caia
-        // sempre em tipo==='nf' e era bloqueado pela regra abaixo (bug real
-        // achado pela Ivna, 26/08/2026, minutos depois de desativar a busca
-        // por NF). So reclassifica quando a marca foi escolhida
-        // explicitamente como Apice - com "auto" nao da pra saber se e um
-        // pedido Apice ou uma NF de outra marca, entao mantem o bloqueio.
-        if (tipo === 'nf' && marcaId === 'apice') tipo = 'pedido';
+        const tipo = classificarTermo(termo);
+        // NF so e segura quando escopada a UMA marca por vez - NF nao e
+        // unica entre marcas diferentes (cada uma numera do zero na sua
+        // propria conta Intelipost; confirmado por Ivna, 26/08/2026: a NF
+        // 150956 em modo "auto" bateu num pedido real da Lescent sem nenhuma
+        // relacao, so por a mesma NF existir por coincidencia nas duas
+        // contas). Restrito a Apice por pedido dela: as outras 6 marcas com
+        // sufixo "SH..." ja tem busca por numero do pedido 100% confiavel,
+        // entao nao precisam de NF; Apice e a excecao (numero de pedido dela
+        // diverge do numero do pedido no Titan, entao NF e a unica chave em
+        // comum - ver torreBuscarNaMarca, tipo==='nf').
+        if (tipo === 'nf' && marcaId !== 'apice') {
+          return Response.json({
+            encontrado: false,
+            termo,
+            tipo_busca: tipo,
+            marcas_tentadas: [],
+            error: `Busca por NF só é suportada pra Apice (NF pode coincidir entre marcas diferentes) - selecione "Apice", ou use o número do pedido para as demais marcas.`,
+          }, { status: 400 });
+        }
         let candidatas: MarcaLogistica[];
         if (marcaId && marcaId !== 'auto') {
           const m = getMarcaLogistica(marcaId);
