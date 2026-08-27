@@ -2337,7 +2337,17 @@ export default {
         if (!termo) return Response.json({ error: 'informe um termo de busca' }, { status: 400 });
         if (termo.length > 60) return Response.json({ error: 'termo muito longo' }, { status: 400 });
 
-        const tipo = classificarTermo(termo);
+        let tipo = classificarTermo(termo);
+        // Apice e a unica marca cujo numero de pedido e so digitos, sem
+        // prefixo "SH..." (ver tabela real: 1504369, 1503462... - nenhum
+        // sufixoPedido em MARCAS_LOGISTICA pra ela por causa disso). Sem essa
+        // excecao, um pedido Apice buscado com a marca ja selecionada caia
+        // sempre em tipo==='nf' e era bloqueado pela regra abaixo (bug real
+        // achado pela Ivna, 26/08/2026, minutos depois de desativar a busca
+        // por NF). So reclassifica quando a marca foi escolhida
+        // explicitamente como Apice - com "auto" nao da pra saber se e um
+        // pedido Apice ou uma NF de outra marca, entao mantem o bloqueio.
+        if (tipo === 'nf' && marcaId === 'apice') tipo = 'pedido';
         // Busca por NF pura desativada (26/08/2026, a pedido da Ivna): a
         // Intelipost nao aceita NF como chave, entao o unico caminho era
         // resolver via ticket historico OU (sem ticket) mandar o mesmo numero
