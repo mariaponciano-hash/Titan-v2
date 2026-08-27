@@ -65,6 +65,8 @@ continuam vindo so do titan_cf_worker/titan_backfill.py.
 import json
 import os
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -79,7 +81,13 @@ ROMANEIOS_FOLDER_ID = "1EHi3gB7b0fYZ7nDODjWWyzcRRAlBFdlj"
 PAGINA = 1000
 
 
-def _http_json(method, url, headers=None, data=None, form=False):
+def _http_json(method, url, headers=None, data=None, form=False, tentativas=3):
+    """3 tentativas com backoff curto (500ms/1500ms) - o runner do GitHub
+    Actions ja mostrou um 500 pontual (27/08/2026) numa consulta que
+    funcionou normal rodando de outro lugar, entao provavelmente e rede/rate
+    limit transitorio, nao erro de sintaxe. Na ultima falha, imprime o corpo
+    da resposta de erro (a versao anterior so mostrava o codigo HTTP, sem
+    dizer o motivo real)."""
     body = None
     hdrs = dict(headers or {})
     if data is not None:
@@ -89,10 +97,23 @@ def _http_json(method, url, headers=None, data=None, form=False):
         else:
             body = json.dumps(data).encode("utf-8")
             hdrs["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        corpo = resp.read()
-        return json.loads(corpo) if corpo else None
+    for tentativa in range(tentativas):
+        req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                corpo = resp.read()
+                return json.loads(corpo) if corpo else None
+        except urllib.error.HTTPError as e:
+            corpo_erro = e.read().decode("utf-8", errors="replace")
+            if e.code < 500 or tentativa == tentativas - 1:
+                print(f"  HTTP {e.code} em {method} {url}: {corpo_erro[:500]}", file=sys.stderr)
+                raise
+            time.sleep(0.5 * (tentativa + 1) * 3)
+        except (urllib.error.URLError, TimeoutError) as e:
+            if tentativa == tentativas - 1:
+                print(f"  falha de rede em {method} {url}: {e}", file=sys.stderr)
+                raise
+            time.sleep(0.5 * (tentativa + 1) * 3)
 
 
 def obter_access_token():
@@ -207,14 +228,25 @@ def main():
     romaneios_achados = 0
     pedidos_gravados = 0
     for romaneio, pares in por_romaneio.items():
-        arquivo = achar_arquivo_do_romaneio(access_token, romaneio, subpasta_ids)
+        # Um romaneio que falha (mesmo apos as 3 tentativas do _http_json)
+        # nao pode derrubar o resto do lote - segue pro proximo e reporta no
+        # final. O que ja foi gravado antes do erro fica gravado (PATCH
+        # direto no Supabase, nao ha rollback a fazer).
+        try:
+            arquivo = achar_arquivo_do_romaneio(access_token, romaneio, subpasta_ids)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            print(f"  [romaneio {romaneio}] erro consultando o Drive, pulando: {e}")
+            continue
         if not arquivo:
             print(f"  [romaneio {romaneio}] nao achei PDF ({len(pares)} pedido(s) aguardando).")
             continue
         romaneios_achados += 1
         for numero_nf, marca in pares:
-            gravar_link(numero_nf, marca, arquivo["webViewLink"])
-            pedidos_gravados += 1
+            try:
+                gravar_link(numero_nf, marca, arquivo["webViewLink"])
+                pedidos_gravados += 1
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+                print(f"  [romaneio {romaneio}] erro gravando NF {numero_nf}/{marca}, pulando: {e}")
         print(f"  [romaneio {romaneio}] {arquivo['name']} -> gravado em {len(pares)} pedido(s).")
 
     print(f"{romaneios_achados}/{len(por_romaneio)} romaneio(s) achado(s), {pedidos_gravados}/{len(pendentes)} pedido(s) atualizado(s).")
