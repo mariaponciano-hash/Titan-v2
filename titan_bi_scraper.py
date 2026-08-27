@@ -403,7 +403,14 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
     try:
         painel = localizar_painel(frame, titulo_painel)
         painel.hover()
-        botao_opcoes = elemento_visivel(painel.get_by_role("button", name="Mais opções"), timeout_ms=10000)
+        # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
+        # aria-label do botao "..." de "Mais opcoes" pra "More options",
+        # quebrando o get_by_role por nome. Confirmado via titan_debug
+        # artifact: o botao real tem data-testid="visual-more-options-btn"
+        # (classe vcMenuBtn), estavel independente do idioma do aria-label.
+        botao_opcoes = elemento_visivel(
+            painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
+        )
         botao_opcoes.click()
 
         item_exportar = elemento_visivel(frame.get_by_text("Exportar dados", exact=True), timeout_ms=10000)
