@@ -164,10 +164,14 @@ def login(page, email, senha):
         raise
 
     try:
-        try:
-            page.get_by_role("button", name="Entrar", exact=True).click()
-        except PWTimeout:
-            page.get_by_text("Entrar", exact=True).first.click()
+        # NAO depende mais do texto/idioma do botao (bug real, 27/08/2026,
+        # achado via titan_debug artifact no GitHub Actions: o Titan trocou
+        # o rotulo de "Entrar" pra "Login" em algum momento, quebrando o
+        # seletor por texto exato). button[type='submit'] e estavel mesmo se
+        # o idioma mudar nao importa mais o texto, e nao colide com o botao
+        # separado "Login with Microsoft" (esse e type='button', nao
+        # 'submit').
+        page.locator("button[type='submit']").first.click()
     except PWTimeout:
         # Unico ponto do login que nao salvava diagnostico nenhum na falha
         # (achado 27/08/2026 rodando no GitHub Actions - sem isso, nao dava
@@ -187,7 +191,10 @@ def login(page, email, senha):
         pass  # nao apareceu esse texto especifico - segue pro proximo cheque
     page.wait_for_load_state("networkidle", timeout=20000)
 
-    if page.get_by_role("button", name="Entrar", exact=True).is_visible():
+    # Mesmo motivo do clique acima: nao depende mais do rotulo do botao
+    # (ja quebrou uma vez, 27/08/2026) - o campo de senha continuar visivel
+    # e um sinal de "ainda no login" independente de idioma/rotulo.
+    if page.locator("input[type='password']").first.is_visible():
         salvar_diagnostico(page, "login_nao_saiu_da_tela")
         raise RuntimeError(
             "Ainda na tela de login depois de tentar entrar - confira "
