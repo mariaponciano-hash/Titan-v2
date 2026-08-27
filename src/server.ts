@@ -75,6 +75,25 @@ export interface Env {
   // distintas, confirmado com um produto real da Rituaria). Chave gerada pela
   // Ivna especificamente pra isso - so leitura. Ver buscarEanPorSku.
   METABASE_KEY_GOBEAUTE?: string;
+  // TICKETS DE ENDERECO (24/08/2026): secret do cx-ticketcreator (no Infisical
+  // chama WEBHOOK_SECRET) e service_role key do Supabase. A service_role e
+  // necessaria porque enderecos_para_ticket guarda endereco de cliente e por
+  // isso NAO tem policy de RLS pra role anon - ver sql/001_*.sql.
+  TICKET_WEBHOOK_SECRET?: string;
+  SB_SERVICE_KEY?: string;
+  // Gate do "sent" via Cosmos - ver o bloco GATE DO "SENT" VIA COSMOS.
+  // COSMOS_ORG_IDS e um JSON marca->organization_id (um secret em vez de sete).
+  COSMOS_BASE_URL?: string;
+  COSMOS_EMAIL?: string;
+  COSMOS_PASSWORD?: string;
+  COSMOS_ORG_IDS?: string;
+  COSMOS_CAMPO_STATUS?: string;
+  COSMOS_ESTADOS_NAO_ENVIADO?: string;
+  // Middleware V1 - o caminho da Apice, que nao passa pelo Cosmos. NAO exige
+  // credencial: o GET e aberto. Os dois secrets abaixo sao so pra permitir
+  // mudar host/ids sem redeploy; ambos tem default no codigo.
+  MIDDLEWARE_V1_BASE_URL?: string;
+  MIDDLEWARE_V1_IDS?: string;
   DB: any; // SQLite embutido do GoDeploy - binding reservado, injetado automaticamente
 }
 
@@ -113,6 +132,35 @@ const WEBHOOK_ENVIAR = 'https://n8n-prod.gogroupgl.com/webhook/enviar-resposta-t
 // Texto fixo definido pela Maria (05/08/2026) pra resposta automatica de AVARIA.
 // So Gobeaute, so uma vez por thread (ver tabela avarias_notificadas).
 const TEXTO_AVARIA_AUTOMATICO = 'O procedimento ideal é que a transportadora atualize o status do pedido para Avaria na Intelipost e encaminhe a solicitação para análise.\nApós essa atualização, nossa equipe realizará a validação do caso para definir o tratamento mais adequado, determinando se o pedido seguirá para devolução ou ressarcimento por perda, conforme o cenário identificado.';
+
+// ============ TICKETS DE ALTERACAO DE ENDERECO (24/08/2026) ============
+// Fluxo pedido pela Maria: o bot registra em enderecos_para_ticket o endereco
+// novo que o cliente pediu, mas o ticket com a transportadora so pode ser
+// aberto DEPOIS que o pedido saiu. Este modulo varre a fila, dispara o que
+// esta pronto, e registra o erro do que falhou pra permitir redisparo.
+//
+// ATENCAO - o `reference` esperado pelo creator para as marcas Gobeaute ainda
+// NAO foi confirmado. Ha tres identificadores em jogo:
+//   - external_ecommerce_number do datamart .... "SH1178985KS"
+//   - exemplo do doc do creator ................ "GC-123"
+//   - "Numero do pedido" da Central ............ vazio em producao (conferido
+//     em 24/08/2026: null nas 1000 linhas mais recentes de tickets_gobeaute)
+// Ate a confirmacao, mandamos `pedido` exatamente como o bot gravou, sem
+// transformar. Se o formato estiver errado o sintoma NAO e erro: a consulta
+// devolve exists:false pra sempre (armadilha (b) do doc). Por isso
+// reconciliarEnderecos() trata divergencia como alerta, nao como silencio.
+const TICKET_API_URL = 'https://cx-ticketcreator-prod.rpa-ia.workers.dev';
+
+// Case-sensitive e com acento, de proposito. O doc avisa que typo aqui nao da
+// erro: devolve exists:false silencioso. Fica como constante justamente pra
+// nunca ser montado a partir do tipo_ocorrencia da Central, que chama a MESMA
+// coisa de "Alterar Endereco" (e a Gocase, de "Ajuste de Endereco").
+const TICKET_ISSUE_TYPE_ENDERECO = 'Endereço Errado';
+
+const TABELA_ENDERECOS = 'enderecos_para_ticket';
+const ENDERECO_BATCH = 25;
+const ENDERECO_MAX_TENTATIVAS = 5;
+const ENDERECO_TIMEOUT_MS = 12000;
 
 // REVERTIDO (11/08/2026): tinha sido temporariamente subido de 15 para 60 em
 // 04/08/2026 pra acelerar o dreno do backlog historico de classificacao.
@@ -2352,6 +2400,903 @@ async function torreBuscarNaMarca(env: any, marca: MarcaLogistica, termo: string
   };
 }
 
+// Identidade de quem chamou, vinda do gateway do GoDeploy - mesmo header que os
+// outros apps internos usam (ver 4a0bf51f/src/server.ts, /api/me).
+//
+// Este app esta com visibility "authenticated": o gateway BARRA quem nao fez SSO
+// antes da requisicao chegar aqui, e injeta o e-mail autenticado. Exigir tambem
+// a trigger key seria burocracia dupla - a pessoa ja provou quem e.
+//
+// ATENCAO, ISSO DEPENDE DA VISIBILIDADE DO APP: so e seguro enquanto o app for
+// "authenticated". Se alguem tornar este app PUBLICO (setAppPublic), o gateway
+// deixa de autenticar e passa a ser possivel mandar o header na mao - a
+// checagem abaixo viraria decorativa e as rotas de endereco (que expoem
+// endereco de cliente) ficariam abertas. Se for publicar, volte a exigir a
+// trigger key aqui. A central de producao, por exemplo, E publica - este
+// caminho de autorizacao nao serve la.
+const DOMINIOS_INTERNOS = ['@gocase.com', '@gobeaute.com'];
+
+function usuarioInterno(request: Request): string | null {
+  const email = (request.headers.get('x-godeploy-user-email') || '').trim().toLowerCase();
+  if (!email) return null;
+  return DOMINIOS_INTERNOS.some((d) => email.endsWith(d)) ? email : null;
+}
+
+// Autorizacao das rotas /api/enderecos-*: SSO do gateway, OU trigger key
+// (mantida pra chamada de fora do navegador), OU cron do GoDeploy.
+function autorizadoEnderecos(request: Request, env: Env): boolean {
+  if (usuarioInterno(request)) return true;
+  return autorizado(request, env);
+}
+
+// ============ GATE DO "SENT" VIA COSMOS ============
+//
+// Regra da Maria: a Central so chama a criacao de ticket depois que o pedido
+// saiu. O creator tambem checa isso (passo 7, ORDER NO SENT), mas checar aqui
+// antes evita gastar chamada dele - cada POST de criacao dispara uma busca do
+// pedido na origem MAIS uma na Intelipost, mesmo terminando recusado.
+//
+// CONFIGURACAO (secrets):
+//   COSMOS_BASE_URL     ex.: https://cosmos.gobeaute.com.br
+//   COSMOS_EMAIL        login de servico
+//   COSMOS_PASSWORD     senha do login de servico
+//   COSMOS_ORG_IDS      JSON marca->organization_id, ex.:
+//                       {"kokeshi":"3","rituaria":"5","lescent":"7"}
+//                       Um secret so em vez de sete.
+//   COSMOS_CAMPO_STATUS   (opcional) nome do campo de status no pedido
+//   COSMOS_ESTADOS_SENT   (opcional) valores que contam como enviado,
+//                         separados por virgula
+//
+// A APICE NAO PASSA PELO COSMOS - o resolver do bot manda Apice e Barbour's por
+// Middleware V1, e no datamart o external_cosmos_id da Apice e nulo em 58.949
+// pedidos. Marca sem organization_id configurado devolve 'desconhecido', e nesse
+// caso a fila SEGUE pra criacao e deixa o creator decidir. E deliberado: barrar
+// por falta de configuracao nossa deixaria ~26% do volume (a Apice e a segunda
+// maior marca em ticket de endereco) parado sem que ninguem visse.
+
+const COSMOS_TIMEOUT_MS = 15000;
+
+// Candidatos de nome do campo de status, na ordem. So sao usados quando
+// COSMOS_CAMPO_STATUS nao esta configurado - ver /api/enderecos-cosmos-debug
+// pra descobrir o nome real e fixar no secret.
+// `logistic_status` primeiro porque e o campo confirmado: e o que o clind-bot le
+// do pedido do Cosmos (src/services/cosmos/transformer.py) e o que ele testa pra
+// decidir se o pedido saiu (message_formatter.py: logistic_status == "waiting"
+// => order_not_shipped). Os outros ficam como rede se o campo mudar de nome.
+const COSMOS_CAMPOS_STATUS_CANDIDATOS = [
+  'logistic_status', 'status', 'state', 'aasm_state', 'order_state',
+  'shipment_state', 'delivery_state', 'situacao', 'fulfillment_status',
+];
+
+// LISTA INVERTIDA, DE PROPOSITO: enumera o que significa NAO enviado, e trata
+// todo o resto como enviado. O contrario (listar os estados "enviado") e uma
+// armadilha - o dia em que o Cosmos ganhar um estado novo, um pedido legitimo
+// cairia fora da lista, seria lido como "nao enviado" e esperaria pra sempre sem
+// ninguem ver. Assim, estado desconhecido segue pra criacao e o creator decide,
+// que e a fonte autoritativa. Erra pro lado de quem sabe mais.
+const COSMOS_ESTADOS_NAO_ENVIADO_PADRAO = ['waiting', 'aguardando', 'pending', 'created'];
+
+// Estados que significam "nem vai mais" - pedido morto antes de sair.
+const COSMOS_ESTADOS_MORTOS = ['canceled', 'cancelled', 'cancelado', 'refunded', 'estornado'];
+
+function cosmosOrgIds(env: Env): Record<string, string> {
+  const raw = env.COSMOS_ORG_IDS;
+  if (!raw) return {};
+  try {
+    const o = JSON.parse(raw);
+    return o && typeof o === 'object' ? o : {};
+  } catch {
+    console.error('[cosmos] COSMOS_ORG_IDS nao e JSON valido - gate do Cosmos desligado');
+    return {};
+  }
+}
+
+function cosmosConfigurado(env: Env): boolean {
+  return !!(env.COSMOS_BASE_URL && env.COSMOS_EMAIL && env.COSMOS_PASSWORD);
+}
+
+// Token por isolate. O signin do Cosmos e uma requisicao a mais por chamada, e
+// um lote de 25 linhas faria 25 logins sem isso. Nao persiste entre isolates -
+// e cache de execucao, nao de sessao.
+let _cosmosToken: { token: string; em: number } | null = null;
+const COSMOS_TOKEN_TTL_MS = 10 * 60 * 1000;
+
+async function cosmosAutenticar(env: Env): Promise<string> {
+  if (_cosmosToken && Date.now() - _cosmosToken.em < COSMOS_TOKEN_TTL_MS) return _cosmosToken.token;
+  const base = String(env.COSMOS_BASE_URL || '').replace(/\/+$/, '');
+  const r = await fetchComTimeout(
+    `${base}/api/v3/auth/signin`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ email: env.COSMOS_EMAIL, password: env.COSMOS_PASSWORD }),
+    },
+    COSMOS_TIMEOUT_MS
+  );
+  if (r.status === 401) throw new Error('cosmos: credenciais invalidas no signin');
+  if (!r.ok) throw new Error(`cosmos: signin HTTP ${r.status}`);
+  const data: any = await r.json();
+  const token = data && data.credentials && data.credentials.token;
+  if (!token) throw new Error('cosmos: signin nao devolveu credentials.token');
+  _cosmosToken = { token: String(token), em: Date.now() };
+  return _cosmosToken.token;
+}
+
+// Busca o pedido no Cosmos: busca por external_id e depois o detalhe, igual o
+// client do bot faz (services/cosmos/cosmos-client.ts no repo gomind-cx).
+async function cosmosBuscarPedido(env: Env, orgId: string, orderId: string): Promise<any | null> {
+  const base = String(env.COSMOS_BASE_URL || '').replace(/\/+$/, '');
+  const token = await cosmosAutenticar(env);
+  const limpo = String(orderId || '').replace(/^#/, '').trim();
+  const org = encodeURIComponent(orgId);
+
+  const busca = await fetchComTimeout(
+    `${base}/api/v3/organizations/${org}/orders?external_id=${encodeURIComponent(limpo)}&page=1&per_page=1`,
+    { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } },
+    COSMOS_TIMEOUT_MS
+  );
+  if (busca.status === 404) return null;
+  if (!busca.ok) throw new Error(`cosmos: busca HTTP ${busca.status}`);
+  const bd: any = await busca.json();
+  const lista: any[] = Array.isArray(bd) ? bd : (bd && (bd.orders || bd.data)) || [];
+  if (!lista.length) return null;
+  const cosmosId = lista[0] && lista[0].id;
+  if (cosmosId == null) throw new Error('cosmos: resultado de busca sem id');
+
+  const det = await fetchComTimeout(
+    `${base}/api/v3/organizations/${org}/orders/${encodeURIComponent(String(cosmosId))}`,
+    { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } },
+    COSMOS_TIMEOUT_MS
+  );
+  if (!det.ok) throw new Error(`cosmos: detalhe HTTP ${det.status}`);
+  return det.json();
+}
+
+function cosmosLerStatus(env: Env, pedido: any): { campo: string | null; valor: string | null } {
+  if (!pedido || typeof pedido !== 'object') return { campo: null, valor: null };
+  const fixo = env.COSMOS_CAMPO_STATUS;
+  const candidatos = fixo ? [fixo] : COSMOS_CAMPOS_STATUS_CANDIDATOS;
+  for (const c of candidatos) {
+    const v = (pedido as any)[c];
+    if (typeof v === 'string' && v.trim()) return { campo: c, valor: v.trim().toLowerCase() };
+  }
+  return { campo: null, valor: null };
+}
+
+
+// ---- Middleware V1: o caminho da Apice ----
+//
+// A Apice nao esta no Cosmos (confirmado por tres vias independentes: o resolver
+// do bot manda Apice por Middleware V1, o datamart tem external_cosmos_id nulo
+// em 58.949 pedidos dela, e a conta de servico do Cosmos nao lista a Apice nos
+// memberships). O caminho dela e este middleware, e o GET e ABERTO - nao precisa
+// de credencial nenhuma.
+//
+// ARMADILHA GRAVE, MEDIDA EM 26/08/2026: NAO use `sent_at`, `status_erp` nem
+// `has_been_fulfilled` como sinal de "saiu". Eles significam "exportado pro
+// ERP", nao "despachado pro cliente". Pedidos parados no CD ha 4 dias voltam com
+// status_erp='enviado', sent_at preenchido e has_been_fulfilled=true, enquanto o
+// `status` real deles e 'ready_for_shipping'. Um gate feito no sent_at liberaria
+// tudo assim que o pedido fosse exportado e abriria ticket de transportadora
+// para pedido que nem saiu - o oposto do que este gate existe pra fazer.
+//
+// O campo certo e `status`. Valores observados: 'imported' e 'ready_for_shipping'
+// (nao saiu) e 'sent' (saiu).
+const MIDDLEWARE_V1_BASE_PADRAO = 'https://middleware.gobeaute.com.br/api/v2';
+const MIDDLEWARE_V1_IDS_PADRAO: Record<string, string> = { apice: '1' };
+const MIDDLEWARE_V1_STATUS_SAIU = 'sent';
+const MIDDLEWARE_V1_STATUS_NAO_SAIU = ['imported', 'ready_for_shipping'];
+
+function middlewareV1Ids(env: Env): Record<string, string> {
+  if (!env.MIDDLEWARE_V1_IDS) return MIDDLEWARE_V1_IDS_PADRAO;
+  try {
+    const o = JSON.parse(env.MIDDLEWARE_V1_IDS);
+    return o && typeof o === 'object' ? o : MIDDLEWARE_V1_IDS_PADRAO;
+  } catch {
+    console.error('[middleware-v1] MIDDLEWARE_V1_IDS nao e JSON valido - usando o padrao');
+    return MIDDLEWARE_V1_IDS_PADRAO;
+  }
+}
+
+// Devolve o registro do pedido, ou null quando o middleware nao o conhece.
+// "Nao conhece" chega de tres formas: HTTP 404, HTTP 500, ou HTTP 200 com
+// {"status": 500} no corpo - todas esperadas e nao-fatais, conforme o client do
+// bot. Nenhuma delas distingue "pedido inexistente" de "pedido ainda nao
+// exportado", e e por isso que quem chama trata null como INCONCLUSIVO e nao
+// como "nao saiu".
+async function middlewareV1BuscarPedido(env: Env, ecomId: string, orderId: string): Promise<any | null> {
+  const base = String(env.MIDDLEWARE_V1_BASE_URL || MIDDLEWARE_V1_BASE_PADRAO).replace(/\/+$/, '');
+  const limpo = String(orderId || '').replace(/^#/, '').trim();
+  // Cache-buster: o middleware cacheia de forma agressiva (o client do bot faz o
+  // mesmo) e um status velho aqui atrasaria o disparo.
+  const url = `${base}/ecommerces/${encodeURIComponent(ecomId)}/orders/${encodeURIComponent(limpo)}?_t=${Date.now()}`;
+  const r = await fetchComTimeout(url, { headers: { Accept: 'application/json' } }, COSMOS_TIMEOUT_MS);
+  if (r.status === 404 || r.status === 500) return null;
+  if (!r.ok) throw new Error(`middleware v1: HTTP ${r.status}`);
+  const d: any = await r.json().catch(() => null);
+  const reg = Array.isArray(d) ? d[0] : d;
+  if (!reg || typeof reg !== 'object') return null;
+  if (Number(reg.status) === 500) return null;
+  return reg;
+}
+
+async function pedidoSaiuPeloMiddlewareV1(env: Env, ecomId: string, row: any): Promise<{ veredito: StatusPedido; detalhe: string }> {
+  let reg: any;
+  try {
+    reg = await middlewareV1BuscarPedido(env, ecomId, row.pedido);
+  } catch (e: any) {
+    return { veredito: 'desconhecido', detalhe: `middleware v1 indisponivel: ${String((e && e.message) || e)}` };
+  }
+  if (!reg) {
+    return { veredito: 'desconhecido', detalhe: `pedido ${row.pedido} nao esta no middleware v1 (pode ser inexistente ou ainda nao exportado)` };
+  }
+  const st = String(reg.status || '').trim().toLowerCase();
+  if (!st) return { veredito: 'desconhecido', detalhe: 'registro sem campo status' };
+  if (st === MIDDLEWARE_V1_STATUS_SAIU) return { veredito: 'sim', detalhe: `status=${st}` };
+  if (MIDDLEWARE_V1_STATUS_NAO_SAIU.indexOf(st) !== -1) return { veredito: 'nao', detalhe: `status=${st}` };
+  // Valor novo: nao chuta. Segue pra criacao e deixa o creator decidir - mesma
+  // logica de lista invertida usada no Cosmos.
+  return { veredito: 'desconhecido', detalhe: `status desconhecido "${st}" - deixando o creator decidir` };
+}
+
+type StatusPedido = 'sim' | 'nao' | 'morto' | 'desconhecido';
+
+// 'sim'          -> saiu: pode chamar a criacao
+// 'nao'          -> confirmadamente ainda nao saiu: nao gasta chamada do creator
+// 'morto'        -> cancelado/estornado: nao se aplica
+// 'desconhecido' -> nao deu pra saber (marca sem Cosmos, pedido nao achado,
+//                   Cosmos fora, campo de status nao identificado). Segue pra
+//                   criacao e deixa o creator decidir - a alternativa seria
+//                   travar a fila por limitacao nossa.
+async function pedidoEstaSent(env: Env, row: any): Promise<{ veredito: StatusPedido; detalhe: string }> {
+  const brandPre = marcaParaBrand(row.marca);
+  // Marca que vai pelo Middleware V1 nao depende do Cosmos estar configurado.
+  if (!cosmosConfigurado(env)) {
+    const ecomIdPre = brandPre ? middlewareV1Ids(env)[brandPre] : null;
+    if (ecomIdPre) return pedidoSaiuPeloMiddlewareV1(env, ecomIdPre, row);
+    return { veredito: 'desconhecido', detalhe: 'Cosmos nao configurado (COSMOS_BASE_URL/EMAIL/PASSWORD)' };
+  }
+  const brand = marcaParaBrand(row.marca);
+  const orgId = brand ? cosmosOrgIds(env)[brand] : null;
+  if (!orgId) {
+    // Sem Cosmos: tenta o Middleware V1, que e o caminho da Apice e nao precisa
+    // de credencial. Se a marca nao estiver em nenhum dos dois, fica
+    // inconclusivo e o creator decide.
+    const ecomId = brand ? middlewareV1Ids(env)[brand] : null;
+    if (ecomId) return pedidoSaiuPeloMiddlewareV1(env, ecomId, row);
+    return { veredito: 'desconhecido', detalhe: `marca ${row.marca} sem fonte de status configurada (nem Cosmos nem Middleware V1)` };
+  }
+  let pedido: any;
+  try {
+    pedido = await cosmosBuscarPedido(env, orgId, row.pedido);
+  } catch (e: any) {
+    return { veredito: 'desconhecido', detalhe: `cosmos indisponivel: ${String((e && e.message) || e)}` };
+  }
+  if (!pedido) {
+    return { veredito: 'desconhecido', detalhe: `pedido ${row.pedido} nao encontrado no Cosmos (org ${orgId})` };
+  }
+
+  const { campo, valor } = cosmosLerStatus(env, pedido);
+  if (!valor) {
+    return { veredito: 'desconhecido', detalhe: 'nao achei campo de status no pedido do Cosmos - use /api/enderecos-cosmos-debug e fixe COSMOS_CAMPO_STATUS' };
+  }
+  if (COSMOS_ESTADOS_MORTOS.indexOf(valor) !== -1) {
+    return { veredito: 'morto', detalhe: `${campo}=${valor}` };
+  }
+  const naoEnviado = (env.COSMOS_ESTADOS_NAO_ENVIADO
+    ? String(env.COSMOS_ESTADOS_NAO_ENVIADO).split(',')
+    : COSMOS_ESTADOS_NAO_ENVIADO_PADRAO).map((x) => x.trim().toLowerCase()).filter(Boolean);
+  if (naoEnviado.indexOf(valor) !== -1) return { veredito: 'nao', detalhe: `${campo}=${valor}` };
+  return { veredito: 'sim', detalhe: `${campo}=${valor}` };
+}
+
+// ============ FILA DE TICKETS DE ENDERECO ============
+
+// enderecos_para_ticket guarda PII (endereco de cliente) e por isso NAO tem
+// policy de RLS pra role anon - a chave anon esta no codigo-fonte de um app
+// publico, entao liberar anon aqui equivaleria a publicar endereco de cliente.
+// Toda leitura/escrita usa a service_role key, que so existe nos secrets.
+function chaveEnderecos(env: Env): string {
+  const k = env.SB_SERVICE_KEY;
+  if (!k) {
+    throw new Error(
+      'SB_SERVICE_KEY nao configurada. A tabela ' + TABELA_ENDERECOS + ' tem RLS habilitado sem policy pra role anon ' +
+      '(guarda endereco de cliente), entao o worker precisa da service_role key do Supabase pra ler/escrever.'
+    );
+  }
+  return k;
+}
+
+function headersEnderecos(env: Env, extra?: Record<string, string>): Record<string, string> {
+  const k = chaveEnderecos(env);
+  return { apikey: k, Authorization: `Bearer ${k}`, ...(extra || {}) };
+}
+
+// As 9 marcas que o creator aceita em `brand`, sempre minusculas (doc de criacao,
+// 26/08/2026). A Central grava a marca em maiuscula e sem separador (BYSAMIA), e
+// o creator espera `bysamia` - sem underscore, diferente do datamart, que usa
+// `by_samia`. Sao tres convencoes pra mesma marca; este mapa e o unico lugar que
+// converte pro creator.
+const MARCA_PARA_BRAND: Record<string, string> = {
+  GOCASE: 'gocase',
+  APICE: 'apice',
+  LESCENT: 'lescent',
+  KOKESHI: 'kokeshi',
+  BYSAMIA: 'bysamia',
+  AUA: 'aua',
+  BARBOURS: 'barbours',
+  RITUARIA: 'rituaria',
+  YENZAH: 'yenzah',
+};
+
+function marcaParaBrand(marca: string): string | null {
+  const k = String(marca || '').trim().toUpperCase().replace(/[\s_'-]/g, '');
+  return MARCA_PARA_BRAND[k] || null;
+}
+
+interface ConsultaTicket {
+  exists: boolean;
+  ticket_id: number | null;
+  status: string | null;
+  response_deadline: string | null;
+  created_at: string | null;
+}
+
+// GET /tickets do cx-ticketcreator. Rota read-only. "Nao existe" vem como HTTP
+// 200 com exists:false, NAO como 404 - so 4xx/5xx trazem error:true. Por isso a
+// checagem aqui e pelo campo, nao pelo status HTTP.
+//
+// ATENCAO: aqui a chave e `issue_type`; na rota de CRIACAO o mesmo valor vai num
+// campo chamado `issue`. Nomes diferentes pra mesma coisa nas duas rotas.
+async function enderecoConsultarTicket(env: Env, reference: string): Promise<ConsultaTicket> {
+  const secret = env.TICKET_WEBHOOK_SECRET;
+  if (!secret) throw new Error('TICKET_WEBHOOK_SECRET nao configurada (no Infisical: WEBHOOK_SECRET)');
+  const url = `${TICKET_API_URL}/tickets?reference=${encodeURIComponent(reference)}&issue_type=${encodeURIComponent(TICKET_ISSUE_TYPE_ENDERECO)}`;
+  const r = await fetchComTimeout(url, { headers: { 'x-webhook-secret': secret } }, ENDERECO_TIMEOUT_MS);
+  const texto = await r.text();
+  let data: any = null;
+  try {
+    data = JSON.parse(texto);
+  } catch {
+    throw new Error(`consulta devolveu resposta nao-JSON (HTTP ${r.status}): ${texto.slice(0, 200)}`);
+  }
+  if (data && data.error) throw new Error(`consulta HTTP ${r.status} ${data.code || ''}: ${data.message || texto.slice(0, 200)}`);
+  if (!r.ok) throw new Error(`consulta HTTP ${r.status}: ${texto.slice(0, 200)}`);
+  return {
+    exists: !!(data && data.exists),
+    ticket_id: (data && data.ticket_id) != null ? data.ticket_id : null,
+    status: (data && data.status) != null ? data.status : null,
+    response_deadline: (data && data.response_deadline) != null ? data.response_deadline : null,
+    created_at: (data && data.created_at) != null ? data.created_at : null,
+  };
+}
+
+// Payload de criacao, conforme o doc de 26/08/2026. Campos no TOPO, sem wrapper.
+//
+// PONTOS QUE NAO SAO INTUITIVOS (todos vindos do doc, nao invente):
+//  - `orderId` e o id do pedido na ORIGEM da marca (GoCase/Cosmos/Apice). NAO e a
+//    reference: a reference vem do proprio pedido e volta na RESPOSTA.
+//  - `issue` (na criacao) x `issue_type` (na consulta): mesma string, chave
+//    diferente em cada rota.
+//  - Em correct_address, `address2` e o NUMERO e `address4` e o BAIRRO. A
+//    nomenclatura e herdada dos payloads do n8n e nao seguе nenhuma logica -
+//    trocar address2 por complemento manda o numero errado pra transportadora.
+//  - Manda fullAddress **E** as partes. O texto que a transportadora recebe sai
+//    do fullAddress (verbatim), mas a Regra 1 compara SO as partes e nunca
+//    parseia a string. Mandar so a string passa do gate de ausencia e morre em
+//    ADDRESS_UNVERIFIABLE. Minimo pra Regra 1 decidir: city + state, mais
+//    address1 ou zipcode.
+function montarPayloadCriacaoEndereco(row: any): any {
+  const partes = [
+    row.end_logradouro, row.end_numero, row.end_complemento, row.end_bairro,
+    row.end_cidade, row.end_uf, row.end_pais, row.end_cep,
+  ].map((p: any) => String(p || '').trim()).filter(Boolean);
+
+  // fullAddress: prefere o texto que o bot gravou (e o que o cliente pediu, com
+  // as palavras dele); se nao houver, compoe das partes na ordem do doc.
+  const fullAddress = String(row.novo_endereco || '').trim() || partes.join(', ');
+
+  return {
+    brand: marcaParaBrand(row.marca),
+    orderId: row.pedido,
+    issue: TICKET_ISSUE_TYPE_ENDERECO,
+    variables: {
+      correct_address: {
+        address1: row.end_logradouro || '',
+        address2: row.end_numero || '',
+        address3: row.end_complemento || '',
+        address4: row.end_bairro || '',
+        city: row.end_cidade || '',
+        state: row.end_uf || '',
+        zipcode: row.end_cep || '',
+        country_code: row.end_pais || 'BR',
+        fullAddress,
+      },
+      executed_by: 'central-tickets',
+    },
+  };
+}
+
+// Desfecho de uma tentativa de criacao, ja traduzido do vocabulario do creator
+// pro que a fila precisa decidir.
+type Desfecho =
+  | 'criado'          // ticket existe: criado agora, em andamento ou concluido
+  | 'nao_enviado'     // ORDER NO SENT - volta pra fila com backoff
+  | 'bloqueado'       // Regra 1 recusou: terminal
+  | 'precisa_humano'  // sem automacao / endereco insuficiente / escalonamento
+  | 'erro';           // falha tecnica: vale redisparar
+
+interface ResultadoCriacao {
+  desfecho: Desfecho;
+  code: string | null;
+  detalhe: string;
+  reference?: string | null;
+  ticketId?: number | null;
+  ticketStatus?: string | null;
+  deadline?: string | null;
+  blockedReason?: string | null;
+  // O creator devolve o estado da entrega junto do ticket criado. E a unica
+  // fonte de status de pedido que a Central tem sem credencial nova - so nao e
+  // um valor vivo: e a foto do instante da abertura.
+  deliveryStatus?: string | null;
+  deliveryDate?: string | null;
+  trackingCode?: string | null;
+  carrier?: string | null;
+  cliente?: string | null;
+}
+
+// Traduz a resposta do creator. Todo desfecho de NEGOCIO vem como HTTP 200 com
+// { code, message, data, action } - so falha tecnica traz error:true. Por isso a
+// leitura aqui e pelo `code`, nunca pelo status HTTP.
+function interpretarRespostaCriacao(httpStatus: number, data: any, texto: string): ResultadoCriacao {
+  const code = String((data && data.code) || '').trim() || null;
+  const msg = String((data && data.message) || texto || '').slice(0, 500);
+  const d = (data && data.data) || {};
+
+  // Envelope de escalonamento: em dois casos o creator responde com `status`
+  // ESCALATE_TO_HUMAN em vez de `code` - prazo de resposta vencido, e pedido nao
+  // encontrado na origem (marcas Cosmos).
+  if (String((data && data.status) || '') === 'ESCALATE_TO_HUMAN') {
+    return {
+      desfecho: 'precisa_humano',
+      code: 'ESCALATE_TO_HUMAN',
+      detalhe: msg || 'creator escalou para atendimento humano (prazo vencido ou pedido nao encontrado na origem)',
+      reference: d.reference || (data && data.reference) || null,
+      ticketId: d.ticket_id || (data && data.ticket_id) || null,
+      deadline: d.response_deadline || (data && data.response_deadline) || null,
+    };
+  }
+
+  if (data && data.error) {
+    return { desfecho: 'erro', code, detalhe: `HTTP ${httpStatus} ${code || ''}: ${msg}` };
+  }
+
+  switch (code) {
+    case 'ADDRESS_TICKET_CREATED':
+    case 'TICKET_EXISTS':
+    case 'TICKET_COMPLETED':
+      return {
+        desfecho: 'criado',
+        code,
+        detalhe: msg,
+        reference: d.reference || null,
+        ticketId: d.ticket_id || null,
+        // TICKET_COMPLETED = ja resolvido; os outros nascem/seguem pending.
+        ticketStatus: code === 'TICKET_COMPLETED' ? 'completed' : 'pending',
+        deadline: d.response_deadline || null,
+        deliveryStatus: d.delivery_status || null,
+        deliveryDate: d.delivery_date || null,
+        trackingCode: d.tracking_code || null,
+        carrier: d.carrier || null,
+        cliente: d.customer || null,
+      };
+
+    // Literal, com espacos - nao e typo do doc.
+    case 'ORDER NO SENT':
+      return { desfecho: 'nao_enviado', code, detalhe: msg || 'pedido ainda nao enviado' };
+
+    case 'ADDRESS_CHANGE_BLOCKED':
+      return {
+        desfecho: 'bloqueado',
+        code,
+        detalhe: msg,
+        blockedReason: d.blocked_reason || null,
+      };
+
+    case 'CARRIER_NOT_AUTOMATED':
+    case 'ADDRESS_MISSING':
+    case 'ADDRESS_UNVERIFIABLE':
+      return { desfecho: 'precisa_humano', code, detalhe: msg };
+
+    default:
+      // Code novo que o doc nao previa: trata como erro tecnico pra aparecer na
+      // fila em vez de virar sucesso silencioso.
+      return {
+        desfecho: 'erro',
+        code,
+        detalhe: `resposta nao reconhecida (HTTP ${httpStatus}, code=${code || 'ausente'}): ${msg}`,
+      };
+  }
+}
+
+async function enderecoCriarTicket(env: Env, row: any, mock?: string | null): Promise<ResultadoCriacao> {
+  // MOCK: sem TICKET_WEBHOOK_SECRET nao ha como chamar o creator, e a tela ainda
+  // precisa ser testavel. `mock` forcado pela rota exercita cada desfecho.
+  const usarMock = !!mock || !env.TICKET_WEBHOOK_SECRET;
+  if (usarMock) {
+    const cenario = mock || 'sucesso';
+    if (cenario === 'nao_enviado') return { desfecho: 'nao_enviado', code: 'ORDER NO SENT', detalhe: 'MOCK: pedido ainda nao enviado' };
+    if (cenario === 'erro') return { desfecho: 'erro', code: 'MOCK_ERRO', detalhe: 'MOCK: falha simulada na criacao' };
+    if (cenario === 'bloqueado') return { desfecho: 'bloqueado', code: 'ADDRESS_CHANGE_BLOCKED', detalhe: 'MOCK: Regra 1 recusou', blockedReason: 'different_city' };
+    if (cenario === 'precisa_humano') return { desfecho: 'precisa_humano', code: 'CARRIER_NOT_AUTOMATED', detalhe: 'MOCK: transportadora sem automacao' };
+    return {
+      desfecho: 'criado',
+      code: 'ADDRESS_TICKET_CREATED',
+      detalhe: 'MOCK: ticket criado',
+      reference: `MOCK-${row.pedido}`,
+      ticketId: 900000 + (Number(row.id) || 0),
+      ticketStatus: 'pending',
+      deadline: null,
+      deliveryStatus: 'in_transit',
+      deliveryDate: null,
+      trackingCode: 'MOCK-RASTREIO',
+      carrier: 'mock_carrier',
+      cliente: null,
+    };
+  }
+
+  const brand = marcaParaBrand(row.marca);
+  if (!brand) {
+    // 422 UNSUPPORTED_SLICE garantido - melhor barrar aqui, com mensagem que diz
+    // o que fazer, do que gastar a chamada.
+    return {
+      desfecho: 'erro',
+      code: 'MARCA_DESCONHECIDA',
+      detalhe: `marca "${row.marca}" nao mapeia pra nenhuma das 9 brands aceitas pelo creator (${Object.values(MARCA_PARA_BRAND).join(', ')})`,
+    };
+  }
+
+  const r = await fetchComTimeout(
+    `${TICKET_API_URL}/gogroup-tickets-clind`,
+    {
+      method: 'POST',
+      headers: { 'x-webhook-secret': env.TICKET_WEBHOOK_SECRET as string, 'Content-Type': 'application/json' },
+      body: JSON.stringify(montarPayloadCriacaoEndereco(row)),
+    },
+    ENDERECO_TIMEOUT_MS
+  );
+  const texto = await r.text();
+  let data: any = null;
+  try { data = JSON.parse(texto); } catch {}
+  return interpretarRespostaCriacao(r.status, data, texto);
+}
+
+// Reivindica a linha ANTES do POST, com o status antigo dentro do filtro. Se o
+// PATCH nao casar nenhuma linha, outra execucao pegou primeiro e esta desiste.
+// E isso que impede duas chamadas de criacao pro mesmo pedido quando duas
+// execucoes se cruzam - e cada chamada custa uma busca do pedido na origem mais
+// uma na Intelipost, mesmo quando termina barrada.
+async function enderecoReivindicar(env: Env, id: any, statusEsperado: string, disparadoAntesDe?: string): Promise<boolean> {
+  // Ao re-reivindicar uma linha abandonada (statusEsperado = 'disparando'), o
+  // filtro leva tambem disparado_em < corte. Assim, se duas execucoes tentarem
+  // resgatar a mesma linha, a primeira atualiza disparado_em e o filtro da
+  // segunda deixa de casar - a condicao de corrida se resolve no proprio PATCH.
+  const extra = disparadoAntesDe ? `&disparado_em=lt.${encodeURIComponent(disparadoAntesDe)}` : '';
+  const r = await fetch(
+    `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?id=eq.${encodeURIComponent(String(id))}&status=eq.${encodeURIComponent(statusEsperado)}${extra}`,
+    {
+      method: 'PATCH',
+      headers: headersEnderecos(env, { 'Content-Type': 'application/json', Prefer: 'return=representation' }),
+      body: JSON.stringify({ status: 'disparando', disparado_em: new Date().toISOString() }),
+    }
+  );
+  if (!r.ok) return false;
+  try {
+    const rows: any[] = await r.json();
+    return Array.isArray(rows) && rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// EXPLODE quando o PATCH falha, de proposito. A versao anterior devolvia
+// `false` e nenhum chamador conferia - com isso, uma coluna que nao existia no
+// banco (schema atras do codigo) fazia a gravacao final falhar em silencio: a
+// rota respondia "ok", a linha ficava presa em `disparando` e a fila nunca mais
+// a recolhia. Melhor estourar e a linha aparecer como erro do que sumir.
+async function enderecoAtualizar(env: Env, id: any, patch: any): Promise<void> {
+  const r = await fetch(`${SB_URL}/rest/v1/${TABELA_ENDERECOS}?id=eq.${encodeURIComponent(String(id))}`, {
+    method: 'PATCH',
+    headers: headersEnderecos(env, { 'Content-Type': 'application/json', Prefer: 'return=minimal' }),
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`falha ao gravar a linha ${id}: Supabase HTTP ${r.status} ${t.slice(0, 300)}`);
+  }
+}
+
+interface OpcoesBuscaEndereco {
+  status?: string;
+  id?: string;
+  marca?: string;
+  limit?: number;
+  respeitarBackoff?: boolean;
+}
+
+async function enderecoBuscar(env: Env, opts: OpcoesBuscaEndereco): Promise<any[]> {
+  let url = `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?select=*&order=criado_em.asc`;
+  if (opts.status) url += `&status=eq.${encodeURIComponent(opts.status)}`;
+  if (opts.id) url += `&id=eq.${encodeURIComponent(opts.id)}`;
+  if (opts.marca) url += `&marca=eq.${encodeURIComponent(opts.marca)}`;
+  if (opts.respeitarBackoff) {
+    const agora = new Date().toISOString();
+    url += `&or=(proxima_tentativa_em.is.null,proxima_tentativa_em.lte.${encodeURIComponent(agora)})`;
+  }
+  url += `&limit=${opts.limit || 500}`;
+  const r = await fetchComTimeout(url, { headers: headersEnderecos(env) }, ENDERECO_TIMEOUT_MS);
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`Supabase HTTP ${r.status} (${TABELA_ENDERECOS}): ${t.slice(0, 300)}`);
+  }
+  return r.json();
+}
+
+// Quanto esperar antes de perguntar de novo por um pedido que ainda nao saiu.
+// Nao e de graca: cada chamada de criacao dispara uma busca do pedido na origem
+// e uma na Intelipost mesmo quando termina em ORDER NO SENT. Duas horas contra
+// uma janela de entrega cuja mediana e ~90h (p10 44h) custa no maximo ~4% da
+// janela e corta a sondagem pela metade.
+const ENDERECO_BACKOFF_NAO_ENVIADO_MS = 2 * 60 * 60 * 1000;
+
+// Quanto tempo uma linha pode ficar em `disparando` antes de ser considerada
+// abandonada. Sem isso, qualquer interrupcao no meio do processamento (timeout
+// do Worker, deploy no meio da execucao, erro de gravacao) deixa a linha presa
+// nesse status pra sempre, porque a fila so recolhe aguardando/erro. 15 min e
+// folgado: o processamento de uma linha leva segundos.
+const ENDERECO_LEASE_MS = 15 * 60 * 1000;
+
+async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null): Promise<any> {
+  const base = { id: row.id, pedido: row.pedido, marca: row.marca };
+  const corteLease = row.status === 'disparando'
+    ? new Date(Date.now() - ENDERECO_LEASE_MS).toISOString()
+    : undefined;
+  if (!(await enderecoReivindicar(env, row.id, row.status, corteLease))) {
+    return { ...base, acao: 'ignorado (outra execucao pegou a linha primeiro)' };
+  }
+  const tentativas = (Number(row.tentativas) || 0) + 1;
+
+  // GATE DO "SENT" (regra da Maria): so chama a criacao depois que o pedido saiu.
+  //
+  // Roda sempre que o Cosmos estiver configurado - INCLUSIVE com a criacao em
+  // mock. Antes eu tinha amarrado o gate ao mock, e isso deixava o Cosmos
+  // configurado sem nunca ser exercitado enquanto o secret do creator nao
+  // chegasse: as duas coisas nao tem relacao nenhuma e nao deviam depender uma
+  // da outra.
+  //
+  // A unica coisa que pula o gate e um `mock` EXPLICITO na rota: ali a pessoa
+  // esta forcando um desfecho especifico pra testar a tela, e o gate
+  // atravessaria o teste.
+  // Roda o gate se houver QUALQUER fonte: Cosmos configurado, ou o Middleware V1
+  // (que nao depende de configuracao alguma, entao na pratica esta sempre
+  // disponivel pra Apice).
+  const brandDaLinha = marcaParaBrand(row.marca);
+  const temFonteDeStatus = cosmosConfigurado(env)
+    || !!(brandDaLinha && middlewareV1Ids(env)[brandDaLinha]);
+  if (!mock && temFonteDeStatus) {
+    const g = await pedidoEstaSent(env, row);
+    if (g.veredito === 'nao') {
+      // Nao gastou chamada do creator. Volta pra fila com o mesmo backoff.
+      await enderecoAtualizar(env, row.id, {
+        status: 'aguardando',
+        ultimo_code: 'COSMOS_NAO_ENVIADO',
+        delivery_status: g.detalhe.split('=')[1] || null,
+        status_visto_em: new Date().toISOString(),
+        disparado_em: null,
+        proxima_tentativa_em: new Date(Date.now() + ENDERECO_BACKOFF_NAO_ENVIADO_MS).toISOString(),
+        ultimo_erro: null, ultimo_erro_em: null,
+      });
+      return { ...base, acao: 'pedido ainda nao enviado - segue na fila', code: 'COSMOS_NAO_ENVIADO', cosmos: g.detalhe };
+    }
+    if (g.veredito === 'morto') {
+      await enderecoAtualizar(env, row.id, {
+        status: 'nao_se_aplica',
+        ultimo_code: 'COSMOS_PEDIDO_MORTO',
+        status_visto_em: new Date().toISOString(),
+        disparado_em: null, proxima_tentativa_em: null,
+        ultimo_erro: `pedido cancelado/estornado no Cosmos (${g.detalhe})`,
+        ultimo_erro_em: new Date().toISOString(),
+      });
+      return { ...base, acao: 'nao se aplica - pedido morto no Cosmos', cosmos: g.detalhe };
+    }
+    // 'sim' e 'desconhecido' seguem. 'desconhecido' de proposito: travar a fila
+    // por limitacao nossa (marca sem Cosmos, Cosmos fora) esconderia volume -
+    // nesse caso o creator decide, que era o comportamento anterior.
+    if (g.veredito === 'desconhecido') {
+      console.log(`[enderecos] gate do Cosmos inconclusivo pro pedido ${row.pedido}: ${g.detalhe} - seguindo pra criacao`);
+    }
+  }
+
+  // NAO ha pre-checagem de duplicidade aqui de proposito. O GET /tickets exige a
+  // `reference`, e a reference so existe DEPOIS que o ticket nasce (o creator a
+  // devolve na criacao). Na primeira vez nao ha o que consultar; e da segunda em
+  // diante a propria criacao barra o par (reference + issue_type) e responde
+  // TICKET_EXISTS. Consultar antes seria uma chamada a mais sem poder responder.
+  let resultado: ResultadoCriacao;
+  try {
+    resultado = await enderecoCriarTicket(env, row, mock);
+  } catch (e: any) {
+    resultado = { desfecho: 'erro', code: null, detalhe: String((e && e.message) || e) };
+  }
+
+  const comum = { tentativas, ultimo_code: resultado.code, atualizado_em: new Date().toISOString() };
+
+  if (resultado.desfecho === 'criado') {
+    await enderecoAtualizar(env, row.id, {
+      ...comum,
+      status: 'criado',
+      ticket_reference: resultado.reference || row.ticket_reference || null,
+      ticket_id: resultado.ticketId != null ? resultado.ticketId : row.ticket_id,
+      ticket_status: resultado.ticketStatus || null,
+      ticket_deadline: resultado.deadline || null,
+      delivery_status: resultado.deliveryStatus || null,
+      delivery_date: resultado.deliveryDate || null,
+      tracking_code: resultado.trackingCode || null,
+      carrier: resultado.carrier || null,
+      cliente: resultado.cliente || null,
+      status_visto_em: new Date().toISOString(),
+      proxima_tentativa_em: null,
+      ultimo_erro: null, ultimo_erro_em: null,
+    });
+    return {
+      ...base, acao: 'ticket criado', code: resultado.code,
+      reference: resultado.reference, deliveryStatus: resultado.deliveryStatus,
+    };
+  }
+
+  if (resultado.desfecho === 'nao_enviado') {
+    // Nao conta como falha - e "ainda nao deu a hora". Volta pra fila com
+    // backoff, sem incrementar nada que leve ao teto de tentativas.
+    await enderecoAtualizar(env, row.id, {
+      status: 'aguardando',
+      ultimo_code: resultado.code,
+      disparado_em: null,
+      proxima_tentativa_em: new Date(Date.now() + ENDERECO_BACKOFF_NAO_ENVIADO_MS).toISOString(),
+      ultimo_erro: null, ultimo_erro_em: null,
+    });
+    return { ...base, acao: 'pedido ainda nao enviado - segue na fila', code: resultado.code };
+  }
+
+  if (resultado.desfecho === 'bloqueado') {
+    // TERMINAL. A Regra 1 recusou (outra cidade depois do envio, ou J&T fora do
+    // escopo de numero/complemento). Redisparar nao muda nada - o que falta e
+    // avisar o cliente. Nao entra na fila de redisparo.
+    await enderecoAtualizar(env, row.id, {
+      ...comum,
+      status: 'bloqueado',
+      blocked_reason: resultado.blockedReason || null,
+      proxima_tentativa_em: null,
+      ultimo_erro: resultado.detalhe.slice(0, 1000),
+      ultimo_erro_em: new Date().toISOString(),
+    });
+    return { ...base, acao: 'bloqueado pela Regra 1 - avisar o cliente', code: resultado.code, motivo: resultado.blockedReason };
+  }
+
+  if (resultado.desfecho === 'precisa_humano') {
+    await enderecoAtualizar(env, row.id, {
+      ...comum,
+      status: 'precisa_humano',
+      ticket_reference: resultado.reference || row.ticket_reference || null,
+      ticket_id: resultado.ticketId != null ? resultado.ticketId : row.ticket_id,
+      ticket_deadline: resultado.deadline || row.ticket_deadline || null,
+      proxima_tentativa_em: null,
+      ultimo_erro: resultado.detalhe.slice(0, 1000),
+      ultimo_erro_em: new Date().toISOString(),
+    });
+    return { ...base, acao: 'precisa de pessoa', code: resultado.code };
+  }
+
+  const esgotou = tentativas >= ENDERECO_MAX_TENTATIVAS;
+  await enderecoAtualizar(env, row.id, {
+    ...comum,
+    status: esgotou ? 'esgotado' : 'erro',
+    ultimo_erro: resultado.detalhe.slice(0, 1000),
+    ultimo_erro_em: new Date().toISOString(),
+  });
+  return { ...base, acao: esgotou ? 'esgotado (teto de tentativas)' : 'erro - vai pra fila de redisparo', code: resultado.code, erro: resultado.detalhe, tentativas };
+}
+
+async function processarLoteEnderecos(env: Env, limit: number, mock?: string | null): Promise<any> {
+  // 'bloqueado' e 'precisa_humano' NAO entram: o primeiro e terminal, o segundo
+  // espera pessoa. Reprocessar os dois so gastaria chamada (que custa busca na
+  // origem + Intelipost) sem chance de desfecho diferente.
+  const aguardando = await enderecoBuscar(env, { status: 'aguardando', limit, respeitarBackoff: true });
+  let sobra = Math.max(0, limit - aguardando.length);
+  const legado = sobra > 0 ? await enderecoBuscar(env, { status: 'sem_fonte_de_status', limit: sobra }) : [];
+  sobra = Math.max(0, sobra - legado.length);
+  const paraRedisparo = sobra > 0 ? await enderecoBuscar(env, { status: 'erro', limit: sobra }) : [];
+  sobra = Math.max(0, sobra - paraRedisparo.length);
+  // Abandonadas: reivindicadas e nunca finalizadas. enderecoProcessarLinha
+  // reconhece o status 'disparando' e so pega as que estouraram o lease.
+  const abandonadas = sobra > 0 ? await enderecoBuscar(env, { status: 'disparando', limit: sobra }) : [];
+  const corte = Date.now() - ENDERECO_LEASE_MS;
+  const presas = abandonadas.filter((r: any) => {
+    const t = r.disparado_em ? new Date(r.disparado_em).getTime() : 0;
+    return !t || t < corte;
+  });
+  const fila = aguardando.concat(legado, paraRedisparo, presas);
+
+  const resultado: any[] = [];
+  for (const row of fila) {
+    // Uma linha que estoura (ex.: schema atras do codigo) NAO pode derrubar o
+    // lote inteiro - as outras seguem, e o erro dela aparece no resultado.
+    try {
+      resultado.push(await enderecoProcessarLinha(env, row, mock));
+    } catch (e: any) {
+      resultado.push({ id: row.id, pedido: row.pedido, marca: row.marca, acao: 'erro - falha ao processar', erro: String((e && e.message) || e) });
+    }
+  }
+
+  const conta = (prefixo: string) => resultado.filter((r) => String(r.acao || '').indexOf(prefixo) === 0).length;
+  return {
+    fila: fila.length,
+    aguardando: aguardando.length,
+    redisparos: paraRedisparo.length,
+    resgatadas: presas.length,
+    criados: conta('ticket criado'),
+    aindaAguardando: conta('pedido ainda nao enviado'),
+    bloqueados: conta('bloqueado'),
+    precisamHumano: conta('precisa de pessoa'),
+    comErro: conta('erro -') + conta('esgotado'),
+    ignorados: conta('ignorado'),
+    mock: mock || (!env.TICKET_WEBHOOK_SECRET ? 'sucesso (automatico: sem TICKET_WEBHOOK_SECRET)' : null),
+    resultado,
+  };
+}
+
+// Confere a nossa versao contra a do creator, usando a `reference` que ELE nos
+// devolveu na criacao (nao um formato que a gente tentou adivinhar). Linha sem
+// ticket_reference nao tem o que conferir - e o caso normal de quem ainda nao
+// disparou, nao um problema.
+//
+// Divergencia - nos dizemos "criado" e o creator nao tem o ticket - e o unico
+// sinal de que algo se perdeu no meio.
+async function reconciliarEnderecos(env: Env, limit: number): Promise<any> {
+  const rows = await enderecoBuscar(env, { limit });
+  const alvo = rows.filter((r: any) => r.ticket_reference && (r.status === 'criado' || r.status === 'precisa_humano'));
+  let atualizados = 0;
+  let divergentes = 0;
+  const semReference = rows.filter((r: any) => !r.ticket_reference && r.status === 'criado').length;
+  const detalhes: any[] = [];
+
+  for (const row of alvo) {
+    try {
+      const c = await enderecoConsultarTicket(env, row.ticket_reference);
+      if (c.exists) {
+        const mudou = String(c.status) !== String(row.ticket_status)
+          || String(c.ticket_id) !== String(row.ticket_id);
+        if (mudou) {
+          await enderecoAtualizar(env, row.id, {
+            ticket_id: c.ticket_id, ticket_status: c.status, ticket_deadline: c.response_deadline,
+          });
+          atualizados++;
+        }
+      } else if (row.status === 'criado') {
+        divergentes++;
+        detalhes.push({ pedido: row.pedido, reference: row.ticket_reference, problema: 'marcamos criado mas o creator devolveu exists:false' });
+        await enderecoAtualizar(env, row.id, {
+          status: 'erro',
+          ultimo_erro: 'DIVERGENCIA: marcamos como criado (reference ' + row.ticket_reference + ') mas GET /tickets devolveu exists:false.',
+          ultimo_erro_em: new Date().toISOString(),
+        });
+      }
+    } catch (e: any) {
+      detalhes.push({ pedido: row.pedido, problema: String((e && e.message) || e) });
+    }
+  }
+  return { conferidos: alvo.length, atualizados, divergentes, semReference, detalhes };
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -3599,6 +4544,175 @@ export default {
         await salvarRegrasNegocio(env, conteudo, updatedBy);
         return Response.json({ ok: true });
       } catch (e: any) {
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
+    // ============ FILA DE TICKETS DE ENDERECO (24/08/2026) ============
+    // Todas as rotas abaixo exigem autorizacao, INCLUSIVE as de leitura - o que
+    // e diferente das rotas de ticket ja existentes, que sao abertas. Motivo:
+    // esta tabela guarda ENDERECO DE CLIENTE, e uma rota de leitura aberta num
+    // app publico equivale a publicar endereco de cliente na internet. Na
+    // pratica o agente configura a "Chave de disparo manual" em Configuracoes
+    // uma vez, igual ja faz pro botao "Verificar Gmail agora".
+
+    if (url.pathname === '/api/enderecos-list' && request.method === 'GET') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        // Busca sem filtro de status de proposito: a fila e pequena (e uma fila
+        // de trabalho, nao um historico) e assim os contadores por status saem
+        // corretos numa unica ida ao banco. O filtro da tela e client-side.
+        const limit = Math.min(parseInt(url.searchParams.get('limit') || '2000', 10) || 2000, 5000);
+        const rows = await enderecoBuscar(env, { limit });
+        const porStatus: Record<string, number> = {};
+        rows.forEach((r: any) => { const k = r.status || '(vazio)'; porStatus[k] = (porStatus[k] || 0) + 1; });
+        return Response.json({
+          total: rows.length,
+          porStatus,
+          rows,
+          // A tela usa isso pra avisar que esta em modo mock em vez de deixar o
+          // agente achar que criou ticket de verdade.
+          temSecretCreator: !!env.TICKET_WEBHOOK_SECRET,
+          issueType: TICKET_ISSUE_TYPE_ENDERECO,
+        });
+      } catch (e: any) {
+        console.error(`[enderecos-list] ${String((e && e.message) || e)}`);
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/api/enderecos-processar' && request.method === 'POST') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const limit = Math.min(parseInt(url.searchParams.get('limit') || String(ENDERECO_BATCH), 10) || ENDERECO_BATCH, 200);
+        // mock=sucesso|nao_enviado|erro forca o desfecho, pra dar pra testar os
+        // tres caminhos da tela sem depender do creator.
+        const mock = url.searchParams.get('mock');
+        const resultado = await processarLoteEnderecos(env, limit, mock);
+        return Response.json({ ok: true, ...resultado });
+      } catch (e: any) {
+        // 200 mesmo em falha, DE PROPOSITO. Medido em 26/08/2026: quando esta
+        // rota devolve 5xx, o cron do GoDeploy reexecuta a cada ~30s em vez de
+        // esperar a proxima hora. Nenhuma das falhas possiveis aqui melhora com
+        // retry de 30s (schema atras do codigo, credencial ausente, Supabase
+        // fora), e o custo do laco e real: cada tentativa de criacao gasta uma
+        // busca do pedido na origem mais uma na Intelipost. O erro vai no corpo
+        // e no console.error - visivel, sem virar tempestade.
+        console.error(`[enderecos-processar] ${String((e && e.message) || e)}`);
+        return Response.json({ ok: false, error: String((e && e.message) || e) });
+      }
+    }
+
+    // Botao manual da aba: cria o ticket de UMA linha, sem esperar o cron.
+    // Serve pro caso de erro (redisparo) e pra forcar uma linha especifica.
+    if (url.pathname === '/api/enderecos-criar-manual' && request.method === 'POST') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const body: any = await request.json().catch(() => ({}));
+        const id = body.id;
+        if (!id) return Response.json({ error: 'id obrigatorio' }, { status: 400 });
+        const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
+        if (!rows.length) return Response.json({ error: `linha ${id} nao encontrada` }, { status: 404 });
+        const row = rows[0];
+        if (row.status === 'criado') {
+          return Response.json({ error: 'esta linha ja esta marcada como criada - use Reconciliar se desconfia que divergiu' }, { status: 409 });
+        }
+        if (row.status === 'disparando') {
+          return Response.json({ error: 'esta linha esta sendo processada agora por outra execucao' }, { status: 409 });
+        }
+        const resultado = await enderecoProcessarLinha(env, row, body.mock || null);
+        return Response.json({ ok: true, resultado });
+      } catch (e: any) {
+        console.error(`[enderecos-criar-manual] ${String((e && e.message) || e)}`);
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
+    // Consulta pontual (read-only) contra o creator - responde "esse pedido ja
+    // tem ticket de Endereco Errado?" sem tocar em nada.
+    if (url.pathname === '/api/enderecos-consultar' && request.method === 'GET') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const pedido = (url.searchParams.get('pedido') || '').trim();
+        if (!pedido) return Response.json({ error: 'pedido obrigatorio' }, { status: 400 });
+        const c = await enderecoConsultarTicket(env, pedido);
+        return Response.json({ pedido, issueType: TICKET_ISSUE_TYPE_ENDERECO, ...c });
+      } catch (e: any) {
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
+    // Preview do payload: devolve EXATAMENTE o JSON que iriamos POSTar pro
+    // creator, sem postar nada. Serve pra confirmar o contrato (nome dos campos)
+    // com quem cuida do cx-ticketcreator antes de abrir ticket de verdade - o
+    // erro de nome de campo aqui e do tipo que passa como 200 e some.
+    if (url.pathname === '/api/enderecos-payload-preview' && request.method === 'GET') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const id = url.searchParams.get('id');
+        if (!id) return Response.json({ error: 'id obrigatorio' }, { status: 400 });
+        const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
+        if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
+        return Response.json({
+          destino: TICKET_API_URL + '/gogroup-tickets-clind',
+          metodo: 'POST',
+          headers: { 'x-webhook-secret': '<TICKET_WEBHOOK_SECRET>', 'Content-Type': 'application/json' },
+          payload: montarPayloadCriacaoEndereco(rows[0]),
+        });
+      } catch (e: any) {
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
+    // Descoberta do campo de status do Cosmos. Nao sabemos qual chave do pedido
+    // significa "enviado" - o client do bot so le tms_unique_id. Esta rota
+    // devolve as chaves do pedido e, DAS QUE PARECEM STATUS, tambem o valor.
+    // Nao devolve o resto dos valores de proposito: o pedido do Cosmos carrega
+    // nome, endereco e telefone do cliente, e isso nao precisa passar por aqui
+    // pra a gente descobrir o nome de um campo.
+    if (url.pathname === '/api/enderecos-cosmos-debug' && request.method === 'GET') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const id = url.searchParams.get('id');
+        if (!id) return Response.json({ error: 'id obrigatorio (id da linha em enderecos_para_ticket)' }, { status: 400 });
+        const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
+        if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
+        const row = rows[0];
+        if (!cosmosConfigurado(env)) return Response.json({ error: 'Cosmos nao configurado (COSMOS_BASE_URL / COSMOS_EMAIL / COSMOS_PASSWORD)' }, { status: 400 });
+        const brand = marcaParaBrand(row.marca);
+        const orgId = brand ? cosmosOrgIds(env)[brand] : null;
+        if (!orgId) return Response.json({ error: `marca ${row.marca} (brand ${brand}) sem organization_id em COSMOS_ORG_IDS` }, { status: 400 });
+
+        const pedido = await cosmosBuscarPedido(env, orgId, row.pedido);
+        if (!pedido) return Response.json({ pedido: row.pedido, brand, orgId, encontrado: false });
+
+        const chaves = Object.keys(pedido);
+        const pareceStatus = /state|status|situa|sent|ship|envi|fulfil|deliver/i;
+        const candidatos: Record<string, unknown> = {};
+        chaves.forEach((k) => {
+          if (!pareceStatus.test(k)) return;
+          const v = (pedido as any)[k];
+          if (v === null || ['string', 'number', 'boolean'].indexOf(typeof v) !== -1) candidatos[k] = v;
+        });
+        return Response.json({
+          pedido: row.pedido, brand, orgId, encontrado: true,
+          chavesDoPedido: chaves,
+          camposQueParecemStatus: candidatos,
+          lidoPeloGate: cosmosLerStatus(env, pedido),
+        });
+      } catch (e: any) {
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/api/enderecos-reconciliar' && request.method === 'POST') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10) || 200, 1000);
+        const resultado = await reconciliarEnderecos(env, limit);
+        return Response.json(resultado);
+      } catch (e: any) {
+        console.error(`[enderecos-reconciliar] ${String((e && e.message) || e)}`);
         return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
       }
     }
