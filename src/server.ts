@@ -1367,8 +1367,30 @@ async function buscarTicketsProxy(tabela: string, opts: OpcoesListaTickets): Pro
       encodeURIComponent('"Número do pedido"') + '.ilike.' + encodeURIComponent(padrao),
       'subject.ilike.' + encodeURIComponent(padrao),
     ].join(',')})&order=id.asc&limit=500`;
-    const r = await fetch(url, { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } });
-    if (!r.ok) throw new Error(`Supabase HTTP ${r.status}`);
+    const r = await fetchComTimeout(
+      url,
+      { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } },
+      // FIX ERRO 500 NA BUSCA POR TERMO (21/08/2026, achado real em producao -
+      // Maria reportou "Erro ao buscar: Supabase HTTP 500" buscando "SH58"):
+      // buscarTicketsProxy com opts.termo faz ILIKE '%termo%' (wildcard nos dois
+      // lados, nao usa indice btree) em 3 colunas ao mesmo tempo, sem filtro de
+      // data. Em tickets_gocase (88k linhas) o EXPLAIN ANALYZE mediu 6.36s de
+      // Seq Scan - estoura o statement_timeout da role anon do Supabase (erro
+      // Postgres 57014), que o PostgREST devolve como HTTP 500. Ja existiam
+      // indices trigram GIN (idx_tickets_<tabela>_numero_nf_trgm, _pedido_trgm,
+      // _subject_trgm, extensao pg_trgm) criados nesta mesma correcao - com
+      // eles a mesma query cai pra ~2ms. Este timeout de 12s aqui e so uma rede
+      // de seguranca (ex.: se os indices forem removidos futuramente por engano
+      // ou o volume crescer muito de novo), pra nao deixar a requisicao pendurada
+      // esperando o timeout do proprio browser.
+      12000
+    );
+    if (!r.ok) {
+      const errBody = await r.text().catch(() => '');
+      const msg = `Supabase HTTP ${r.status}${errBody ? `: ${errBody.slice(0, 300)}` : ''}`;
+      console.error(`[tickets-list termo="${opts.termo}" tabela=${tabela}] ${msg}`);
+      throw new Error(msg);
+    }
     return r.json();
   }
   // FIX TIMEOUT (12/08/2026, achado real em producao - Maria reportou erro
@@ -3181,7 +3203,15 @@ export default {
         const rows = await ticketsListComCache(env, tabela, { termo, ini, fim, statusExato, heuristicaExtravio });
         return Response.json(rows);
       } catch (e: any) {
-        return Response.json({ __error: String((e && e.message) || e) });
+        // FIX OBSERVABILIDADE (21/08/2026): antes essa rota devolvia
+        // Response.json({ __error }) com status 200, entao qualquer falha
+        // (timeout do Supabase, coluna invalida, etc.) aparecia como
+        // "outcome: ok" nos logs do GoDeploy - nada disparava como erro,
+        // dificultando o diagnostico. Agora loga de verdade e devolve
+        // status 500, mantendo o campo __error pro frontend continuar
+        // funcionando igual.
+        console.error(`[tickets-list] erro: ${String((e && e.message) || e)}`);
+        return Response.json({ __error: String((e && e.message) || e) }, { status: 500 });
       }
     }
 
