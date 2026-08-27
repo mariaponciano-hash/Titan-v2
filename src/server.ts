@@ -1633,6 +1633,18 @@ async function buscarIntelipost(env: any, marca: MarcaLogistica, termo: string):
   return null;
 }
 
+// GET /shipment_order/invoice/{nf} - resolve pedido a partir da NF (achado
+// 26/08/2026, ver comentario grande em torreBuscarNaMarca, tipo==='nf').
+// `content` vem como array (ver ipBuscarEm - ja trata isso), diferente do
+// endpoint por pedido/rastreio que devolve objeto direto.
+async function buscarIntelipostPorNF(env: any, marca: MarcaLogistica, nf: string): Promise<any | null> {
+  const apiKey = env[marca.envIntelipost];
+  if (!apiKey) return null;
+  const headers = { 'api-key': apiKey, 'Content-Type': 'application/json' };
+  const nfUrl = encodeURIComponent(nf.trim());
+  return ipBuscarEm(headers, `https://api.intelipost.com.br/api/v1/shipment_order/invoice/${nfUrl}`);
+}
+
 async function buscarShopifyPorNome(env: any, marca: MarcaLogistica, nome: string): Promise<any | null> {
   const token = env[marca.envShopify];
   if (!token) return null;
@@ -2127,19 +2139,21 @@ async function torreBuscarNaMarca(env: any, marca: MarcaLogistica, termo: string
     }));
     outrosPedidos = outrosPedidos.filter((p) => p.numero_pedido !== termoIntelipost);
   } else if (tipo === 'nf') {
-    // NF nao e buscavel direto na Intelipost. A tabela de tickets ja tem o
-    // par NF -> numero do pedido, entao usamos ela como tradutora.
-    const porNf = await buscarTicketsDoPedido('', termo);
-    const doMarca = porNf.filter((t) => String(t.marca || '').toUpperCase() === marca.marcaSupabase);
-    const candidato = doMarca.length ? doMarca[0] : null;
-    if (candidato) {
-      // "Rastreio" e o order_number nativo da Intelipost - o caminho mais direto.
-      const chave = candidato['Rastreio'] || candidato['Número do pedido'];
-      if (chave) intelipost = await buscarIntelipost(env, marca, String(chave));
-      termoIntelipost = String(candidato['Número do pedido'] || termo);
+    // NF E buscavel direto na Intelipost via GET /shipment_order/invoice/{nf}
+    // (achado 26/08/2026 na documentacao oficial - docs.intelipost.com.br -
+    // depois de pesquisar por "nota fiscal": o comentario antigo aqui dizia
+    // que NF nao era buscavel porque so tinham sido testados os 3 endpoints
+    // por pedido/rastreio/sales_order_number, nunca esse). Isso substitui o
+    // caminho antigo (tabela de tickets como tradutora NF->pedido, com
+    // fallback de mandar a NF pra Intelipost como se fosse pedido quando nao
+    // achava ticket - fallback que causou um bug real de PEDIDO ERRADO por
+    // coincidencia numerica, ver validacao de seguranca logo abaixo). Esse
+    // endpoint e a propria Intelipost resolvendo a NF, sem chute nenhum.
+    intelipost = await buscarIntelipostPorNF(env, marca, termo);
+    if (intelipost && intelipost.order_number) {
+      termoIntelipost = String(intelipost.order_number);
+      shopify = await buscarShopifyPorNome(env, marca, termoIntelipost);
     }
-    if (!intelipost) intelipost = await buscarIntelipost(env, marca, termo);
-    shopify = await buscarShopifyPorNome(env, marca, termoIntelipost);
     if (!intelipost && !shopify) return null;
   } else {
     intelipost = await buscarIntelipost(env, marca, termo);
@@ -2165,17 +2179,14 @@ async function torreBuscarNaMarca(env: any, marca: MarcaLogistica, termo: string
     ? normalizarIntelipost(intelipost)
     : { encontrado: false, pedido: {}, transportadora: {}, remetente: {}, destinatario: {}, kpi: {}, timeline: [] };
 
-  // VALIDACAO DE SEGURANCA pra busca por NF (25/08/2026, bug real encontrado
-  // pela Ivna): quando tipo==='nf' e nao ha ticket historico pra traduzir NF
-  // -> pedido (candidato null acima), o codigo cai num fallback que manda o
-  // MESMO numero pra Intelipost/Shopify como se fosse pedido/rastreio. Isso
-  // as vezes bate por COINCIDENCIA NUMERICA num pedido real mas TOTALMENTE
-  // diferente (confirmado: buscando NF 886691 sem ticket previo, o fallback
-  // achou um pedido real da Apice cuja NF de verdade e 231787 - o numero
-  // 886691 era o numero do PEDIDO desse outro pedido, nao uma NF). Sem essa
-  // checagem, a tela mostra silenciosamente o pedido errado. So valida
-  // quando o pedido encontrado TEM uma NF preenchida (pedido novo sem NF
-  // ainda emitida nao tem o que comparar, e nao deve ser rejeitado por isso).
+  // VALIDACAO DE SEGURANCA pra busca por NF - hoje redundante (buscarIntelipostPorNF
+  // ja resolve pela propria Intelipost, sem chute), mas mantida como
+  // cinto-e-suspensorio barato: ate 25/08/2026 o caminho antigo (fallback que
+  // mandava a NF pra Intelipost como se fosse pedido quando nao achava ticket
+  // historico) causou um bug real de PEDIDO ERRADO por coincidencia numerica
+  // (NF 886691 sem ticket bateu num pedido real da Apice cuja NF de verdade
+  // era 231787). So valida quando o pedido encontrado TEM uma NF preenchida
+  // (pedido novo sem NF ainda emitida nao tem o que comparar).
   if (tipo === 'nf' && base.pedido && base.pedido.numero_nf && String(base.pedido.numero_nf).trim() !== String(termo).trim()) {
     return null;
   }
@@ -2348,25 +2359,6 @@ export default {
         // explicitamente como Apice - com "auto" nao da pra saber se e um
         // pedido Apice ou uma NF de outra marca, entao mantem o bloqueio.
         if (tipo === 'nf' && marcaId === 'apice') tipo = 'pedido';
-        // Busca por NF pura desativada (26/08/2026, a pedido da Ivna): a
-        // Intelipost nao aceita NF como chave, entao o unico caminho era
-        // resolver via ticket historico OU (sem ticket) mandar o mesmo numero
-        // pra Intelipost/Shopify como se fosse pedido/rastreio - e isso ja
-        // gerou um bug real de PEDIDO ERRADO por coincidencia numerica (ver
-        // comentario grande em torreBuscarNaMarca, tipo==='nf', 25/08/2026).
-        // A validacao adicionada la mitiga mas nao elimina o risco pra
-        // pedidos sem NF preenchida ainda. Mais seguro nao tentar: pedido sem
-        // ticket e sem NF/pedido resolvivel direto fica pro Unilog CD (que
-        // le o infos_titan) ou pro numero do pedido mesmo.
-        if (tipo === 'nf') {
-          return Response.json({
-            encontrado: false,
-            termo,
-            tipo_busca: tipo,
-            marcas_tentadas: [],
-            error: `Busca por NF não é suportada com segurança pela Torre (risco de achar o pedido errado por coincidência numérica) - use o número do pedido, ou confira na Unilog CD/Titan BI se só tiver a NF.`,
-          }, { status: 400 });
-        }
         let candidatas: MarcaLogistica[];
         if (marcaId && marcaId !== 'auto') {
           const m = getMarcaLogistica(marcaId);

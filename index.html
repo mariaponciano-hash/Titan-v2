@@ -1599,7 +1599,7 @@ function renderTorre() {
     +   '<div class="torre-search-row">'
     +     '<div class="torre-search-field">'
     +       '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4.3-4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
-    +       '<input type="text" id="torre-termo" placeholder="Buscar por nº do pedido ou CPF..." value="' + tEsc(torreState.termo) + '" onkeydown="if(event.key===\'Enter\')torreBuscar()">'
+    +       '<input type="text" id="torre-termo" placeholder="Buscar por NF, nº do pedido ou CPF..." value="' + tEsc(torreState.termo) + '" onkeydown="if(event.key===\'Enter\')torreBuscar()">'
     +     '</div>'
     +     '<select class="filter-select" id="torre-marca" style="padding:11px 14px;border-radius:24px">' + marcaOpts + '</select>'
     +     '<button class="torre-btn" id="torre-btn-buscar" onclick="torreBuscar()"' + (torreState.carregando ? ' disabled' : '') + '>'
@@ -2421,7 +2421,7 @@ function torreBuscar() {
   var sel = document.getElementById('torre-marca');
   var termo = inp ? inp.value.trim() : '';
   if (sel) torreState.marca = sel.value;
-  if (!termo) { alert('Digite o nº do pedido ou o CPF do cliente.'); return; }
+  if (!termo) { alert('Digite a NF, o nº do pedido ou o CPF do cliente.'); return; }
   torreState.termo = termo;
   torreState.formAberto = false;
   torreState.resultadoEnvio = null;
