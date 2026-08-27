@@ -4,7 +4,8 @@ titan_romaneio_links.py
 Roda periodicamente (GitHub Actions, ver .github/workflows/titan_romaneio_links.yml)
 e preenche infos_titan.romaneio_link pra pedidos ja EMBARCADO, casando o
 numero do romaneio com o PDF correspondente numa pasta do Google Drive
-("Romaneios", compartilhada com a conta gogroup).
+("Romaneios", compartilhada com a conta gogroup, id ROMANEIOS_FOLDER_ID
+abaixo).
 
 QUEM RODA ISSO: o proprio GitHub Actions, sem supervisao - mesmo padrao ja
 aceito pro titan_backfill.py e pro titan-watcher-worker (Cloudflare):
@@ -20,25 +21,43 @@ revogado. Precisa de 3 variaveis de ambiente:
     GOOGLE_OAUTH_CLIENT_SECRET
     GOOGLE_OAUTH_REFRESH_TOKEN
 
+BUSCA ESCOPADA POR SUBPASTA (corrigido 27/08/2026 - primeira versao
+buscava "name contains {romaneio}" sem restringir pasta e nao achou NADA
+em 1000 tentativas): a API do Drive nao indexa de forma confiavel uma
+busca por nome que atravesse subpastas de uma pasta so compartilhada (nao
+"adicionada ao Meu Drive") - precisa escopar explicitamente pelos ids das
+subpastas (uma por transportadora: ANJUN EXPRESS, CORREIOS, DIALOGO
+LOGISTICA, DIASLOG, J&T EXPRESS, L4B, LOG SERVICOS, PDFs - listadas uma
+vez no inicio da execucao, nunca hardcoded, pra sobreviver se criarem uma
+pasta nova). Como infos_titan nao guarda qual transportadora fez o
+pedido, a query busca em TODAS as subpastas de uma vez (clausula "OR" de
+parents), nao uma por vez.
+
 PADRAO DE NOME DO ARQUIVO (confirmado com print real da pasta,
 27/08/2026): "{romaneio} - {TRANSPORTADORA} - {DD-MM-AAAA}_{HH.MM}.pdf",
-ex: "166015 - ANJUN EXPRESS - 10-06-2026_17.37.pdf". Busca por nome
-contendo o romaneio, SEM restringir subpasta (a pasta tem uma subpasta
-por transportadora - buscar sem filtro de pasta poupa o trabalho de
-mapear nome de transportadora -> nome de subpasta), depois filtra em
-Python por nome comecando com "{romaneio} " pra nao confundir com um
-romaneio que seja substring de outro (ex: buscar "166" nao deveria bater
-com "1660158").
+ex: "166015 - ANJUN EXPRESS - 10-06-2026_17.37.pdf". Filtra em Python por
+nome comecando com "{romaneio} " pra nao confundir com um romaneio que
+seja substring de outro (ex: buscar "166" nao deveria bater com
+"1660158").
 
-DUPLICATA: se mais de um arquivo bater pro mesmo romaneio (aconteceu no
-print real - 166282 apareceu duas vezes, datas diferentes), pega o mais
-recente por modifiedTime.
+DEDUP POR ROMANEIO (corrigido 27/08/2026): um romaneio e um lote que
+cobre VARIOS pedidos - o log da primeira versao mostrou o mesmo romaneio
+repetido ate 6x. Busca no Drive so uma vez por romaneio unico, aplica o
+link achado a todos os pedidos daquele romaneio.
 
-SEM LIMITE DE TENTATIVAS: um pedido que nunca acha PDF correspondente
+DUPLICATA DE ARQUIVO: se mais de um PDF bater pro mesmo romaneio
+(aconteceu no print real - 166282 apareceu duas vezes, datas diferentes),
+pega o mais recente por modifiedTime.
+
+PAGINACAO NO SUPABASE (corrigido 27/08/2026): a primeira versao nao
+paginava - PostgREST corta em 1000 linhas por padrao, e "1000
+pedido(s)... " no primeiro log era bem provavelmente esse teto, nao o
+total real. Agora pagina em blocos ate a pagina vir vazia.
+
+SEM LIMITE DE TENTATIVAS: um romaneio que nunca acha PDF correspondente
 (documento ainda nao subiu na pasta) e retentado em toda execucao pra
-sempre - aceitavel porque e barato (poucas dezenas de pedidos por vez,
-2x/dia) e se autocura sozinho assim que o documento aparecer. Revisar se
-o volume crescer muito.
+sempre - aceitavel porque agora e barato (1 busca por romaneio UNICO,
+nao por pedido) e se autocura sozinho assim que o documento aparecer.
 
 NAO MEXE em nada alem de romaneio_link - status/situacao/romaneio em si
 continuam vindo so do titan_cf_worker/titan_backfill.py.
@@ -55,6 +74,9 @@ TABELA = "infos_titan"
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+ROMANEIOS_FOLDER_ID = "1EHi3gB7b0fYZ7nDODjWWyzcRRAlBFdlj"
+
+PAGINA = 1000
 
 
 def _http_json(method, url, headers=None, data=None, form=False):
@@ -99,12 +121,23 @@ def _supabase_request(method, path, body=None):
 
 
 def buscar_pendentes_de_link():
-    """Pedidos EMBARCADO com romaneio conhecido mas sem link ainda."""
-    q = (
-        f"{TABELA}?situacao=eq.EMBARCADO&romaneio=not.is.null"
-        f"&romaneio_link=is.null&select=numero_nf,marca,romaneio"
-    )
-    return _supabase_request("GET", q) or []
+    """Pedidos EMBARCADO com romaneio conhecido mas sem link ainda - pagina
+    ate a pagina vir vazia, pra nao truncar silenciosamente no teto padrao
+    de 1000 linhas do PostgREST."""
+    resultado = []
+    offset = 0
+    while True:
+        q = (
+            f"{TABELA}?situacao=eq.EMBARCADO&romaneio=not.is.null"
+            f"&romaneio_link=is.null&select=numero_nf,marca,romaneio"
+            f"&limit={PAGINA}&offset={offset}"
+        )
+        pagina = _supabase_request("GET", q) or []
+        resultado.extend(pagina)
+        if len(pagina) < PAGINA:
+            break
+        offset += PAGINA
+    return resultado
 
 
 def gravar_link(numero_nf, marca, link):
@@ -115,9 +148,21 @@ def gravar_link(numero_nf, marca, link):
     _supabase_request("PATCH", path, {"romaneio_link": link})
 
 
-def achar_arquivo_do_romaneio(access_token, romaneio):
+def listar_subpastas(access_token, pasta_id):
     headers = {"Authorization": f"Bearer {access_token}"}
-    query = f"name contains '{romaneio}' and mimeType = 'application/pdf' and trashed = false"
+    query = f"'{pasta_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    params = urllib.parse.urlencode({"q": query, "fields": "files(id,name)", "pageSize": 100})
+    resp = _http_json("GET", f"{GOOGLE_DRIVE_FILES_URL}?{params}", headers=headers)
+    return resp.get("files") or []
+
+
+def achar_arquivo_do_romaneio(access_token, romaneio, subpasta_ids):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    clausula_pastas = " or ".join(f"'{pid}' in parents" for pid in subpasta_ids)
+    query = (
+        f"({clausula_pastas}) and name contains '{romaneio}' "
+        f"and mimeType = 'application/pdf' and trashed = false"
+    )
     params = urllib.parse.urlencode({
         "q": query,
         "fields": "files(id,name,webViewLink,modifiedTime)",
@@ -136,28 +181,43 @@ def achar_arquivo_do_romaneio(access_token, romaneio):
 
 def main():
     access_token = obter_access_token()
+
+    subpastas = listar_subpastas(access_token, ROMANEIOS_FOLDER_ID)
+    if not subpastas:
+        print("Nao achei nenhuma subpasta dentro de Romaneios - confira o acesso da conta autorizada.", file=sys.stderr)
+        sys.exit(1)
+    subpasta_ids = [f["id"] for f in subpastas]
+    print(f"{len(subpastas)} subpasta(s) de transportadora: {', '.join(f['name'] for f in subpastas)}")
+
     pendentes = buscar_pendentes_de_link()
     if not pendentes:
         print("Nenhum pedido EMBARCADO sem link de romaneio.")
         return
 
-    print(f"{len(pendentes)} pedido(s) EMBARCADO sem link - procurando na pasta Romaneios...")
-    achados = 0
+    por_romaneio = {}
     for item in pendentes:
         romaneio = str(item.get("romaneio") or "").strip()
         numero_nf = str(item.get("numero_nf") or "").strip()
         marca = str(item.get("marca") or "").strip()
         if not romaneio or not numero_nf or not marca:
             continue
-        arquivo = achar_arquivo_do_romaneio(access_token, romaneio)
-        if not arquivo:
-            print(f"  [romaneio {romaneio}] nao achei PDF na pasta Romaneios.")
-            continue
-        gravar_link(numero_nf, marca, arquivo["webViewLink"])
-        achados += 1
-        print(f"  [romaneio {romaneio}] {arquivo['name']} -> gravado.")
+        por_romaneio.setdefault(romaneio, []).append((numero_nf, marca))
 
-    print(f"{achados}/{len(pendentes)} link(s) gravado(s).")
+    print(f"{len(pendentes)} pedido(s) sem link, {len(por_romaneio)} romaneio(s) unico(s) - procurando na pasta Romaneios...")
+    romaneios_achados = 0
+    pedidos_gravados = 0
+    for romaneio, pares in por_romaneio.items():
+        arquivo = achar_arquivo_do_romaneio(access_token, romaneio, subpasta_ids)
+        if not arquivo:
+            print(f"  [romaneio {romaneio}] nao achei PDF ({len(pares)} pedido(s) aguardando).")
+            continue
+        romaneios_achados += 1
+        for numero_nf, marca in pares:
+            gravar_link(numero_nf, marca, arquivo["webViewLink"])
+            pedidos_gravados += 1
+        print(f"  [romaneio {romaneio}] {arquivo['name']} -> gravado em {len(pares)} pedido(s).")
+
+    print(f"{romaneios_achados}/{len(por_romaneio)} romaneio(s) achado(s), {pedidos_gravados}/{len(pendentes)} pedido(s) atualizado(s).")
 
 
 if __name__ == "__main__":
