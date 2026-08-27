@@ -43,6 +43,8 @@
 #torre-marca{flex:0 0 auto;width:230px}
 .torre-search-field:focus-within{border-color:var(--blue);box-shadow:0 0 0 3px var(--blue-bg);background:var(--white)}
 .torre-search-field input{border:none;background:none;outline:none;font-size:14px;font-family:'Poppins',sans-serif;color:var(--ink);width:100%}
+.torre-clear-btn{flex:0 0 auto;border:none;background:none;color:var(--muted,#8a8f98);font-size:18px;line-height:1;cursor:pointer;padding:2px 4px;border-radius:50%}
+.torre-clear-btn:hover{color:var(--ink);background:var(--border-2)}
 .torre-btn{padding:11px 22px;border-radius:24px;border:none;background:var(--blue);color:var(--white);font-size:13px;font-weight:600;font-family:'Poppins',sans-serif;cursor:pointer;transition:all .15s;white-space:nowrap}
 .torre-btn:hover{background:#1d4680}
 .torre-btn:disabled{opacity:.55;cursor:not-allowed}
@@ -1600,6 +1602,7 @@ function renderTorre() {
     +     '<div class="torre-search-field">'
     +       '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4.3-4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
     +       '<input type="text" id="torre-termo" placeholder="Buscar por NF, nº do pedido ou CPF..." value="' + tEsc(torreState.termo) + '" onkeydown="if(event.key===\'Enter\')torreBuscar()">'
+    +       (torreState.termo ? '<button type="button" class="torre-clear-btn" onclick="torreLimparBusca()" title="Limpar busca">&times;</button>' : '')
     +     '</div>'
     +     '<select class="filter-select" id="torre-marca" style="padding:11px 14px;border-radius:24px">' + marcaOpts + '</select>'
     +     '<button class="torre-btn" id="torre-btn-buscar" onclick="torreBuscar()"' + (torreState.carregando ? ' disabled' : '') + '>'
@@ -2416,6 +2419,18 @@ function renderTorreResultado(d) {
 }
 
 // --- Acoes ---------------------------------------------------------------
+function torreLimparBusca() {
+  torreState.termo = '';
+  torreState.marca = 'auto';
+  torreState.dados = null;
+  torreState.erro = '';
+  torreState.formAberto = false;
+  torreState.resultadoEnvio = null;
+  renderTorre();
+  var inp = document.getElementById('torre-termo');
+  if (inp) inp.focus();
+}
+
 function torreBuscar() {
   var inp = document.getElementById('torre-termo');
   var sel = document.getElementById('torre-marca');
