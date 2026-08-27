@@ -52,6 +52,7 @@ Nota Fiscal (nao o "Numero do Pedido" do Titan, que e interno do armazem).
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -413,11 +414,17 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
         )
         botao_opcoes.click()
 
-        item_exportar = elemento_visivel(frame.get_by_text("Exportar dados", exact=True), timeout_ms=10000)
+        # Mesmo idioma trocou aqui tambem (confirmado via titan_debug: o menu
+        # do "..." agora mostra "Export data" em vez de "Exportar dados").
+        # Aceita os dois pra nao quebrar de novo se o Power BI voltar pro
+        # PT-BR em algum momento.
+        item_exportar = elemento_visivel(
+            frame.get_by_text(re.compile(r"^(Exportar dados|Export data)$")), timeout_ms=10000
+        )
         item_exportar.click()
 
         botao_exportar_dialogo = elemento_visivel(
-            frame.get_by_role("button", name="Exportar", exact=True), timeout_ms=15000
+            frame.get_by_role("button", name=re.compile(r"^(Exportar|Export)$")), timeout_ms=15000
         )
         with frame.page.expect_download(timeout=180000) as download_info:
             botao_exportar_dialogo.click()
