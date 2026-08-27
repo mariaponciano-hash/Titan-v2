@@ -2481,13 +2481,16 @@ function torreAbrirForm() {
 }
 
 // Pede pro Titan BI consultar o romaneio de verdade deste pedido (24/08/2026,
-// a pedido da Ivna). O trabalho pesado (login no Titan, scraping) roda num
-// script Python no PC dela, nunca aqui - isso so avisa uma fila no Supabase
-// (POST /api/logistica/titan-solicitar) e fica de olho no resultado
-// (torrePollTitanStatus). Se o script nao estiver rodando naquele momento, o
-// pedido so fica "pendente" pra sempre e o polling desiste depois de um
-// tempo - tanto o campo do formulario quanto o painel "Dados do Pedido"
-// continuam mostrando/editando isso manualmente o tempo todo.
+// a pedido da Ivna). O trabalho pesado (login no Titan, scraping) roda no
+// titan-watcher-worker (Cloudflare, Cron a cada 5 min - migrado do script
+// Python que rodava no PC da Ivna, ver titan_cf_worker/), nunca aqui - isso
+// so avisa uma fila no Supabase (POST /api/logistica/titan-solicitar) e
+// fica de olho no resultado (torrePollTitanStatus). Se o Cron ainda nao
+// tiver rodado de novo (ate 5 min), o pedido fica "pendente" e o polling
+// desiste depois de ~80s - tanto o campo do formulario quanto o painel
+// "Dados do Pedido" continuam mostrando/editando isso manualmente o tempo
+// todo. Um romaneio ja resolvido antes continua valendo mesmo que o status
+// volte a 'pendente' num recheck (ver torreAtualizarUiTitan).
 // Chamada tanto ao pesquisar (torreBuscar) quanto ao abrir o form
 // (torreAbrirForm) - o backend so enfileira de verdade na primeira vez
 // (ver /api/logistica/titan-solicitar), as chamadas seguintes so conferem o
@@ -2581,9 +2584,20 @@ function torreAtualizarUiTitan(d, tentativa) {
     [fillForm, fillPainel].forEach(function(f) { if (f) f.style.width = (percentual || 0) + '%'; });
   }
 
+  // O romaneio ja gravado vale mesmo se status !== 'concluido' (bug real
+  // reportado pela Ivna, 27/08/2026): o recheck automatico do
+  // titan-watcher-worker devolve pedidos com situacao nao-final pra fila
+  // (status volta a 'pendente') pra tentar achar uma atualizacao mais
+  // recente, mas o romaneio ja confirmado antes continua valido nessa
+  // linha - so a situacao/data podem estar desatualizadas por uns minutos.
+  // Sem essa checagem primeiro, a tela ficava "Consultando..." ate estourar
+  // o timeout mesmo com o romaneio ja disponivel no Supabase.
+  if (d.romaneio) {
+    aplicar('✓ confirmado no Titan BI - confira antes de repassar.', 'var(--green)', d.romaneio, null);
+    return true;
+  }
   if (d.status === 'concluido') {
-    if (d.romaneio) aplicar('✓ confirmado no Titan BI - confira antes de repassar.', 'var(--green)', d.romaneio, null);
-    else aplicar('Titan BI consultado, mas não achou romaneio para este pedido.', 'var(--ink-3)', null, null);
+    aplicar('Titan BI consultado, mas não achou romaneio para este pedido.', 'var(--ink-3)', null, null);
     return true;
   }
   if (d.status === 'erro') {
@@ -2592,7 +2606,7 @@ function torreAtualizarUiTitan(d, tentativa) {
   }
   if (d.status === 'inexistente') { aplicar('', 'var(--ink-3)', null, null); return true; }
   if (d.status === 'timeout') {
-    aplicar('Titan BI não respondeu a tempo - confirme se o script está rodando no seu PC.', 'var(--orange)', null, null);
+    aplicar('Titan BI não respondeu a tempo - o pedido está na fila e deve resolver sozinho em poucos minutos, tente consultar de novo.', 'var(--orange)', null, null);
     return true;
   }
   // 'pendente'
@@ -3007,7 +3021,11 @@ function unilogPollTitanStatus(numeroNf, marca, tentativa) {
     .then(function(d) {
       unilogState.titan = d;
       unilogState.titanStatus = d.status;
-      var terminou = ['concluido', 'erro', 'inexistente'].indexOf(d.status) !== -1;
+      // Situacao/romaneio ja gravados valem mesmo com status==='pendente'
+      // (mesmo bug real corrigido na Torre, 27/08/2026 - o recheck
+      // automatico devolve pedidos com situacao nao-final pra fila e o
+      // status volta a 'pendente', mas o dado cacheado continua valido).
+      var terminou = ['concluido', 'erro', 'inexistente'].indexOf(d.status) !== -1 || !!(d.situacao || d.romaneio);
       unilogRenderTitanPainelDom();
       if (terminou) return;
       if (tentativa < UNILOG_TITAN_MAX_TENTATIVAS) {
@@ -3038,20 +3056,25 @@ function unilogRenderTitanPainelDom() {
 function renderUnilogTitanPaineis() {
   var status = unilogState.titanStatus;
   var t = unilogState.titan || {};
+  // Se ja tem situacao/romaneio cacheados, mostra a tabela de dados direto
+  // - nao importa se o status voltou a 'pendente'/'erro' num recheck mais
+  // recente (mesmo raciocinio do fix na Torre, 27/08/2026: dado antigo
+  // ainda vale, so pode estar levemente desatualizado por uns minutos).
+  var temDados = !!(t.situacao || t.romaneio);
   if (status === 'sem_nf') {
     return '<div class="torre-alert warn">Este pedido ainda não tem Nota Fiscal emitida - o Titan BI só é consultável por NF.</div>';
   }
-  if (status === 'pendente' || status === '') {
+  if (!temDados && (status === 'pendente' || status === '')) {
     var elapsedS = unilogState._titanInicioMs ? Math.round((Date.now() - unilogState._titanInicioMs) / 1000) : 0;
     return '<div class="state-box"><p>Consultando o Titan BI... (' + elapsedS + 's)</p></div>';
   }
-  if (status === 'timeout') {
-    return '<div class="torre-alert warn">Titan BI não respondeu a tempo - confirme se o script (titan_watcher.py) está rodando.</div>';
+  if (!temDados && status === 'timeout') {
+    return '<div class="torre-alert warn">Titan BI não respondeu a tempo - o pedido está na fila e deve resolver sozinho em poucos minutos, tente consultar de novo.</div>';
   }
-  if (status === 'erro') {
+  if (!temDados && status === 'erro') {
     return '<div class="torre-alert err">Titan BI: ' + tEsc(t.erro || 'erro desconhecido') + '</div>';
   }
-  if (status === 'inexistente' || (status === 'concluido' && !t.situacao && !t.romaneio)) {
+  if (!temDados && (status === 'inexistente' || status === 'concluido')) {
     return '<div class="torre-alert warn">NF não encontrada no Titan BI para esta marca.</div>';
   }
 
