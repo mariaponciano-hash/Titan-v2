@@ -1642,7 +1642,21 @@ async function buscarIntelipostPorNF(env: any, marca: MarcaLogistica, nf: string
   if (!apiKey) return null;
   const headers = { 'api-key': apiKey, 'Content-Type': 'application/json' };
   const nfUrl = encodeURIComponent(nf.trim());
-  return ipBuscarEm(headers, `https://api.intelipost.com.br/api/v1/shipment_order/invoice/${nfUrl}`);
+  const node = await ipBuscarEm(headers, `https://api.intelipost.com.br/api/v1/shipment_order/invoice/${nfUrl}`);
+  if (!node) return null;
+  // O endpoint /invoice/{nf} devolve order_number mas nao os itens do
+  // volume (vol.products vem vazio - bug real achado pela Ivna,
+  // 26/08/2026: "Itens do pedido" ficava sempre "-"). Nao confiamos em
+  // ehPayloadRico aqui (foi desenhado pro payload enxuto do
+  // sales_order_number, que falta OUTROS campos - nao necessariamente os
+  // mesmos deste endpoint) - so refaz a chamada pra pegar produtos.
+  const vol = (node.shipment_order_volume_array && node.shipment_order_volume_array[0]) || {};
+  const temItens = Array.isArray(vol.products) && vol.products.length > 0;
+  if (!temItens && node.order_number) {
+    const rico = await ipBuscarEm(headers, `https://api.intelipost.com.br/api/v1/shipment_order/${encodeURIComponent(node.order_number)}`);
+    if (rico) return rico;
+  }
+  return node;
 }
 
 async function buscarShopifyPorNome(env: any, marca: MarcaLogistica, nome: string): Promise<any | null> {
