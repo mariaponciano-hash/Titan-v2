@@ -23,3 +23,11 @@ create index if not exists infos_titan_status_atualizado_idx
 create index if not exists infos_titan_romaneio_link_pendente_idx
   on public.infos_titan (situacao, atualizado_em)
   where romaneio_link is null and romaneio is not null;
+
+-- Terceiro indice (27/08/2026): ate um simples "romaneio=eq.X" (achar todos
+-- os pedidos de um romaneio, pra copiar o link de um pra quem ainda nao
+-- tem) estourou o mesmo erro 57014 - nao existia indice nenhum na coluna
+-- romaneio sozinha. Sem "where" (nao e parcial) porque esse acesso e por
+-- valor especifico de romaneio, nao por "ainda pendente".
+create index if not exists infos_titan_romaneio_idx
+  on public.infos_titan (romaneio);
