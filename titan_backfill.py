@@ -208,7 +208,13 @@ def definir_periodo(frame, data_inicial, data_final):
     de verdade a 1a linha aparecer em vez de um sleep fixo.
     """
     try:
-        rotulo = scraper.elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False))
+        # timeout_ms=60000 (era o padrao de 30000) - achado real rodando via
+        # GitHub Actions (28/08/2026): o rotulo existe de verdade (confirmado
+        # print real da Ivna no navegador dela) mas nao apareceu NENHUMA VEZ
+        # no HTML capturado apos os 30s padrao - o runner (CPU compartilhada)
+        # parece ser bem mais lento que um PC normal pra este slicer
+        # especifico do Power BI terminar de renderizar.
+        rotulo = scraper.elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
         caixa = rotulo.bounding_box()
         if not caixa:
             raise PWTimeout("rotulo 'Data Inicial - Data Final' visivel mas sem bounding_box (layout inesperado)")
