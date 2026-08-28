@@ -49,21 +49,49 @@ DUPLICATA DE ARQUIVO: se mais de um PDF bater pro mesmo romaneio
 (aconteceu no print real - 166282 apareceu duas vezes, datas diferentes),
 pega o mais recente por modifiedTime.
 
-PAGINACAO E JANELA DE TEMPO (corrigido 27/08/2026, dois problemas reais):
-1. A primeira versao nao paginava - PostgREST corta em 1000 linhas por
-   padrao, e "1000 pedido(s)..." no primeiro log era esse teto, nao o
-   total real. Ainda pagina em blocos (PAGINA=1000).
-2. Sem limite de data, a consulta achou mais de 249 MIL linhas historicas
-   sem link (o backfill original cobre meses de pedidos ja embarcados ha
-   tempo) - OFFSET tao fundo (pagina ~250) estourou statement timeout do
-   Postgres (57014). Agora so considera pedidos EMBARCADO nos ultimos
-   JANELA_DIAS (45) dias, por atualizado_em - suficiente, ja que EMBARCADO
-   e status final e atualizado_em nao muda mais depois disso.
+INDICES NO POSTGRES (27/08/2026 - ver infos_titan_add_status_atualizado_index.sql):
+a consulta filtra por situacao+romaneio_link+atualizado_em - sem indice
+pra essa combinacao, o Postgres varria a tabela inteira e estourava
+statement timeout (57014) toda vez, nao importa como a paginacao do lado
+do cliente fosse feita. Precisa rodar aquele SQL antes deste script
+funcionar de verdade.
+
+PAGINACAO POR CURSOR, NAO OFFSET: OFFSET fica mais lento quanto mais
+fundo vai (o Postgres precisa escanear/pular todas as linhas anteriores
+toda vez) - com uma janela de JANELA_DIAS dias ainda sobram centenas de
+milhares de linhas reais (volume legitimo do negocio - varias dezenas de
+milhares de pedidos por dia), entao OFFSET profundo estourava statement
+timeout mesmo com indice. Cursor por atualizado_em (ordenado, "pegue so o
+que e mais novo que o ultimo que eu vi") nao degrada com a profundidade.
+A partir da 2a pagina o corte usa "gt" (estritamente maior), nunca "gte" -
+de proposito, pra garantir que o cursor sempre avanca (com "gte" repetido,
+uma pagina cheia so de linhas com timestamp identico faria o corte nunca
+mudar = loop infinito). Isso pode deixar de fora, so nesta passada, linhas
+empatadas com a ultima vista que nao couberam na mesma pagina - sem
+problema, ainda batem romaneio_link=is.null e entram na proxima passada.
+
+CURSOR PERSISTIDO ENTRE EXECUCOES (27/08/2026, a pedido da Ivna - ver
+infos_titan_romaneio_links_cursor.sql): sem isso, toda execucao
+recomecava do inicio da janela de JANELA_DIAS dias - um romaneio sem PDF
+na pasta (ainda nao subiu) ficava sempre na FRENTE da fila (ordenada por
+atualizado_em) e era retentado em toda execucao, gastando o tempo do
+timeout de 30min antes do script alcancar romaneios mais novos nunca
+tentados. Agora guarda em titan_romaneio_links_cursor (tabela singleton)
+o atualizado_em ate onde uma PAGINA INTEIRA foi processada (buscada +
+todos os romaneios dela tentados no Drive) - a proxima execucao continua
+dali via "gt", em vez de "gte" do inicio da janela. Quando uma pagina
+volta menor que PAGINA (alcancou o fim - nao ha mais nada mais novo na
+janela), o cursor e resetado (apagado) de proposito: fecha uma volta
+completa e a proxima execucao recomeca do zero, dando aos romaneios que
+nunca foram achados uma nova chance (o PDF pode ter subido nesse meio
+tempo). Se o job for interrompido no meio de uma pagina (timeout do
+GitHub Actions), so aquela pagina em andamento e re-tentada na proxima
+execucao - nao a janela inteira de novo.
 
 SEM LIMITE DE TENTATIVAS: um romaneio que nunca acha PDF correspondente
-(documento ainda nao subiu na pasta) e retentado em toda execucao pra
-sempre - aceitavel porque agora e barato (1 busca por romaneio UNICO,
-nao por pedido) e se autocura sozinho assim que o documento aparecer.
+(documento ainda nao subiu na pasta) e retentado a cada volta completa do
+cursor - aceitavel porque agora e barato (1 busca por romaneio UNICO, nao
+por pedido) e se autocura sozinho assim que o documento aparecer.
 
 NAO MEXE em nada alem de romaneio_link - status/situacao/romaneio em si
 continuam vindo so do titan_cf_worker/titan_backfill.py.
@@ -80,6 +108,7 @@ from datetime import datetime, timedelta, timezone
 SUPABASE_URL = "https://ozwcyrkzsqzmavjtsmsp.supabase.co"
 SUPABASE_KEY = "sb_publishable_CPF6bT_HC0jkTvYWnxHmDg_61qaWqSQ"
 TABELA = "infos_titan"
+CURSOR_TABELA = "titan_romaneio_links_cursor"
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
@@ -88,12 +117,9 @@ ROMANEIOS_FOLDER_ID = "1EHi3gB7b0fYZ7nDODjWWyzcRRAlBFdlj"
 PAGINA = 1000
 # So considera pedidos EMBARCADO recentemente (por atualizado_em, que pra um
 # pedido ja EMBARCADO reflete quando ele chegou nesse status - o recheck
-# nao toca mais nele depois, EMBARCADO e status final). Motivo (27/08/2026):
-# sem essa janela, a consulta achou mais de 249 MIL linhas historicas sem
-# link (o backfill original cobriu meses de pedidos ja embarcados havia
-# tempo) - paginar isso com OFFSET estourava statement timeout do Postgres
-# depois de ~250 paginas, e documento de romaneio de pedido tao antigo
-# provavelmente nem serve mais pra nada pratico.
+# nao toca mais nele depois, EMBARCADO e status final). So usado quando NAO
+# ha cursor salvo (primeira execucao, ou logo apos uma volta completa) -
+# ver CURSOR PERSISTIDO no docstring acima.
 JANELA_DIAS = 45
 
 
@@ -149,43 +175,44 @@ def obter_access_token():
     return resp["access_token"]
 
 
-def _supabase_request(method, path, body=None):
+def _supabase_request(method, path, body=None, prefer=None):
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    if method == "PATCH":
+    if prefer:
+        headers["Prefer"] = prefer
+    elif method == "PATCH":
         headers["Prefer"] = "return=minimal"
     return _http_json(method, url, headers=headers, data=body)
 
 
-def buscar_pendentes_de_link():
-    """Pedidos EMBARCADO com romaneio conhecido mas sem link ainda - pagina
-    ate a pagina vir vazia, pra nao truncar silenciosamente no teto padrao
-    de 1000 linhas do PostgREST."""
-    resultado = []
-    offset = 0
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=JANELA_DIAS)).isoformat()
-    while True:
-        q = (
-            f"{TABELA}?situacao=eq.EMBARCADO&romaneio=not.is.null"
-            f"&romaneio_link=is.null&atualizado_em=gte.{urllib.parse.quote(cutoff)}"
-            f"&select=numero_nf,marca,romaneio"
-            f"&limit={PAGINA}&offset={offset}"
-        )
-        try:
-            pagina = _supabase_request("GET", q) or []
-        except urllib.error.HTTPError as e:
-            # 57014 = statement timeout do Postgres (aconteceu com OFFSET
-            # fundo antes da janela de dias existir, 27/08/2026 - mais de
-            # 249 mil linhas historicas sem link). Com a janela isso nao
-            # deve mais acontecer, mas se acontecer, usa o que ja tem em vez
-            # de derrubar a execucao inteira - a proxima rodada continua.
-            print(f"  pagina offset={offset} falhou ({e.code}), parando com o que ja tenho.", file=sys.stderr)
-            break
-        resultado.extend(pagina)
-        if len(pagina) < PAGINA:
-            break
-        offset += PAGINA
-    return resultado
+def ler_cursor():
+    resp = _supabase_request("GET", f"{CURSOR_TABELA}?select=ultimo_atualizado_em&id=eq.true")
+    if resp and resp[0].get("ultimo_atualizado_em"):
+        return resp[0]["ultimo_atualizado_em"]
+    return None
+
+
+def gravar_cursor(valor):
+    _supabase_request(
+        "POST",
+        f"{CURSOR_TABELA}?on_conflict=id",
+        {"id": True, "ultimo_atualizado_em": valor},
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+
+
+def resetar_cursor():
+    gravar_cursor(None)
+
+
+def buscar_pagina(cutoff, operador):
+    q = (
+        f"{TABELA}?situacao=eq.EMBARCADO&romaneio=not.is.null"
+        f"&romaneio_link=is.null&atualizado_em={operador}.{urllib.parse.quote(cutoff)}"
+        f"&select=numero_nf,marca,romaneio,atualizado_em"
+        f"&order=atualizado_em.asc&limit={PAGINA}"
+    )
+    return _supabase_request("GET", q) or []
 
 
 def gravar_link(numero_nf, marca, link):
@@ -227,23 +254,12 @@ def achar_arquivo_do_romaneio(access_token, romaneio, subpasta_ids):
     return candidatos[0]
 
 
-def main():
-    access_token = obter_access_token()
-
-    subpastas = listar_subpastas(access_token, ROMANEIOS_FOLDER_ID)
-    if not subpastas:
-        print("Nao achei nenhuma subpasta dentro de Romaneios - confira o acesso da conta autorizada.", file=sys.stderr)
-        sys.exit(1)
-    subpasta_ids = [f["id"] for f in subpastas]
-    print(f"{len(subpastas)} subpasta(s) de transportadora: {', '.join(f['name'] for f in subpastas)}")
-
-    pendentes = buscar_pendentes_de_link()
-    if not pendentes:
-        print("Nenhum pedido EMBARCADO sem link de romaneio.")
-        return
-
+def processar_pagina(access_token, pagina, subpasta_ids):
+    """Agrupa a pagina por romaneio unico, busca cada um no Drive UMA vez e
+    replica o link achado pra todos os pedidos daquele romaneio. Retorna
+    (romaneios_tentados, romaneios_achados, pedidos_gravados)."""
     por_romaneio = {}
-    for item in pendentes:
+    for item in pagina:
         romaneio = str(item.get("romaneio") or "").strip()
         numero_nf = str(item.get("numero_nf") or "").strip()
         marca = str(item.get("marca") or "").strip()
@@ -251,7 +267,6 @@ def main():
             continue
         por_romaneio.setdefault(romaneio, []).append((numero_nf, marca))
 
-    print(f"{len(pendentes)} pedido(s) sem link, {len(por_romaneio)} romaneio(s) unico(s) - procurando na pasta Romaneios...")
     romaneios_achados = 0
     pedidos_gravados = 0
     for romaneio, pares in por_romaneio.items():
@@ -276,7 +291,65 @@ def main():
                 print(f"  [romaneio {romaneio}] erro gravando NF {numero_nf}/{marca}, pulando: {e}")
         print(f"  [romaneio {romaneio}] {arquivo['name']} -> gravado em {len(pares)} pedido(s).")
 
-    print(f"{romaneios_achados}/{len(por_romaneio)} romaneio(s) achado(s), {pedidos_gravados}/{len(pendentes)} pedido(s) atualizado(s).")
+    return len(por_romaneio), romaneios_achados, pedidos_gravados
+
+
+def main():
+    access_token = obter_access_token()
+
+    subpastas = listar_subpastas(access_token, ROMANEIOS_FOLDER_ID)
+    if not subpastas:
+        print("Nao achei nenhuma subpasta dentro de Romaneios - confira o acesso da conta autorizada.", file=sys.stderr)
+        sys.exit(1)
+    subpasta_ids = [f["id"] for f in subpastas]
+    print(f"{len(subpastas)} subpasta(s) de transportadora: {', '.join(f['name'] for f in subpastas)}")
+
+    cursor_salvo = ler_cursor()
+    if cursor_salvo:
+        cutoff, operador = cursor_salvo, "gt"
+        print(f"Continuando do cursor salvo: {cutoff}")
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=JANELA_DIAS)).isoformat()
+        operador = "gte"
+        print(f"Sem cursor salvo - comecando do inicio da janela de {JANELA_DIAS} dias: {cutoff}")
+
+    total_pedidos = total_romaneios = romaneios_achados = pedidos_gravados = 0
+    pagina_num = 0
+    while True:
+        pagina_num += 1
+        try:
+            pagina = buscar_pagina(cutoff, operador)
+        except urllib.error.HTTPError as e:
+            print(f"  pagina {pagina_num} (apos {cutoff}) falhou ({e.code}), parando por aqui - cursor ja salvo ate a pagina anterior.", file=sys.stderr)
+            break
+
+        if not pagina:
+            if pagina_num == 1:
+                print("Nenhum pedido EMBARCADO sem link de romaneio.")
+            resetar_cursor()
+            print("Alcancei o fim da janela - cursor resetado, proxima execucao comeca do zero (nova chance pros romaneios ainda sem PDF).")
+            break
+
+        print(f"[pagina {pagina_num}] {len(pagina)} pedido(s) - procurando na pasta Romaneios...")
+        n_romaneios, n_achados, n_gravados = processar_pagina(access_token, pagina, subpasta_ids)
+        total_pedidos += len(pagina)
+        total_romaneios += n_romaneios
+        romaneios_achados += n_achados
+        pedidos_gravados += n_gravados
+
+        # So avanca/salva o cursor DEPOIS de tentar todos os romaneios desta
+        # pagina no Drive - se o job for morto no meio, a proxima execucao
+        # re-tenta essa pagina inteira em vez de pular pedidos nunca tentados.
+        cutoff = pagina[-1]["atualizado_em"]
+        operador = "gt"
+        gravar_cursor(cutoff)
+
+        if len(pagina) < PAGINA:
+            resetar_cursor()
+            print("Alcancei o fim da janela - cursor resetado, proxima execucao comeca do zero (nova chance pros romaneios ainda sem PDF).")
+            break
+
+    print(f"{romaneios_achados}/{total_romaneios} romaneio(s) achado(s), {pedidos_gravados}/{total_pedidos} pedido(s) atualizado(s).")
 
 
 if __name__ == "__main__":
