@@ -41,9 +41,20 @@ def _supabase_request(method, path, body=None):
         return json.loads(corpo) if corpo else None
 
 
+PENDENTES_MAX_POR_BUSCA = 500  # so um teto de payload/memoria, nao um limite real de processamento (ver rodar_fila_uma_vez)
+
+
 def buscar_pendentes():
+    # order=solicitado_em.asc (28/08/2026, achado real - NF 1295282 ficou 3
+    # dias parada como 'pendente' porque, sem ordenacao explicita, o Postgres/
+    # PostgREST nao garante nenhuma ordem - um pedido antigo podia ficar
+    # "escondido" atras de pedidos mais novos indefinidamente. Mais antigo
+    # primeiro = justo (FIFO), mesmo criterio ja usado no recheck do
+    # titan_cf_worker.
     return _supabase_request(
-        "GET", f"{TABELA}?status=eq.pendente&select=numero_pedido,numero_nf,marca"
+        "GET",
+        f"{TABELA}?status=eq.pendente&select=numero_pedido,numero_nf,marca"
+        f"&order=solicitado_em.asc&limit={PENDENTES_MAX_POR_BUSCA}",
     ) or []
 
 
