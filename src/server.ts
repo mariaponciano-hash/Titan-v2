@@ -2447,17 +2447,28 @@ export default {
         if (!marca) return Response.json({ error: 'marca obrigatoria (NF sozinha pode ser de mais de uma marca - ver comentario acima)' }, { status: 400 });
 
         const jaExiste = await fetchJsonComTimeout(
-          `${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}&select=numero_nf,status`,
+          `${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}&select=numero_nf,status,eventos`,
           { headers: titanHeaders() },
           LOG_TIMEOUT_MS
         );
         if (Array.isArray(jaExiste) && jaExiste.length) {
           const statusAtual = jaExiste[0].status;
-          // 'erro' vale re-enfileirar (ex: o script no PC da Ivna nao estava
-          // rodando na primeira tentativa) - 'pendente'/'concluido' ficam como
-          // estao (nao interrompe um processamento em andamento nem refaz uma
-          // consulta que ja deu certo, seja de um pedido avulso ou do backfill).
-          if (statusAtual === 'erro') {
+          // Bug real achado pela Ivna, 27/08/2026: um pedido que so passou
+          // pelo titan_backfill.py (que de proposito nao coleta Eventos/Itens,
+          // so os campos da tabela principal, pra ser rapido - ver docstring
+          // grande em titan_backfill.py) fica com status='concluido' mas
+          // eventos/itens NULL pra sempre - a Unilog CD (que precisa desses
+          // dois campos) nunca teria como resolver isso, porque 'concluido'
+          // sozinho era tratado como "ja resolvido, nao mexe". Agora tambem
+          // reenfileira quando concluido mas sem eventos - o processamento
+          // avulso (titan_cf_worker) sempre clica no pedido e extrai
+          // Eventos/Itens, entao isso completa o que o backfill deixou de
+          // fora, sem reprocessar quem ja tem tudo.
+          const concluidoSemEventos = statusAtual === 'concluido' && jaExiste[0].eventos == null;
+          // 'erro' vale re-enfileirar (ex: falha transitoria na primeira
+          // tentativa) - 'pendente' fica como esta (nao interrompe um
+          // processamento em andamento).
+          if (statusAtual === 'erro' || concluidoSemEventos) {
             await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}`, {
               method: 'PATCH',
               headers: { ...titanHeaders(), Prefer: 'return=minimal' },
