@@ -11,3 +11,15 @@
 
 create index if not exists infos_titan_status_atualizado_idx
   on public.infos_titan (status, atualizado_em);
+
+-- Segundo indice (27/08/2026, mesmo motivo, achado pelo
+-- titan_romaneio_links.py): esse script filtra por SITUACAO (o status real
+-- do Titan, ex. 'EMBARCADO' - coluna diferente de "status" acima, que e o
+-- estado da fila pendente/concluido/erro) + romaneio_link IS NULL. Sem
+-- indice pra essa combinacao, a mesma varredura sequencial acontecia e
+-- estourava o mesmo erro 57014, mesmo ja paginando por cursor em vez de
+-- OFFSET. Indice PARCIAL (so cobre linhas ainda sem link) - fica pequeno e
+-- rapido, e encolhe sozinho conforme o script vai preenchendo os links.
+create index if not exists infos_titan_romaneio_link_pendente_idx
+  on public.infos_titan (situacao, atualizado_em)
+  where romaneio_link is null and romaneio is not null;
