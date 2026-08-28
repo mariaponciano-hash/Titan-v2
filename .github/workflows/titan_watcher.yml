@@ -67,12 +67,18 @@ jobs:
           fi
 
       # O runner some ao fim do job - sem isso, o print/HTML que
-      # salvar_diagnostico() grava em titan_debug/ na falha ficaria
-      # inacessivel. "if: failure()" so sobe quando o passo anterior falhou.
-      - name: Subir diagnostico (so se falhar)
-        if: failure()
+      # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel.
+      # "always()" em vez de "failure()" (28/08/2026, achado real): cada item
+      # tem seu proprio try/except (rodar_fila_uma_vez) - o job inteiro "tem
+      # sucesso" mesmo com 100% dos itens falhando, entao "if: failure()"
+      # nunca disparava e os prints/HTML ficavam perdidos quando o runner
+      # terminava. if-no-files-found:ignore evita o passo falhar sozinho na
+      # rodada normal (sem nenhum diagnostico salvo).
+      - name: Subir diagnostico (se tiver)
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: titan_debug
           path: titan_debug/
           retention-days: 7
+          if-no-files-found: ignore

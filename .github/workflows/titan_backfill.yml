@@ -53,13 +53,19 @@ jobs:
             --headless
 
       # O runner some ao fim do job - sem isso, o print/HTML que
-      # salvar_diagnostico() grava em titan_debug/ na falha ficaria
-      # inacessivel (diferente de rodar no PC, onde a pasta fica ali pra
-      # abrir direto). "if: failure()" so sobe quando o passo anterior falhou.
-      - name: Subir diagnostico (so se falhar)
-        if: failure()
+      # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel
+      # (diferente de rodar no PC, onde a pasta fica ali pra abrir direto).
+      # "always()" em vez de "failure()" (28/08/2026, achado real): o passo
+      # de recheck (rechecar_situacoes_presas) engole excecao por item -
+      # o job inteiro "tem sucesso" mesmo com 100% dos itens falhando, entao
+      # "if: failure()" nunca disparava e os prints/HTML ficavam perdidos
+      # quando o runner terminava. if-no-files-found:ignore evita o passo
+      # falhar sozinho na rodada normal (sem nenhum diagnostico salvo).
+      - name: Subir diagnostico (se tiver)
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: titan_debug
           path: titan_debug/
           retention-days: 7
+          if-no-files-found: ignore
