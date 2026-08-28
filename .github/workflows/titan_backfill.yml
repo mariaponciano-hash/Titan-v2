@@ -18,7 +18,12 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 40min (era 30) - 28/08/2026: agora tambem reconfere pedidos presos em
+    # situacao intermediaria fora da janela de 10 dias (ver
+    # rechecar_situacoes_presas em titan_backfill.py), orcamento proprio de
+    # 10min pra essa etapa - da margem extra sem depender so do orcamento
+    # interno do script.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
