@@ -1,3 +1,4 @@
+import argparse
 import datetime
 import json
 import os
@@ -19,6 +20,7 @@ SUPABASE_URL = "https://ozwcyrkzsqzmavjtsmsp.supabase.co"
 SUPABASE_KEY = "sb_publishable_CPF6bT_HC0jkTvYWnxHmDg_61qaWqSQ"
 TABELA = "infos_titan"
 INTERVALO_POLL_SEGUNDOS = 15
+ORCAMENTO_UMA_VEZ_SEGUNDOS_PADRAO = 240  # 4min - ver rodar_fila_uma_vez/--uma-vez
 
 
 def _agora_iso():
@@ -116,7 +118,51 @@ def processar_pedido(page, item):
     print(f"[NF {numero_nf}] ok - Romaneio: {pedido_data.get('Romaneio') or '(nao veio)'} | {len(itens)} item(ns)")
 
 
+def rodar_fila_uma_vez(page, orcamento_segundos=ORCAMENTO_UMA_VEZ_SEGUNDOS_PADRAO):
+    """
+    Passada UNICA (nao-loop) pela fila 'pendente' - pra rodar via GitHub
+    Actions (job que roda, processa o que tiver dentro do orcamento de tempo,
+    e termina), em vez do loop infinito "while True: sleep(15)" de main()
+    (pensado pra ficar aberto no PC, ver --uma-vez). Orcamento de TEMPO (nao
+    contagem fixa de itens) pra sempre terminar dentro do timeout do job,
+    seja qual for o tamanho da fila (28/08/2026, mesmo padrao ja usado em
+    titan_backfill.rechecar_situacoes_presas).
+    """
+    inicio = time.monotonic()
+    processados = 0
+    erros = 0
+    try:
+        pendentes = buscar_pendentes()
+    except (urllib.error.URLError, Exception) as e:
+        print(f"Erro consultando a fila no Supabase: {e}", file=sys.stderr)
+        return processados, erros
+
+    for item in pendentes:
+        if time.monotonic() - inicio > orcamento_segundos:
+            print(f"  orcamento de tempo esgotado - {processados} processado(s), resto fica pra proxima rodada.")
+            break
+        try:
+            processar_pedido(page, item)
+            processados += 1
+        except Exception as e:
+            erros += 1
+            print(f"[NF {item.get('numero_nf')} / marca {item.get('marca')}] erro inesperado: {e}", file=sys.stderr)
+            traceback.print_exc()
+            if item.get("numero_nf") and item.get("marca"):
+                marcar_erro(item.get("numero_nf"), item.get("marca"), str(e))
+    return processados, erros
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Watcher da fila 'pendente' de infos_titan.")
+    parser.add_argument("--uma-vez", action="store_true",
+                         help="roda uma passada so pela fila (pra GitHub Actions) em vez do loop infinito (uso local no PC)")
+    parser.add_argument("--headless", action="store_true", default=False,
+                         help="roda sem abrir janela - o workflow do GitHub Actions sempre usa isso")
+    parser.add_argument("--orcamento-segundos", type=int, default=ORCAMENTO_UMA_VEZ_SEGUNDOS_PADRAO,
+                         help=f"so com --uma-vez: tempo maximo processando a fila (padrao {ORCAMENTO_UMA_VEZ_SEGUNDOS_PADRAO}s)")
+    args = parser.parse_args()
+
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")
     if not email or not senha:
@@ -124,9 +170,24 @@ def main():
         print("Ex (PowerShell): $env:TITAN_EMAIL='...'; $env:TITAN_SENHA='...'", file=sys.stderr)
         sys.exit(1)
 
+    if args.uma_vez:
+        # Checa a fila ANTES de abrir navegador/logar - so uma chamada HTTP
+        # leve (sem Playwright). Fila vazia (esperado na maior parte das
+        # rodadas depois que o backlog atual baixar) termina em segundos, sem
+        # gastar tempo nenhum de navegador/login - importante pro orcamento
+        # de minutos do GitHub Actions rodando com frequencia (28/08/2026).
+        try:
+            pendentes_preview = buscar_pendentes()
+        except (urllib.error.URLError, Exception) as e:
+            print(f"Erro consultando a fila no Supabase: {e}", file=sys.stderr)
+            pendentes_preview = []
+        if not pendentes_preview:
+            print("Fila 'pendente' vazia - nada a fazer, encerrando sem abrir o Titan.")
+            return
+
     print("Entrando no Titan BI...")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=args.headless)
         page = browser.new_page()
         try:
             scraper.login(page, email, senha)
@@ -135,8 +196,14 @@ def main():
             browser.close()
             raise
 
-        print(f"Login ok. Verificando a fila a cada {INTERVALO_POLL_SEGUNDOS}s - deixe esta janela aberta. Ctrl+C pra parar.")
         try:
+            if args.uma_vez:
+                print(f"Login ok. Rodando UMA passada pela fila (orcamento {args.orcamento_segundos}s)...")
+                processados, erros = rodar_fila_uma_vez(page, args.orcamento_segundos)
+                print(f"\nConcluido: {processados} pedido(s) processado(s), {erros} erro(s).")
+                return
+
+            print(f"Login ok. Verificando a fila a cada {INTERVALO_POLL_SEGUNDOS}s - deixe esta janela aberta. Ctrl+C pra parar.")
             while True:
                 try:
                     pendentes = buscar_pendentes()
