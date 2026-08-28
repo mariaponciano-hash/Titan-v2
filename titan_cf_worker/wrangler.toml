@@ -21,6 +21,13 @@ binding = "MYBROWSER"
 [triggers]
 crons = ["*/5 * * * *"]
 
+# Workers Logs (27/08/2026) - sem isso explicito aqui, cada `wrangler deploy`
+# reseta a opcao "Workers Logs" do painel pro padrao (desligado), mesmo que a
+# Ivna tenha ligado manualmente antes - foi o que estava acontecendo durante
+# a depuracao de hoje. Deixando fixo no config, sobrevive a redeploys.
+[observability]
+enabled = true
+
 # Segredos (NAO colar aqui - configure via `wrangler secret put <NOME>` ou
 # pelo painel Cloudflare, Workers & Pages > titan-watcher-worker > Settings >
 # Variables > Encrypt): TITAN_EMAIL, TITAN_SENHA, TITAN_SB_URL, TITAN_SB_KEY.

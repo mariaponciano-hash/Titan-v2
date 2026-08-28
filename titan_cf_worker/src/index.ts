@@ -63,6 +63,21 @@ const RECHECK_INTERVALO_ERRO_HORAS = 1;
 const ERRO_RECHECK_MAX_POR_RODADA = 30;
 const ERRO_RECHECK_MAX_TENTATIVAS = 5;
 
+// TETO DE ITENS POR RODADA (27/08/2026): achado em producao - Cloudflare mata
+// Cron scheduled events com "exceededWallTime" na marca de 15 min, sempre,
+// sem excecao JS nenhuma (o finally do gravarHeartbeat nao roda - a rodada
+// inteira desaparece sem deixar rastro). Com um backlog de ~14 mil itens
+// (~15-30s cada), uma rodada sem teto nunca termina dentro da janela, nunca
+// grava heartbeat, e ainda se sobrepoe com o proximo tick (5 min depois),
+// competindo pelos mesmos itens. Processar um lote pequeno e fixo por rodada
+// garante: a rodada sempre termina, o heartbeat sempre e gravado, e o
+// backlog e consumido de forma constante e visivel ao longo de varios ticks.
+// Reduzido de 20 pra 12 (28/08/2026) junto com o aumento do timeout de
+// espera do painel do relatorio (30s -> 60s, ver getDashboardFrame) - com
+// mais tempo por item, precisa de menos itens por rodada pra continuar
+// cabendo dentro dos 15 min antes do exceededWallTime.
+const PENDENTES_MAX_POR_RODADA = 12;
+
 // ---------------------------------------------------------------------------
 // Supabase (mesma tabela/chave que titan_watcher.py e o server.ts ja usam)
 // ---------------------------------------------------------------------------
@@ -80,6 +95,34 @@ class ErroSupabase extends Error {
     super(message);
     this.status = status;
   }
+}
+
+// Cloudflare Workers Logs corta a mensagem de um Error passado como
+// argumento separado pro console.error (so mostra o stack, nunca
+// e.message) - concatenar numa unica string evita perder o motivo real do
+// erro (26/08/2026, achado depurando o proprio deploy de hoje).
+function mensagemDeErro(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// Deteccao de pagina/navegador corrompido (27/08/2026): quando isso acontece
+// no meio do loop de itens, TODO item seguinte falha do mesmo jeito (mesma
+// referencia de frame morta) - continuar so desperdica o resto da janela de
+// 15 min numa cascata garantida de falhas, e marcar cada um como 'erro'
+// penaliza pedidos que nunca tiveram uma chance de verdade (gasta
+// erro_recheck_tentativas por um problema que nao e deles). Ver rodarFila:
+// ao detectar isso, para o loop sem marcar os itens restantes.
+const PADROES_ERRO_CONEXAO = [
+  'detached Frame',
+  'Navigating frame was detached',
+  'Execution context was destroyed',
+  'Protocol error',
+  'Connection closed',
+  'Target closed',
+];
+function erroDeConexao(e: unknown): boolean {
+  const msg = mensagemDeErro(e);
+  return PADROES_ERRO_CONEXAO.some((padrao) => msg.includes(padrao));
 }
 
 async function verificarResposta(r: Response, contexto: string): Promise<void> {
@@ -120,7 +163,8 @@ async function comRetry<T>(fn: () => Promise<T>): Promise<T> {
 async function buscarPendentes(env: Env): Promise<any[]> {
   return comRetry(async (): Promise<any[]> => {
     const r = await fetch(
-      `${env.TITAN_SB_URL}/rest/v1/${TABELA}?status=eq.pendente&select=numero_pedido,numero_nf,marca`,
+      `${env.TITAN_SB_URL}/rest/v1/${TABELA}?status=eq.pendente&select=numero_pedido,numero_nf,marca` +
+        `&order=solicitado_em.asc&limit=${PENDENTES_MAX_POR_RODADA}`,
       { headers: titanHeaders(env) }
     );
     await verificarResposta(r, 'buscarPendentes');
@@ -188,7 +232,7 @@ async function devolverParaFila(
       ok++;
     } catch (e) {
       falhas++;
-      console.error(`devolverParaFila: falha ao devolver NF ${item.numero_nf}/${item.marca}:`, e);
+      console.error(`devolverParaFila: falha ao devolver NF ${item.numero_nf}/${item.marca}: ${mensagemDeErro(e)}`);
     }
   }
   return { ok, falhas };
@@ -209,7 +253,7 @@ async function marcarErro(env: Env, numeroNf: string, marca: string, mensagem: s
       await verificarResposta(r, 'marcarErro');
     });
   } catch (e) {
-    console.error('nao consegui nem marcar erro no Supabase:', e);
+    console.error(`nao consegui nem marcar erro no Supabase: ${mensagemDeErro(e)}`);
   }
 }
 
@@ -271,7 +315,7 @@ async function gravarHeartbeat(
       await verificarResposta(r, 'gravarHeartbeat');
     });
   } catch (e) {
-    console.error('nao consegui gravar heartbeat no Supabase:', e);
+    console.error(`nao consegui gravar heartbeat no Supabase: ${mensagemDeErro(e)}`);
   }
 }
 
@@ -329,7 +373,15 @@ async function login(page: Page, email: string, senha: string) {
   await campoSenha.click({ clickCount: 3 });
   await campoSenha.type(senha, { delay: 40 });
 
-  const botaoEntrar = await elementoVisivel(await todosPorAria(page, 'Entrar', 'button'));
+  // type="submit" e preciso e sem ambiguidade (a tela tambem tem um botao
+  // "Entrar com Microsoft", que nao e submit - so dispara um redirect OAuth).
+  // ARIA por nome/role fica como fallback: o texto do botao real tem um
+  // espaco em branco antes de "Entrar" no DOM, o que pode quebrar uma
+  // comparacao exata de nome acessivel dependendo da versao do puppeteer.
+  const botaoEntrar =
+    (await page.$('button[type="submit"]')) ||
+    (await elementoVisivel(await todosPorAria(page, 'Entrar', 'button')).catch(() => null));
+  if (!botaoEntrar) throw new Error('Botao "Entrar" nao encontrado na tela de login do Titan.');
   await botaoEntrar.click();
 
   // "Autenticando no TitanBI..." fica visivel um tempo depois do clique -
@@ -355,24 +407,117 @@ async function login(page: Page, email: string, senha: string) {
   await page.waitForNetworkIdle({ timeout: 15000 }).catch(() => {});
 }
 
-async function getDashboardFrame(page: Page): Promise<Frame> {
+// Diagnostico de texto (28/08/2026): a captura em base64 (imagem) exigia
+// colar uma string enorme no chat pra eu decodificar, e a reconstrucao
+// manual dos pedacos vinha corrompida (relay perde/altera caracteres em
+// algum ponto) - impossivel decodificar de forma confiavel. Texto puro (URL
+// atual, titulo, inicio do texto visivel da pagina) resolve o mesmo
+// problema - dizer o que a pagina mostra de verdade no momento do timeout
+// (bloqueio, captcha, tela em branco etc) - sem nenhum risco de corrupcao
+// no caminho, e cabe direto numa linha de log. So uma vez por rodada.
+//
+// consoleErros/requisicoesFalhas (28/08/2026): dobrar o timeout pra 60s nao
+// mudou nada (mesma falha 100% das vezes) - descarta "so precisa de mais
+// tempo". O relatorio do Power BI carrega a casca da pagina mas nunca
+// termina de renderizar o painel de verdade - hipotese agora e falha
+// silenciosa (JS quebrando ou chamada de API do proprio Power BI sendo
+// bloqueada) que nao gera nenhuma excecao pro nosso codigo. Escutar
+// console/pageerror/response desde a criacao da pagina (nao so no momento
+// do timeout) e a unica forma de pegar isso.
+export interface Diagnostico {
+  screenshotTirado: boolean;
+  consoleErros: string[];
+  requisicoesFalhas: string[];
+}
+
+function novoDiagnostico(): Diagnostico {
+  return { screenshotTirado: false, consoleErros: [], requisicoesFalhas: [] };
+}
+
+const DIAGNOSTICO_MAX_ITENS = 15;
+function registrarDiagnostico(lista: string[], item: string) {
+  lista.push(item.slice(0, 200));
+  if (lista.length > DIAGNOSTICO_MAX_ITENS) lista.shift();
+}
+
+// Anexa os listeners uma unica vez por pagina (25/08/2026 - o browser.newPage()
+// de rodarFila e reusado por todos os itens da rodada, entao isso cobre a
+// rodada inteira, nao so o item que disparar o diagnostico).
+function monitorarPagina(page: Page, diagnostico: Diagnostico) {
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') registrarDiagnostico(diagnostico.consoleErros, `console.error: ${msg.text()}`);
+  });
+  page.on('pageerror', (err) => {
+    registrarDiagnostico(diagnostico.consoleErros, `pageerror: ${String(err)}`);
+  });
+  page.on('requestfailed', (req) => {
+    registrarDiagnostico(diagnostico.requisicoesFalhas, `FALHA ${req.method()} ${req.url()} -> ${req.failure()?.errorText || '?'}`);
+  });
+  page.on('response', (res) => {
+    if (res.status() >= 400) registrarDiagnostico(diagnostico.requisicoesFalhas, `HTTP ${res.status()} ${res.url()}`);
+  });
+}
+
+async function tirarDiagnosticoDePagina(page: Page, diagnostico: Diagnostico) {
+  if (diagnostico.screenshotTirado) return;
+  diagnostico.screenshotTirado = true;
+  try {
+    const info = await page.evaluate(() => ({
+      url: location.href,
+      titulo: document.title,
+      texto: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800),
+    }));
+    console.log(`DIAGNOSTICO_TIMEOUT_DASHBOARD url=${info.url} titulo="${info.titulo}" texto="${info.texto}"`);
+    console.log(
+      `DIAGNOSTICO_TIMEOUT_DASHBOARD_CONSOLE (${diagnostico.consoleErros.length}): ${diagnostico.consoleErros.join(' | ') || '(nenhum)'}`
+    );
+    console.log(
+      `DIAGNOSTICO_TIMEOUT_DASHBOARD_REDE (${diagnostico.requisicoesFalhas.length}): ${diagnostico.requisicoesFalhas.join(' | ') || '(nenhuma)'}`
+    );
+  } catch (diagErr) {
+    console.error(`nao consegui pegar diagnostico da pagina: ${mensagemDeErro(diagErr)}`);
+  }
+}
+
+async function getDashboardFrame(page: Page, diagnostico: Diagnostico): Promise<Frame> {
   for (let tentativa = 0; tentativa < 3; tentativa++) {
     try {
-      await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle0' });
+      // 'domcontentloaded' em vez de 'networkidle0' (27/08/2026): o Power BI
+      // faz polling/telemetria continuo em segundo plano, entao a rede nunca
+      // fica realmente parada - 'networkidle0' estava batendo timeout de 30s
+      // em TODO item, sempre. A checagem real de "carregou de verdade" ja
+      // acontece embaixo (espera o painel "Informacao Pedido" ficar visivel).
+      await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded' });
       break;
     } catch (e: any) {
       if (String(e).includes('interrupted') && tentativa < 2) {
         await new Promise((res) => setTimeout(res, 1500));
         continue;
       }
+      await tirarDiagnosticoDePagina(page, diagnostico);
       throw e;
     }
   }
-  const frameEl = await page.waitForSelector('iframe', { timeout: 30000 });
-  const frame = await frameEl!.contentFrame();
-  if (!frame) throw new Error('iframe do dashboard nao expos um Frame acessivel.');
-  await elementoVisivel(await todosPorTexto(frame, 'Informação Pedido'), 30000);
-  return frame;
+  try {
+    const frameEl = await page.waitForSelector('iframe', { timeout: 30000 });
+    const frame = await frameEl!.contentFrame();
+    if (!frame) throw new Error('iframe do dashboard nao expos um Frame acessivel.');
+    // 30s -> 60s (28/08/2026): diagnostico mostrou a pagina certa carregando
+    // rapido (titulo correto), so o relatorio do Power BI em si (dentro do
+    // iframe) nunca aparecia a tempo - hipotese de que so precisa de mais
+    // tempo pra renderizar nesse ambiente. Ver PENDENTES_MAX_POR_RODADA
+    // (reduzido junto) pra manter a rodada dentro do limite de 15 min.
+    await elementoVisivel(await todosPorTexto(frame, 'Informação Pedido'), 60000);
+    return frame;
+  } catch (e) {
+    // Mesmo diagnostico da navegacao (acima): a falha aqui (esperando o
+    // iframe ou o painel "Informacao Pedido" aparecer) e a que mais aparece
+    // em producao desde que domcontentloaded resolveu a falha de navegacao
+    // em si (27/08/2026) - o screenshot aqui mostra o que a pagina exibe DEPOIS
+    // do DOM carregado, mas antes do relatorio do Power BI terminar de renderizar.
+    await tirarDiagnosticoDePagina(page, diagnostico);
+    throw e;
+  }
 }
 
 async function abrirDropdownEDigitar(frame: Frame, rotulo: string, valor: string, tentativas = 3) {
@@ -588,6 +733,8 @@ async function rodarFila(env: Env): Promise<{ log: string; processados: number; 
   const page = await browser.newPage();
   const linhas: string[] = [];
   let comErro = 0;
+  const diagnostico = novoDiagnostico();
+  monitorarPagina(page, diagnostico);
   try {
     await login(page, env.TITAN_EMAIL, env.TITAN_SENHA);
 
@@ -599,18 +746,33 @@ async function rodarFila(env: Env): Promise<{ log: string; processados: number; 
         // Recarrega o dashboard do zero a cada pedido - reseta os filtros
         // (mesma cautela do titan_watcher.py: o slicer do Power BI pode
         // acumular selecao entre consultas em vez de substituir).
-        const frame = await getDashboardFrame(page);
+        const frame = await getDashboardFrame(page, diagnostico);
         const { pedidoData, eventos, itens } = await processarPedido(frame, { numero_nf: numeroNf, marca });
         await marcarConcluido(env, numeroNf, marca, pedidoData, eventos, itens);
         linhas.push(`[NF ${numeroNf}/${marca}] ok - Romaneio: ${pedidoData['Romaneio'] || '(nao veio)'}`);
       } catch (e: any) {
+        if (erroDeConexao(e)) {
+          // Nao marca 'erro' (o item nao teve uma chance de verdade, e o
+          // proximo tick pega ele de novo com um browser/pagina novos) e para
+          // aqui - continuar so bateria na mesma parede pra cada item restante.
+          linhas.push(
+            `[NF ${numeroNf}/${marca}] pagina/navegador corrompido (${mensagemDeErro(e)}) - parando a rodada, restante fica pendente pro proximo tick.`
+          );
+          break;
+        }
         comErro++;
-        await marcarErro(env, numeroNf, marca, String(e?.message || e));
-        linhas.push(`[NF ${numeroNf}/${marca}] erro: ${String(e?.message || e)}`);
+        await marcarErro(env, numeroNf, marca, mensagemDeErro(e));
+        linhas.push(`[NF ${numeroNf}/${marca}] erro: ${mensagemDeErro(e)}`);
       }
     }
   } finally {
-    await browser.close();
+    // Sem try/catch aqui, uma falha ao FECHAR uma conexao ja morta (ex: o
+    // navegador caiu no meio do processamento de um item, que ja foi
+    // corretamente marcado 'erro' individualmente) escapava sem protecao e
+    // mascarava o resultado real da rodada com um erro generico de fechamento
+    // (ver "Attempted to use detached Frame" chegando no topo em vez de ficar
+    // contido no catch por item, 27/08/2026).
+    await browser.close().catch((e) => console.error(`falha ao fechar o browser (ignorada): ${mensagemDeErro(e)}`));
   }
   return { log: [...linhasResumo, ...linhas].join('\n'), processados: pendentes.length, comErro };
 }
@@ -635,8 +797,8 @@ async function executarRodadaComHeartbeat(env: Env): Promise<void> {
     console.log(detail);
   } catch (e: any) {
     status = 'error';
-    detail = String(e?.message || e).slice(0, 2000);
-    console.error('rodarFila falhou:', e);
+    detail = mensagemDeErro(e).slice(0, 2000);
+    console.error(`rodarFila falhou: ${detail}`);
   } finally {
     await gravarHeartbeat(env, status, detail, processados, comErro);
   }
