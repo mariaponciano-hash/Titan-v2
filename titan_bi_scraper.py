@@ -215,30 +215,51 @@ def login(page, email, senha):
         pass  # pode ja ter caido direto numa URL diferente de /home - segue
 
 
+def _ir_pro_dashboard(page):
+    """page.goto com retry - a navegacao pos-login pode ainda estar em
+    andamento (confirmado com erro real: "interrupted by another navigation
+    to .../home")."""
+    for tentativa in range(3):
+        try:
+            page.goto(DASHBOARD_URL)
+            return
+        except Exception as e:
+            if "interrupted by another navigation" in str(e) and tentativa < 2:
+                time.sleep(1.5)  # deixa a navegacao concorrente (ex: redirect pos-login) terminar
+                continue
+            raise
+
+
 def get_dashboard_frame(page):
     """
     O conteudo real (tabela, filtros) fica dentro de um <iframe> - a pagina
     "de fora" so tem a barra lateral e o seletor de abas (Consulta/Exportacao).
     Se o Titan tiver mais de um iframe na pagina, ajuste o seletor abaixo (ex:
     'iframe[src*="embed"]') depois de checar com o DevTools (F12 -> Elements).
+
+    CORRIGIDO (31/08/2026, HTML+print reais salvos em titan_debug/
+    dashboard_iframe_nao_encontrado): o print mostrava a mensagem de erro do
+    proprio Titan "Request timed out: GET https://api.titanbi.com.br/api/
+    dashboard/.../token" - o backend dele falhou ao gerar o token de embed do
+    Power BI, e nesse caso o <iframe> nunca chega a existir no DOM (confirmado:
+    zero ocorrencias no HTML salvo). Esperar mais nao ajuda, ja que o elemento
+    simplesmente nao vai aparecer. E uma falha transitoria do lado do Titan,
+    nao do nosso seletor/timing - um reload completo (page.goto de novo)
+    resolve na pratica. Tenta ate 3 vezes antes de desistir.
     """
+    ultimo_erro = None
     for tentativa in range(3):
+        _ir_pro_dashboard(page)
         try:
-            page.goto(DASHBOARD_URL)
-            break
-        except Exception as e:
-            if "interrupted by another navigation" in str(e) and tentativa < 2:
-                time.sleep(1.5)  # deixa a navegacao concorrente (ex: redirect pos-login) terminar
-                continue
-            raise
-    try:
-        frame_el = page.wait_for_selector("iframe", timeout=30000)
-        frame = frame_el.content_frame()
-        elemento_visivel(frame.get_by_text("Informação Pedido", exact=False), timeout_ms=30000)
-    except PWTimeout:
-        salvar_diagnostico(page, "dashboard_iframe_nao_encontrado")
-        raise
-    return frame
+            frame_el = page.wait_for_selector("iframe", timeout=30000)
+            frame = frame_el.content_frame()
+            elemento_visivel(frame.get_by_text("Informação Pedido", exact=False), timeout_ms=30000)
+            return frame
+        except PWTimeout as e:
+            ultimo_erro = e
+            time.sleep(3)
+    salvar_diagnostico(page, "dashboard_iframe_nao_encontrado")
+    raise ultimo_erro
 
 
 # Mapa do rotulo visivel (h3 do slicer) pro aria-label TECNICO real do
