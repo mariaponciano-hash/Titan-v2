@@ -369,6 +369,33 @@ def _abrir_dropdown_e_pegar_campo_busca(frame, rotulo, tentativas=3):
     raise ultimo_erro
 
 
+def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=15000):
+    """
+    Espera o painel "Informacao Pedido" realmente mostrar o valor filtrado,
+    em vez de confiar num sleep fixo. CORRIGIDO (31/08/2026, HTML real salvo
+    em titan_debug/tabela_linha_nao_encontrada.html): o slicer confirmava a
+    selecao certinha (slicer-restatement e o checkbox do item mostravam
+    "1285822" marcado, aria-selected="true"), mas a TABELA ainda mostrava os
+    dados antigos/default por mais tempo - um lag assincrono entre o slicer
+    comitar a selecao e o visual re-renderizar, mais lento no runner do
+    GitHub Actions do que no PC (mesma classe de lentidao ja vista no slicer
+    de periodo e no token do dashboard). Sem essa espera,
+    _achar_linha_pedido rodava cedo demais contra uma tabela desatualizada.
+    Se o valor nunca aparecer (NF que genuinamente nao existe pra essa
+    marca), so retorna sem erro - _achar_linha_pedido/extrair_linha_por_pedido
+    decidem "nao encontrado" do jeito de sempre.
+    """
+    painel = localizar_painel(frame, "Informação Pedido")
+    limite = time.time() + timeout_ms / 1000
+    while time.time() < limite:
+        try:
+            if str(valor) in painel.inner_text():
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
 def filtrar(frame, nf=None, numero_pedido=None):
     """
     Abre o combobox do filtro, digita a busca de verdade (tecla por tecla),
@@ -382,6 +409,7 @@ def filtrar(frame, nf=None, numero_pedido=None):
             marcar_item_da_lista(frame, campo, nf)
             time.sleep(1)  # deixa o filtro assincrono aplicar na tabela
             frame.page.keyboard.press("Escape")
+            _esperar_tabela_refletir_filtro(frame, nf)
         if numero_pedido:
             campo = _abrir_dropdown_e_pegar_campo_busca(frame, "Número do pedido")
             digitar_busca(campo, numero_pedido)
@@ -389,6 +417,7 @@ def filtrar(frame, nf=None, numero_pedido=None):
             marcar_item_da_lista(frame, campo, numero_pedido)
             time.sleep(1)
             frame.page.keyboard.press("Escape")
+            _esperar_tabela_refletir_filtro(frame, numero_pedido)
     except PWTimeout:
         salvar_diagnostico(frame, "filtro_nao_encontrado")
         raise
