@@ -114,6 +114,15 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 ROMANEIOS_FOLDER_ID = "1EHi3gB7b0fYZ7nDODjWWyzcRRAlBFdlj"
 
+# 25min - fica com folga sob o timeout de 30min do job (titan_romaneio_links.yml).
+# Achado real (31/08/2026): as ultimas 5 execucoes seguidas bateram EXATAMENTE
+# nos 30min e foram canceladas pelo proprio GitHub Actions, sem terminar uma
+# pagina sequer - como o cursor so avancava no fim da pagina inteira, nenhuma
+# delas fez progresso nenhum (sempre recomecava do mesmo ponto, parado desde
+# 25/08). Ver ORCAMENTO em processar_pagina/main - agora salva o cursor
+# incrementalmente, linha por linha, entao qualquer quantidade de trabalho
+# feito dentro do orcamento fica salva, mesmo se a pagina nao terminar.
+ORCAMENTO_SEGUNDOS = 25 * 60
 PAGINA = 1000
 # So considera pedidos EMBARCADO recentemente (por atualizado_em, que pra um
 # pedido ja EMBARCADO reflete quando ele chegou nesse status - o recheck
@@ -254,44 +263,67 @@ def achar_arquivo_do_romaneio(access_token, romaneio, subpasta_ids):
     return candidatos[0]
 
 
-def processar_pagina(access_token, pagina, subpasta_ids):
-    """Agrupa a pagina por romaneio unico, busca cada um no Drive UMA vez e
-    replica o link achado pra todos os pedidos daquele romaneio. Retorna
-    (romaneios_tentados, romaneios_achados, pedidos_gravados)."""
-    por_romaneio = {}
+def processar_pagina(access_token, pagina, subpasta_ids, inicio, orcamento_segundos):
+    """
+    Processa a pagina NA ORDEM ORIGINAL (atualizado_em.asc), linha por linha
+    - nao mais agrupada por romaneio de uma vez so. Um cache em memoria
+    (cache_drive) ainda garante so 1 busca no Drive por romaneio UNICO,
+    mesmo que ele apareca em varias linhas seguidas da pagina; a diferenca e
+    que agora da pra parar em QUALQUER linha (orcamento de tempo estourado)
+    e devolver ate onde e seguro avancar o cursor, em vez de exigir a pagina
+    inteira terminar pra salvar qualquer progresso.
+
+    CORRIGIDO (31/08/2026, achado real - 5 execucoes seguidas bateram nos
+    30min do job e foram canceladas ANTES de terminar uma pagina sequer, sem
+    o cursor nunca avancar do dia 25/08 mesmo com links sendo gravados de
+    verdade a cada rodada): essa versao agrupada nao tinha como salvar
+    progresso parcial.
+
+    Retorna (cursor_seguro, pagina_completou, romaneios_tentados,
+    romaneios_achados, pedidos_gravados). cursor_seguro e None so se nem uma
+    linha chegou a ser processada (orcamento zerado logo de cara).
+    """
+    cache_drive = {}  # romaneio -> arquivo (dict) ou None (ja tentou, nao achou/deu erro)
+    romaneios_achados = 0
+    pedidos_gravados = 0
+    cursor_seguro = None
+
     for item in pagina:
+        if time.monotonic() - inicio > orcamento_segundos:
+            return cursor_seguro, False, len(cache_drive), romaneios_achados, pedidos_gravados
+
         romaneio = str(item.get("romaneio") or "").strip()
         numero_nf = str(item.get("numero_nf") or "").strip()
         marca = str(item.get("marca") or "").strip()
-        if not romaneio or not numero_nf or not marca:
-            continue
-        por_romaneio.setdefault(romaneio, []).append((numero_nf, marca))
+        if romaneio and numero_nf and marca:
+            if romaneio not in cache_drive:
+                # Um romaneio que falha (mesmo apos as 3 tentativas do
+                # _http_json) nao pode derrubar o resto do lote - trata como
+                # "nao achado" e segue. O que ja foi gravado antes do erro
+                # fica gravado (PATCH direto no Supabase, nao ha rollback).
+                try:
+                    arquivo = achar_arquivo_do_romaneio(access_token, romaneio, subpasta_ids)
+                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+                    print(f"  [romaneio {romaneio}] erro consultando o Drive, pulando: {e}")
+                    arquivo = None
+                cache_drive[romaneio] = arquivo
+                if arquivo:
+                    romaneios_achados += 1
+                    print(f"  [romaneio {romaneio}] {arquivo['name']}")
+                else:
+                    print(f"  [romaneio {romaneio}] nao achei PDF.")
 
-    romaneios_achados = 0
-    pedidos_gravados = 0
-    for romaneio, pares in por_romaneio.items():
-        # Um romaneio que falha (mesmo apos as 3 tentativas do _http_json)
-        # nao pode derrubar o resto do lote - segue pro proximo e reporta no
-        # final. O que ja foi gravado antes do erro fica gravado (PATCH
-        # direto no Supabase, nao ha rollback a fazer).
-        try:
-            arquivo = achar_arquivo_do_romaneio(access_token, romaneio, subpasta_ids)
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
-            print(f"  [romaneio {romaneio}] erro consultando o Drive, pulando: {e}")
-            continue
-        if not arquivo:
-            print(f"  [romaneio {romaneio}] nao achei PDF ({len(pares)} pedido(s) aguardando).")
-            continue
-        romaneios_achados += 1
-        for numero_nf, marca in pares:
-            try:
-                gravar_link(numero_nf, marca, arquivo["webViewLink"])
-                pedidos_gravados += 1
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
-                print(f"  [romaneio {romaneio}] erro gravando NF {numero_nf}/{marca}, pulando: {e}")
-        print(f"  [romaneio {romaneio}] {arquivo['name']} -> gravado em {len(pares)} pedido(s).")
+            arquivo = cache_drive[romaneio]
+            if arquivo:
+                try:
+                    gravar_link(numero_nf, marca, arquivo["webViewLink"])
+                    pedidos_gravados += 1
+                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+                    print(f"  [romaneio {romaneio}] erro gravando NF {numero_nf}/{marca}, pulando: {e}")
 
-    return len(por_romaneio), romaneios_achados, pedidos_gravados
+        cursor_seguro = item["atualizado_em"]
+
+    return cursor_seguro, True, len(cache_drive), romaneios_achados, pedidos_gravados
 
 
 def main():
@@ -313,6 +345,7 @@ def main():
         operador = "gte"
         print(f"Sem cursor salvo - comecando do inicio da janela de {JANELA_DIAS} dias: {cutoff}")
 
+    inicio = time.monotonic()
     total_pedidos = total_romaneios = romaneios_achados = pedidos_gravados = 0
     pagina_num = 0
     while True:
@@ -331,18 +364,26 @@ def main():
             break
 
         print(f"[pagina {pagina_num}] {len(pagina)} pedido(s) - procurando na pasta Romaneios...")
-        n_romaneios, n_achados, n_gravados = processar_pagina(access_token, pagina, subpasta_ids)
+        cursor_pagina, completou, n_romaneios, n_achados, n_gravados = processar_pagina(
+            access_token, pagina, subpasta_ids, inicio, ORCAMENTO_SEGUNDOS
+        )
         total_pedidos += len(pagina)
         total_romaneios += n_romaneios
         romaneios_achados += n_achados
         pedidos_gravados += n_gravados
 
-        # So avanca/salva o cursor DEPOIS de tentar todos os romaneios desta
-        # pagina no Drive - se o job for morto no meio, a proxima execucao
-        # re-tenta essa pagina inteira em vez de pular pedidos nunca tentados.
-        cutoff = pagina[-1]["atualizado_em"]
-        operador = "gt"
-        gravar_cursor(cutoff)
+        # Salva o cursor ate onde a pagina realmente avancou, mesmo que nao
+        # tenha terminado (ver ORCAMENTO_SEGUNDOS/processar_pagina acima) -
+        # cursor_pagina so vem None se nem uma linha chegou a ser tentada.
+        if cursor_pagina:
+            cutoff = cursor_pagina
+            operador = "gt"
+            gravar_cursor(cutoff)
+
+        if not completou:
+            print(f"Orcamento de tempo esgotado no meio da pagina {pagina_num} - "
+                  f"cursor salvo ate onde deu, resto fica pra proxima execucao.")
+            break
 
         if len(pagina) < PAGINA:
             resetar_cursor()
