@@ -241,17 +241,39 @@ def get_dashboard_frame(page):
     return frame
 
 
+# Mapa do rotulo visivel (h3 do slicer) pro aria-label TECNICO real do
+# combobox (nome do campo Power BI por baixo) - confirmado no HTML real
+# salvo em titan_debug/filtro_nao_encontrado.html (31/08/2026): o elemento
+# que abre o popup e <div role="combobox" data-testid="slicer-dropdown"
+# aria-label="nota_fiscal_saida_numero">, um irmao do <h3> do rotulo, nao um
+# filho - por isso clicar por coordenada relativa ao rotulo era fragil.
+ARIA_LABEL_POR_ROTULO = {
+    "Nota Fiscal de Saída": "nota_fiscal_saida_numero",
+    "Número do pedido": "numero",
+}
+
+
 def abrir_dropdown_filtro(frame, rotulo):
     """
-    Clicar direto no TEXTO do rotulo (ex: "Nota Fiscal de Saída") nao abre o
-    slicer - confirmado com print real: o clique nao fez nada, a tabela
-    continuou no estado padrao. O rotulo e so um titulo; o controle que
-    realmente abre o dropdown e a caixa "Todos" logo ABAIXO dele (mesmo
-    padrao que usei manualmente explorando o Titan pelo navegador). Como nao
-    consigo inspecionar o DOM real deste slicer, clico numa posicao relativa
-    ao rotulo (um pouco abaixo da sua caixa delimitadora) em vez de tentar
-    achar o elemento certo por seletor.
+    Abre o combobox do slicer. Preferencia: seletor real por aria-label
+    tecnico (ARIA_LABEL_POR_ROTULO) - so existe pros rotulos ja confirmados
+    no HTML. Fallback (rotulo desconhecido): clicar numa posicao relativa ao
+    rotulo, ~15-20px abaixo da sua caixa delimitadora (abordagem antiga,
+    usada quando ainda nao tinhamos o HTML real do slicer pra inspecionar -
+    confirmado, com print, que clicar direto no TEXTO do rotulo nao abre
+    nada; e essa mesma coordenada, por ser sensivel a diferencas finas de
+    fonte/DPI entre o PC da Ivna e o runner do GitHub Actions, foi a causa
+    real de falhas la mesmo com a pagina 100% carregada).
     """
+    aria_label = ARIA_LABEL_POR_ROTULO.get(rotulo)
+    if aria_label:
+        combobox = frame.locator(
+            f'div[role="combobox"][data-testid="slicer-dropdown"][aria-label="{aria_label}"]'
+        )
+        if combobox.count() > 0:
+            combobox.first.click(timeout=10000)
+            return
+
     titulo = elemento_visivel(frame.get_by_text(rotulo, exact=False))
     caixa = titulo.bounding_box()
     if not caixa:
