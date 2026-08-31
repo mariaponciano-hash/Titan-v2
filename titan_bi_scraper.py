@@ -563,14 +563,25 @@ def extrair_registros_do_painel(painel, marcadores_cabecalho):
     return registros
 
 
+def _normalizar_espacos(valor):
+    """
+    Colapsa qualquer sequencia de espaco (inclusive \\xa0, non-breaking space
+    - confirmado no HTML real, 31/08/2026: a celula "Nome Projeto" da NF
+    1283798 veio como 'BY\\xa0SAMIA', nao 'BY SAMIA') pra um unico espaco
+    normal. .strip() sozinho nao resolve - o \\xa0 fica NO MEIO do texto, nao
+    so nas pontas. str.split() sem argumento ja trata \\xa0 como espaco.
+    """
+    return " ".join(str(valor or "").split())
+
+
 def _bate_marca(registro, marca_esperada):
     """Compara "Nome Projeto" (ex: "RITUARIA") com o id de marca da Torre
-    (ex: "rituaria") - sem diferenciar caixa. Sem marca_esperada, aceita
-    qualquer linha (comportamento antigo)."""
+    (ex: "rituaria") - sem diferenciar caixa nem tipo de espaco. Sem
+    marca_esperada, aceita qualquer linha (comportamento antigo)."""
     if not marca_esperada:
         return True
-    projeto = str(registro.get("Nome Projeto") or "").strip().upper()
-    return projeto == str(marca_esperada).strip().upper()
+    projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper()
+    return projeto == _normalizar_espacos(marca_esperada).upper()
 
 
 def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):
