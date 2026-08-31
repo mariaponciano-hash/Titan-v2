@@ -577,11 +577,21 @@ def _normalizar_espacos(valor):
 def _bate_marca(registro, marca_esperada):
     """Compara "Nome Projeto" (ex: "RITUARIA") com o id de marca da Torre
     (ex: "rituaria") - sem diferenciar caixa nem tipo de espaco. Sem
-    marca_esperada, aceita qualquer linha (comportamento antigo)."""
+    marca_esperada, aceita qualquer linha (comportamento antigo).
+
+    APICE (confirmado pela Ivna, 31/08/2026): e a UNICA marca cujo "Nome
+    Projeto" vem vazio no Titan (todas as outras marcas sempre preenchem
+    esse campo). Por isso celula vazia e tratada como sinal confiavel de
+    "essa linha e da apice", nao como "nao bate com marca nenhuma" - sem
+    isso, toda NF de apice era descartada como "nao encontrada" mesmo
+    existindo certinha na tabela (lote real de NFs em 31/08/2026)."""
     if not marca_esperada:
         return True
     projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper()
-    return projeto == _normalizar_espacos(marca_esperada).upper()
+    esperado = _normalizar_espacos(marca_esperada).upper()
+    if not projeto:
+        return esperado == "APICE"
+    return projeto == esperado
 
 
 def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):
