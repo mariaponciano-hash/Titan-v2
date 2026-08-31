@@ -323,18 +323,24 @@ def _abrir_dropdown_e_pegar_campo_busca(frame, rotulo, tentativas=3):
     """
     CORRIGIDO (24/08/2026, erro real reportado pela Ivna): abrir_dropdown_filtro
     as vezes clica certo (a setinha do rotulo vira pra cima, print confirmou)
-    mas o popup abre VAZIO por um instante - nem o campo "Pesquisar" aparece
+    mas o popup abre VAZIO por um instante - nem o campo de busca aparece
     a tempo, sem nenhum erro visivel na tela (so um retangulo em branco).
     Parece lentidao pontual do proprio Titan, nao um clique errado. Em vez de
     desistir na primeira, fecha (Escape) e tenta abrir de novo ate
     'tentativas' vezes antes de propagar o erro de verdade.
+
+    CORRIGIDO (31/08/2026, HTML real salvo em titan_debug/filtro_nao_encontrado.html):
+    o placeholder desse campo nao e fixo em portugues - e uma string de UI do
+    proprio Power BI, que segue o locale do navegador. No PC da Ivna renderiza
+    "Pesquisar"; no runner do GitHub Actions (locale em ingles) renderiza
+    "Search". Aceita os dois.
     """
     ultimo_erro = None
     for tentativa in range(tentativas):
         abrir_dropdown_filtro(frame, rotulo)
         time.sleep(0.8 + tentativa * 0.5)  # da mais folga a cada nova tentativa
         try:
-            return elemento_visivel(frame.get_by_placeholder("Pesquisar"), timeout_ms=10000)
+            return elemento_visivel(frame.get_by_placeholder(re.compile("Pesquisar|Search")), timeout_ms=10000)
         except PWTimeout as e:
             ultimo_erro = e
             frame.page.keyboard.press("Escape")
