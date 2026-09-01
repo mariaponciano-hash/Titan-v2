@@ -65,6 +65,10 @@ create table if not exists public.enderecos_para_ticket (
   cliente         text,
   status_visto_em timestamptz,
 
+  -- quem criou a linha: 'bot' (pedido do cliente) ou 'torre' (agente)
+  origem          text        default 'bot',
+  responsavel     text,
+
   disparado_em    timestamptz,
   criado_em       timestamptz not null default now(),
   atualizado_em   timestamptz not null default now(),

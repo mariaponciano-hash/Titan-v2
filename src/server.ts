@@ -5024,6 +5024,130 @@ export default {
     //    historico. Chamar a enderecos-list pra isso traria o endereco completo
     //    de cada cliente pra contar linhas, o que seria absurdo.
     // 2. PII. Contar nao precisa de endereco de cliente atravessando a rede.
+    // ============ PORTA DE ENTRADA PRA TORRE DE CONTROLE ============
+    //
+    // A Torre chama isto quando o chamarTicketsCreator dela recebe
+    // code "ORDER NO SENT" (literal, com espacos, HTTP 200, action
+    // "no_ticket_needed"): em vez de mostrar um erro morto pro agente, o pedido
+    // entra na fila e e disparado quando o pedido sair.
+    //
+    // POR QUE UM ENDPOINT E NAO O SCHEMA DA TABELA: a Torre nao precisa conhecer
+    // a chave (pedido, marca), nem a regra de nunca escrever `status` - que se
+    // violada faz a Central abrir um SEGUNDO ticket no mesmo pedido -, nem o
+    // mapeamento address1..4 do creator, onde address2 e o numero e address4 e o
+    // bairro. Um escritor so na tabela, um lugar so pra errar.
+    //
+    // Os nomes aqui sao em portugues de proposito: quem chama descreve um
+    // endereco, nao o payload de terceiro que ele vai virar.
+    if (url.pathname === '/api/enderecos-enfileirar' && request.method === 'POST') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const b: any = await request.json().catch(() => ({}));
+        const txt = (v: any) => String(v == null ? '' : v).trim();
+
+        const marca = txt(b.marca).toUpperCase();
+        const pedido = txt(b.numero_pedido || b.pedido);
+        if (!marca || !pedido) {
+          return Response.json({ error: 'marca e numero_pedido sao obrigatorios', code: 'CAMPOS_OBRIGATORIOS' }, { status: 400 });
+        }
+        if (!marcaParaBrand(marca)) {
+          return Response.json({
+            error: `marca "${marca}" nao mapeia pra nenhuma das 9 do creator (${Object.keys(MARCA_PARA_BRAND).join(', ')})`,
+            code: 'MARCA_DESCONHECIDA',
+          }, { status: 400 });
+        }
+
+        const cidade = txt(b.cidade);
+        const uf = txt(b.uf).toUpperCase();
+        const logradouro = txt(b.logradouro);
+        const cep = txt(b.cep);
+
+        // Barra na porta em vez de enfileirar algo condenado. A Regra 1 do
+        // creator compara SO as partes (city/state/address1/address2/zipcode) e
+        // nunca faz parse do texto composto - sem cidade+UF e sem logradouro nem
+        // CEP ela nao tem o que comparar, e o ticket morreria em
+        // ADDRESS_UNVERIFIABLE depois de esperar o pedido sair. Melhor o agente
+        // saber agora, com a tela aberta e o cliente na linha, do que a linha
+        // apodrecer na fila.
+        if (!cidade || !uf || (!logradouro && !cep)) {
+          return Response.json({
+            error: 'faltam dados pra transportadora conseguir avaliar a troca: cidade e UF sao obrigatorios, mais logradouro ou CEP',
+            code: 'ENDERECO_INSUFICIENTE',
+            faltando: [
+              ...(!cidade ? ['cidade'] : []),
+              ...(!uf ? ['uf'] : []),
+              ...(!logradouro && !cep ? ['logradouro ou cep'] : []),
+            ],
+          }, { status: 400 });
+        }
+
+        const numero = txt(b.numero);
+        const complemento = txt(b.complemento);
+        const bairro = txt(b.bairro);
+        const pais = txt(b.pais) || 'BR';
+
+        // fullAddress: usa o que vier pronto; senao compoe na ordem que o creator
+        // usaria (address1, address2, address3, address4, city, state,
+        // country_code, zipcode).
+        const composto = [logradouro, numero, complemento, bairro, cidade, uf, pais, cep]
+          .filter(Boolean).join(', ');
+        const novoEndereco = txt(b.novo_endereco || b.endereco_novo) || composto;
+
+        const linha: any = {
+          pedido, marca,
+          endereco_atual: txt(b.endereco_atual) || null,
+          novo_endereco: novoEndereco,
+          end_logradouro: logradouro || null,
+          end_numero: numero || null,
+          end_complemento: complemento || null,
+          end_bairro: bairro || null,
+          end_cidade: cidade,
+          end_uf: uf,
+          end_cep: cep || null,
+          end_pais: pais,
+          origem: 'torre',
+          responsavel: txt(b.responsavel) || null,
+        };
+        // `status` NAO entra no corpo de proposito - ver o comentario grande
+        // acima. Com merge-duplicates, so as colunas presentes sao atualizadas,
+        // entao um segundo registro no mesmo pedido troca o endereco e deixa o
+        // estado da fila em paz.
+
+        const r = await fetch(
+          `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?on_conflict=pedido,marca`,
+          {
+            method: 'POST',
+            headers: headersEnderecos(env, {
+              'Content-Type': 'application/json',
+              Prefer: 'resolution=merge-duplicates,return=representation',
+            }),
+            body: JSON.stringify(linha),
+          }
+        );
+        const corpo = await r.text();
+        if (!r.ok) {
+          console.error(`[enderecos-enfileirar] Supabase HTTP ${r.status}: ${corpo.slice(0, 300)}`);
+          return Response.json({ error: `falha ao gravar: HTTP ${r.status}`, detalhe: corpo.slice(0, 300) }, { status: 502 });
+        }
+        let rows: any[] = [];
+        try { rows = JSON.parse(corpo); } catch {}
+        const linhaGravada = Array.isArray(rows) && rows.length ? rows[0] : null;
+        return Response.json({
+          ok: true,
+          id: linhaGravada ? linhaGravada.id : null,
+          status: linhaGravada ? linhaGravada.status : null,
+          // A Torre mostra isso pro agente: se ja existia, ele nao registrou em
+          // duplicidade - so atualizou o endereco.
+          jaExistia: !!(linhaGravada && linhaGravada.criado_em && linhaGravada.atualizado_em
+            && linhaGravada.criado_em !== linhaGravada.atualizado_em),
+          mensagem: 'Pedido registrado na fila. O ticket sera aberto automaticamente quando o pedido sair.',
+        });
+      } catch (e: any) {
+        console.error(`[enderecos-enfileirar] ${String((e && e.message) || e)}`);
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
     if (url.pathname === '/api/enderecos-contadores' && request.method === 'GET') {
       if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
       try {
