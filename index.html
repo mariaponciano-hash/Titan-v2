@@ -674,6 +674,11 @@ textarea.fluxo-node-texto.field-input{flex:1;min-height:44px;resize:vertical}
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M3 9.5L12 4l9 5.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 8.5V19a1 1 0 001 1h12a1 1 0 001-1V8.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 20v-6h6v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Unilog CD</span>
       </button>
+      <button class="nav-item" id="nav-enderecos" onclick="setTab('enderecos')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 21s-7-5.5-7-11a7 7 0 1114 0c0 5.5-7 11-7 11z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="10" r="2.5" stroke="currentColor" stroke-width="1.8"/></svg>
+        <span>Tickets a Disparar</span>
+        <span class="nav-badge" id="badge-enderecos" style="display:none">0</span>
+      </button>
       <button class="nav-item" id="nav-regras" onclick="setTab('regras')">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M4 4.5A2.5 2.5 0 016.5 2H20v17.5a2.5 2.5 0 01-2.5 2.5H4V4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 4.5A2.5 2.5 0 016.5 2H20v17.5H6.5A2.5 2.5 0 004 22" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 7h9M8 11h9M8 15h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         <span>Regras de Negócio</span>
@@ -1655,8 +1660,8 @@ function getMotivoCell(t) {
 // STATUS
 
 // TABS
-const PAGE_TITLES = { tickets: 'Torre de Controle', torre: 'Torre de Controle', unilog: 'Unilog CD', regras: 'Regras de Negócio', dashboard: 'Dashboard', config: 'Configurações' };
-const PAGE_CAPTIONS = { tickets: 'FILA DE TICKETS', torre: 'VISAO 360 DO PEDIDO', unilog: 'CENTRO DE DISTRIBUICAO UNILOG', regras: 'REGRAS DE NEGÓCIO', dashboard: 'VISAO GERAL', config: 'CONFIGURACOES' };
+const PAGE_TITLES = { tickets: 'Torre de Controle', enderecos: 'Tickets a Serem Disparados', torre: 'Torre de Controle', unilog: 'Unilog CD', regras: 'Regras de Negócio', dashboard: 'Dashboard', config: 'Configurações' };
+const PAGE_CAPTIONS = { tickets: 'FILA DE TICKETS', enderecos: 'TICKETS A SEREM DISPARADOS', torre: 'VISAO 360 DO PEDIDO', unilog: 'CENTRO DE DISTRIBUICAO UNILOG', regras: 'REGRAS DE NEGÓCIO', dashboard: 'VISAO GERAL', config: 'CONFIGURACOES' };
 function setTab(tab) {
   // Guarda contra perda de edicao (08/08/2026, a pedido da Maria): apagar uma
   // linha da tabela de classificacoes (ou editar qualquer campo) so muda o
@@ -1668,7 +1673,7 @@ function setTab(tab) {
     if (!confirm('Você tem alterações não salvas nas Regras de Negócio. Sair sem salvar?')) return;
   }
   currentTab = tab;
-  ['tickets','torre','unilog','regras','dashboard','config'].forEach(function(t) {
+  ['tickets','torre','unilog','enderecos','regras','dashboard','config'].forEach(function(t) {
     const el = document.getElementById('nav-'+t);
     if (el) el.classList.toggle('active', t === tab);
   });
@@ -1707,6 +1712,7 @@ function setTab(tab) {
     // essa checagem so serviria pra travar todo mundo na tela de config, ja
     // que DEFAULT_SB_KEY ficou vazio de proposito. Removida.
     if (tab === 'config') { renderConfig(false); return; }
+    if (tab === 'enderecos') { renderEnderecos(); return; }
     if (tab === 'regras') { renderRegras(); return; }
     // A Torre nao depende de allTickets - ela busca um pedido especifico sob
     // demanda, entao pode renderizar direto sem carregar a lista de tickets.
@@ -5844,6 +5850,423 @@ function transportadorasAtivasHTML() {
 // safeAttr, que escapa pra uso dentro de atributos com aspas simples em
 // onclick inline). Usado aqui pro texto ir corretamente dentro da <textarea>,
 // sem que "<", ">" ou "&" digitados pelo agente quebrem o HTML da pagina.
+// ============ ABA: TICKETS A SEREM DISPARADOS (24/08/2026) ============
+// Espelha a fila de enderecos_para_ticket: o bot registra a troca de endereco
+// que o cliente pediu, o cron dispara quando o pedido sai, e o que falhou fica
+// visivel aqui com botao de redisparo manual.
+//
+// ESCAPE: diferente do resto desta tela (que interpola dado de ticket direto no
+// innerHTML), tudo aqui passa por escEnd(). O `novo_endereco` vem de texto
+// digitado pelo cliente e repassado pelo bot - e a entrada menos confiavel de
+// toda a Central, entao nao entra cru no DOM.
+function escEnd(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Manda a trigger key so se o agente tiver configurado uma. Em app autenticado
+// (staging) ela e dispensavel; em app publico ela volta a ser o que autoriza.
+function headersEnd(extra) {
+  var hh = Object.assign({}, extra || {});
+  if (TRIGGER_KEY) hh['X-Trigger-Key'] = TRIGGER_KEY;
+  return hh;
+}
+
+// Traducao dos codes do creator pra linguagem de gente. Sem isso a tela mostra
+// ORDER NO SENT / ADDRESS_UNVERIFIABLE cru, que nao diz nada pra quem nao leu o
+// doc da API.
+var CODE_EM_PORTUGUES = {
+  'ORDER NO SENT':          'Pedido ainda nao saiu do CD',
+  'ADDRESS_TICKET_CREATED': 'Ticket aberto agora',
+  'TICKET_EXISTS':          'Ja havia ticket em andamento',
+  'TICKET_COMPLETED':       'Ticket ja concluido',
+  'ADDRESS_CHANGE_BLOCKED': 'Transportadora nao aceita essa alteracao',
+  'CARRIER_NOT_AUTOMATED':  'Transportadora sem automacao de endereco',
+  'ADDRESS_MISSING':        'Nao veio endereco',
+  'ADDRESS_UNVERIFIABLE':   'Endereco sem cidade/UF - regra nao consegue avaliar',
+  'ESCALATE_TO_HUMAN':      'Creator escalou para atendimento humano',
+  'MARCA_DESCONHECIDA':     'Marca nao mapeia pra nenhuma das 9 do creator'
+};
+function codeEmPortugues(c) { return CODE_EM_PORTUGUES[c] || c || ''; }
+
+// Status de entrega que vem no corpo da criacao (data.delivery_status).
+var ENTREGA_EM_PORTUGUES = {
+  created:          'Pronto para envio',
+  in_transit:       'Em transito',
+  out_for_delivery: 'Saiu para entrega',
+  delivered:        'Entregue',
+  delivery_failed:  'Falha na entrega',
+  canceled:         'Cancelado'
+};
+function entregaEmPortugues(s) { return ENTREGA_EM_PORTUGUES[s] || s || ''; }
+
+function horaCurta(iso) {
+  if (!iso) return '';
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+var enderecoFiltroStatus = 'todos';
+var _enderecosCache = null;
+
+// Rotulos dos DOIS vocabularios de status, que convivem nesta tela:
+//  - ENDERECO_STATUS_*  = a NOSSA tentativa (coluna `status` da tabela)
+//  - TICKET_STATUS_*    = o estado do ticket no cx-ticketcreator
+// Eles usam palavras parecidas com sentidos diferentes de proposito separados:
+// o `manual` deles significa "transportadora sem automacao, precisa de pessoa,
+// nada falhou"; o nosso caso equivalente se chama `esgotado` (estourou o teto
+// de tentativas). Misturar os dois na mesma coluna seria ilegivel.
+var ENDERECO_STATUS_LABEL = {
+  aguardando:    'Aguardando envio',
+  sem_fonte_de_status: 'Sem fonte de status',
+  bloqueado:     'Bloqueado pela regra',
+  precisa_humano: 'Precisa de pessoa',
+  disparando:    'Disparando...',
+  criado:        'Ticket criado',
+  erro:          'Erro',
+  esgotado:      'Esgotado',
+  nao_se_aplica: 'Nao se aplica'
+};
+var ENDERECO_STATUS_COR = {
+  aguardando:    ['var(--yellow-bg)', 'var(--yellow)'],
+  sem_fonte_de_status: ['var(--orange-bg)', 'var(--orange)'],
+  bloqueado:      ['var(--red-bg)', 'var(--red)'],
+  precisa_humano: ['var(--purple-bg)', 'var(--purple)'],
+  disparando:    ['var(--blue-bg)',   'var(--blue)'],
+  criado:        ['var(--green-bg)',  'var(--green)'],
+  erro:          ['var(--red-bg)',    'var(--red)'],
+  esgotado:      ['var(--purple-bg)', 'var(--purple)'],
+  nao_se_aplica: ['var(--gray-bg)',   'var(--gray)']
+};
+var TICKET_STATUS_LABEL = {
+  pending:    'pendente',
+  processing: 'processando',
+  completed:  'concluido',
+  error:      'erro na transportadora',
+  manual:     'precisa de pessoa (sem automacao)'
+};
+
+
+// Banner de saude do cron. Cobre DOIS modos de falha que antes eram invisiveis:
+// o lote que roda e falha (ok:false) e o lote que parou de rodar (registro
+// velho). O segundo importa porque um cron desabilitado ou apagado nao deixa
+// rastro nenhum - a tela simplesmente ficaria parada parecendo saudavel.
+var LOTE_ATRASO_ALERTA_MS = 3 * 60 * 60 * 1000;
+
+
+// Badge do menu: quantas linhas esperam acao de pessoa (erro, esgotado,
+// precisa_humano). Usa a rota de contadores, que nao devolve linha nenhuma -
+// contar nao precisa trazer endereco de cliente pela rede.
+async function atualizarBadgeEnderecos() {
+  var el = document.getElementById('badge-enderecos');
+  if (!el) return;
+  try {
+    var r = await fetchComTimeout('/api/enderecos-contadores', { headers: headersEnd() }, 12000);
+    if (!r.ok) return;
+    var d = await r.json();
+    var n = (d && d.precisamAtencao) || 0;
+    el.textContent = n > 99 ? '99+' : String(n);
+    el.style.display = n > 0 ? 'inline' : 'none';
+    el.title = n === 1 ? '1 linha esperando alguem' : n + ' linhas esperando alguem';
+  } catch (e) {
+    // Silencioso de proposito: badge que nao carrega nao pode atrapalhar o
+    // resto da tela. A falha real aparece no banner dentro da aba.
+  }
+}
+
+function bannerUltimoLote(ul) {
+  if (!ul) {
+    return '<div class="alert alert-error" style="margin-bottom:12px">'
+      + '<strong>O lote nunca rodou.</strong> Nenhum registro de execução — '
+      + 'o cron pode não estar configurado, ou nunca chegou a completar.</div>';
+  }
+  var quando = horaCurta(ul.em);
+  var idadeMs = ul.em ? (Date.now() - new Date(ul.em).getTime()) : null;
+  var velho = idadeMs !== null && idadeMs > LOTE_ATRASO_ALERTA_MS;
+
+  if (ul.ok === false) {
+    return '<div class="alert alert-error" style="margin-bottom:12px">'
+      + '<strong>O último lote falhou</strong> (' + escEnd(quando) + '): '
+      + escEnd(String(ul.erro || 'sem detalhe')) + '</div>';
+  }
+  var resumo = escEnd(ul.criados || 0) + ' criado(s), '
+    + escEnd(ul.aindaAguardando || 0) + ' aguardando, '
+    + escEnd(ul.comErro || 0) + ' com erro'
+    + (ul.resgatadas ? ', ' + escEnd(ul.resgatadas) + ' resgatada(s)' : '');
+  if (velho) {
+    var horas = Math.floor(idadeMs / 3600000);
+    return '<div class="alert alert-error" style="margin-bottom:12px">'
+      + '<strong>O lote não roda há ' + horas + 'h.</strong> Último sucesso em '
+      + escEnd(quando) + ' (' + resumo + '). O cron deveria rodar de hora em hora — '
+      + 'vale checar se está habilitado.</div>';
+  }
+  return '<div class="alert alert-success" style="margin-bottom:12px">'
+    + 'Último lote em ' + escEnd(quando) + ': ' + resumo
+    + (ul.mock ? ' <strong>(mock: ' + escEnd(ul.mock) + ')</strong>' : '') + '</div>';
+}
+
+function enderecoPill(status) {
+  var cor = ENDERECO_STATUS_COR[status] || ['var(--gray-bg)', 'var(--gray)'];
+  var lbl = ENDERECO_STATUS_LABEL[status] || status || '—';
+  return '<span style="background:' + cor[0] + ';color:' + cor[1] + ';font-size:10px;font-weight:700;'
+    + 'padding:2px 8px;border-radius:4px;white-space:nowrap">' + escEnd(lbl) + '</span>';
+}
+
+function renderEnderecos() {
+  // Sem pedir chave: este app esta atras do SSO do GoDeploy, entao quem chegou
+  // aqui ja se autenticou e o worker reconhece pelo header x-godeploy-user-email
+  // (ver autorizadoEnderecos em server.ts). A trigger key segue sendo enviada
+  // quando existir, pra funcionar tambem em app publico.
+  var mc = document.getElementById('main-content');
+  mc.innerHTML = '<div id="end-topo"></div><div id="end-lista"><div class="state-box"><p>Carregando fila...</p></div></div>';
+  loadEnderecos();
+}
+
+async function loadEnderecos() {
+  var lista = document.getElementById('end-lista');
+  try {
+    var r = await fetchComTimeout('/api/enderecos-list', { headers: headersEnd() }, 20000);
+    var data = await r.json();
+    if (!r.ok) {
+      lista.innerHTML = '<div class="alert alert-error">Erro (' + r.status + '): ' + escEnd((data && data.error) || 'falha desconhecida') + '</div>';
+      return;
+    }
+    _enderecosCache = data;
+    renderEnderecosTopo(data);
+    renderEnderecosLista(data);
+    // A listagem ja trouxe porStatus - atualiza o badge daqui em vez de gastar
+    // outra requisicao na rota de contadores.
+    var elBadge = document.getElementById('badge-enderecos');
+    if (elBadge) {
+      var ps = data.porStatus || {};
+      var n = (ps['erro'] || 0) + (ps['esgotado'] || 0) + (ps['precisa_humano'] || 0);
+      elBadge.textContent = n > 99 ? '99+' : String(n);
+      elBadge.style.display = n > 0 ? 'inline' : 'none';
+    }
+  } catch (e) {
+    lista.innerHTML = '<div class="alert alert-error">Erro de conexao: ' + escEnd((e && e.message) || e) + '</div>';
+  }
+}
+
+function renderEnderecosTopo(data) {
+  var el = document.getElementById('end-topo');
+  if (!el) return;
+  var ps = data.porStatus || {};
+  var ordem = ['aguardando', 'precisa_humano', 'bloqueado', 'erro', 'esgotado', 'sem_fonte_de_status', 'disparando', 'criado', 'nao_se_aplica'];
+  var chips = ordem.filter(function(s) { return ps[s]; }).map(function(s) {
+    var ativo = enderecoFiltroStatus === s;
+    return '<button onclick="setEnderecoFiltro(\'' + s + '\')" style="border:1px solid ' + (ativo ? 'var(--blue)' : 'var(--border-2)')
+      + ';background:' + (ativo ? 'var(--blue-bg)' : 'var(--white)') + ';border-radius:16px;padding:5px 12px;cursor:pointer;'
+      + 'font-family:\'Poppins\',sans-serif;font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px">'
+      + escEnd(ENDERECO_STATUS_LABEL[s] || s) + '<span style="font-weight:700;color:var(--ink-3)">' + ps[s] + '</span></button>';
+  }).join('');
+  var todos = '<button onclick="setEnderecoFiltro(\'todos\')" style="border:1px solid '
+    + (enderecoFiltroStatus === 'todos' ? 'var(--blue)' : 'var(--border-2)') + ';background:'
+    + (enderecoFiltroStatus === 'todos' ? 'var(--blue-bg)' : 'var(--white)') + ';border-radius:16px;padding:5px 12px;cursor:pointer;'
+    + 'font-family:\'Poppins\',sans-serif;font-size:11px;font-weight:600">Todos <span style="font-weight:700;color:var(--ink-3)">'
+    + (data.total || 0) + '</span></button>';
+
+  // Aviso de mock: sem o secret do creator, "criar ticket" NAO cria nada de
+  // verdade. Sem esse aviso na cara, o agente veria "Ticket criado" na tela e
+  // acreditaria - o pior tipo de falha silenciosa possivel aqui.
+  var avisoMock = data.temSecretCreator ? '' :
+    '<div class="alert alert-error" style="margin-bottom:12px"><strong>Modo mock.</strong> '
+    + 'O secret do cx-ticketcreator (TICKET_WEBHOOK_SECRET) nao esta configurado, entao nenhum ticket '
+    + 'e criado de verdade - os disparos abaixo sao simulados. Configure o secret para valer.</div>';
+
+  el.innerHTML = bannerUltimoLote(data.ultimoLote)
+    + avisoMock
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px">'
+    + todos + chips
+    + '<div style="flex:1"></div>'
+    + (data.temSecretCreator ? '' :
+        '<select id="end-mock-cenario" class="filter-select" style="border-radius:6px;font-size:11px"'
+        + ' title="Só aparece em modo mock: escolhe o desfecho simulado da criação">'
+        + '<option value="sucesso">mock: sucesso</option>'
+        + '<option value="nao_enviado">mock: pedido não enviado</option>'
+        + '<option value="erro">mock: erro</option>'
+        + '<option value="bloqueado">mock: bloqueado (Regra 1)</option>'
+        + '<option value="precisa_humano">mock: precisa de pessoa</option></select>')
+    + '<button class="btn-refresh" id="btn-end-processar" onclick="processarFilaEnderecos(this)">Processar fila</button>'
+    + '<button class="btn-refresh" id="btn-end-reconciliar" onclick="reconciliarEnderecosUI(this)" '
+    + 'title="Confere cada linha contra o cx-ticketcreator e marca divergencia">Reconciliar</button>'
+    + '</div><div id="end-acao-resultado"></div>';
+}
+
+function setEnderecoFiltro(s) {
+  enderecoFiltroStatus = s;
+  if (_enderecosCache) { renderEnderecosTopo(_enderecosCache); renderEnderecosLista(_enderecosCache); }
+}
+
+function renderEnderecosLista(data) {
+  var el = document.getElementById('end-lista');
+  if (!el) return;
+  var rows = (data.rows || []).filter(function(r) {
+    return enderecoFiltroStatus === 'todos' || r.status === enderecoFiltroStatus;
+  });
+  if (!rows.length) {
+    el.innerHTML = '<div class="state-box"><p>' + (data.total
+      ? 'Nenhuma linha com este status.'
+      : 'A fila esta vazia. O bot alimenta esta tabela quando um cliente pede troca de endereco.') + '</p></div>';
+    return;
+  }
+  var head = '<div class="t-head" style="grid-template-columns:110px 90px 1fr 1fr 130px 150px 110px">'
+    + '<span>Pedido</span><span>Marca</span><span>Endereco atual</span><span>Novo endereco</span>'
+    + '<span>Nossa fila</span><span>Ticket no creator</span><span></span></div>';
+
+  var corpo = rows.map(function(r) {
+    // 'bloqueado' NAO ganha botao: a Regra 1 do creator recusou e redisparar
+    // devolveria o mesmo. O que falta ali e avisar o cliente, nao tentar de novo.
+    var podeCriar = r.status === 'aguardando' || r.status === 'erro'
+      || r.status === 'esgotado' || r.status === 'sem_fonte_de_status'
+      || r.status === 'precisa_humano';
+    var ticketCel;
+    if (r.ticket_id) {
+      var lbl = TICKET_STATUS_LABEL[r.ticket_status] || r.ticket_status || '—';
+      ticketCel = '<div style="font-size:11px"><span class="mono" style="font-weight:600">#' + escEnd(r.ticket_id) + '</span> '
+        + escEnd(lbl)
+        + (r.ticket_reference ? '<div class="mono" style="color:var(--ink-3);font-size:10px">ref ' + escEnd(r.ticket_reference) + '</div>' : '')
+        + (r.delivery_status
+            ? '<div style="font-size:10px;margin-top:2px"><span style="background:var(--cyan-bg);color:var(--cyan);'
+              + 'padding:1px 5px;border-radius:3px;font-weight:600">' + escEnd(entregaEmPortugues(r.delivery_status)) + '</span>'
+              // Foto do momento da abertura, nao valor vivo - o rotulo diz isso
+              // pra ninguem ler como status atual do pedido.
+              + (r.status_visto_em ? ' <span style="color:var(--ink-4)">na abertura</span>' : '') + '</div>'
+            : '')
+        + (r.tracking_code ? '<div class="mono" style="color:var(--ink-3);font-size:10px">' + escEnd(r.tracking_code) + (r.carrier ? ' - ' + escEnd(r.carrier) : '') + '</div>' : '')
+        + (r.ticket_deadline ? '<div style="color:var(--ink-3);font-size:10px">prazo ' + escEnd(r.ticket_deadline) + '</div>' : '') + '</div>';
+    } else {
+      ticketCel = '<span style="color:var(--ink-4);font-size:11px">sem ticket</span>';
+    }
+    // O `code` do creator e a informacao mais util da linha quando algo nao
+    // deu certo - e ele que diz se foi regra de negocio ou falha tecnica.
+    var selo = r.ultimo_code
+      ? '<span class="mono" style="background:var(--white);border:1px solid currentColor;border-radius:3px;padding:0 4px;margin-right:6px">'
+        + escEnd(r.ultimo_code) + '</span>' : '';
+    var motivo = r.blocked_reason
+      ? ' <strong>(' + escEnd(r.blocked_reason) + ')</strong>' : '';
+    // O caso 'aguardando' nao tem ultimo_erro (nao e erro), mas TEM ultimo_code.
+    // Sem esta linha, o estado mais comum da fila aparece sem explicacao nenhuma.
+    var infoLinha = (!r.ultimo_erro && r.ultimo_code)
+      ? '<div style="grid-column:1/-1;background:var(--surface);color:var(--ink-2);border-radius:4px;'
+        + 'padding:6px 9px;font-size:11px;margin-top:4px">' + escEnd(codeEmPortugues(r.ultimo_code))
+        + (r.atualizado_em ? ' <span style="color:var(--ink-3)">- checado ' + escEnd(horaCurta(r.atualizado_em)) + '</span>' : '')
+        + (r.proxima_tentativa_em ? ' <span style="color:var(--ink-3)">- reconsulta ' + escEnd(horaCurta(r.proxima_tentativa_em)) + '</span>' : '')
+        + '</div>'
+      : '';
+    var erroLinha = r.ultimo_erro
+      ? '<div style="grid-column:1/-1;background:' + (r.status === 'bloqueado' ? 'var(--red-bg);color:var(--red)' : r.status === 'precisa_humano' ? 'var(--purple-bg);color:var(--purple)' : 'var(--red-bg);color:var(--red)')
+        + ';border-radius:4px;padding:6px 9px;font-size:11px;margin-top:4px">' + selo
+        + escEnd(String(r.ultimo_erro).slice(0, 400)) + motivo + '</div>'
+      : '';
+    if (r.ultimo_code && r.ultimo_erro) {
+      selo = '<span class="mono" style="background:var(--white);border:1px solid currentColor;border-radius:3px;'
+        + 'padding:0 4px;margin-right:6px" title="' + escEnd(codeEmPortugues(r.ultimo_code)) + '">'
+        + escEnd(r.ultimo_code) + '</span>';
+    }
+    return '<div class="t-row-wrap"><div class="t-row" style="grid-template-columns:110px 90px 1fr 1fr 130px 150px 110px;cursor:default">'
+      + '<div class="mono" style="font-size:11px;font-weight:600">' + escEnd(r.pedido) + '</div>'
+      + '<div><span class="t-marca">' + escEnd(r.marca) + '</span></div>'
+      + '<div style="font-size:11px;color:var(--ink-2)">' + escEnd(r.endereco_atual || '—') + '</div>'
+      + '<div style="font-size:11px;font-weight:600">' + escEnd(r.novo_endereco || '—') + '</div>'
+      + '<div>' + enderecoPill(r.status) + '</div>'
+      + '<div>' + ticketCel + '</div>'
+      + '<div>' + (podeCriar
+          ? '<button class="btn-resp" style="padding:5px 9px;font-size:10px" onclick="criarTicketEnderecoManual(\''
+            + escEnd(r.id) + '\',this)">' + (r.status === 'aguardando' ? 'Criar ticket' : 'Redisparar') + '</button>'
+          : '') + '</div>'
+      + infoLinha + erroLinha + '</div></div>';
+  }).join('');
+
+  el.innerHTML = '<div class="ticket-table">' + head + corpo + '</div>';
+}
+
+// Cenario de mock escolhido na tela. Devolve null quando o seletor nao existe
+// (modo real, com TICKET_WEBHOOK_SECRET configurado) - e null faz o backend
+// usar o caminho de verdade, nao o simulado.
+function cenarioMock() {
+  var el = document.getElementById('end-mock-cenario');
+  return el && el.value ? el.value : null;
+}
+function cenarioMockQS() {
+  var c = cenarioMock();
+  return c ? ('?mock=' + encodeURIComponent(c)) : '';
+}
+
+async function criarTicketEnderecoManual(id, btn) {
+  if (!confirm('Criar o ticket de alteracao de endereco para esta linha agora?')) return;
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  var out = document.getElementById('end-acao-resultado');
+  try {
+    var r = await fetchComTimeout('/api/enderecos-criar-manual', {
+      method: 'POST',
+      headers: headersEnd({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ id: id, mock: cenarioMock() })
+    }, 25000);
+    var data = await r.json();
+    if (!r.ok) {
+      if (out) out.innerHTML = '<div class="alert alert-error">' + escEnd((data && data.error) || ('HTTP ' + r.status)) + '</div>';
+    } else {
+      var acao = (data.resultado && data.resultado.acao) || 'processado';
+      var tipo = /criado/.test(acao) ? 'success' : 'error';
+      if (out) out.innerHTML = '<div class="alert alert-' + tipo + '">' + escEnd(acao)
+        + (data.resultado && data.resultado.erro ? ' — ' + escEnd(data.resultado.erro) : '') + '</div>';
+    }
+  } catch (e) {
+    if (out) out.innerHTML = '<div class="alert alert-error">Erro de conexao: ' + escEnd((e && e.message) || e) + '</div>';
+  }
+  loadEnderecos();
+  atualizarBadgeEnderecos();
+}
+
+async function processarFilaEnderecos(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Processando...'; }
+  var out = document.getElementById('end-acao-resultado');
+  try {
+    var r = await fetchComTimeout('/api/enderecos-processar' + cenarioMockQS(), {
+      method: 'POST', headers: headersEnd()
+    }, 60000);
+    var d = await r.json();
+    if (!r.ok) {
+      if (out) out.innerHTML = '<div class="alert alert-error">' + escEnd((d && d.error) || ('HTTP ' + r.status)) + '</div>';
+    } else if (out) {
+      out.innerHTML = '<div class="alert alert-success">Fila de ' + escEnd(d.fila) + ': '
+        + escEnd(d.criados) + ' criado(s), ' + escEnd(d.aindaAguardando) + ' ainda aguardando envio, '
+        + escEnd(d.comErro) + ' com erro.' + (d.mock ? ' <strong>(mock: ' + escEnd(d.mock) + ')</strong>' : '') + '</div>';
+    }
+  } catch (e) {
+    if (out) out.innerHTML = '<div class="alert alert-error">Erro de conexao: ' + escEnd((e && e.message) || e) + '</div>';
+  }
+  loadEnderecos();
+  atualizarBadgeEnderecos();
+}
+
+async function reconciliarEnderecosUI(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Conferindo...'; }
+  var out = document.getElementById('end-acao-resultado');
+  try {
+    var r = await fetchComTimeout('/api/enderecos-reconciliar', {
+      method: 'POST', headers: headersEnd()
+    }, 60000);
+    var d = await r.json();
+    if (!r.ok) {
+      if (out) out.innerHTML = '<div class="alert alert-error">' + escEnd((d && d.error) || ('HTTP ' + r.status)) + '</div>';
+    } else if (out) {
+      // Divergencia e o achado importante desta acao, nao um detalhe: significa
+      // que a nossa tabela diz "criado" e o creator nao tem o ticket.
+      var tipo = d.divergentes ? 'error' : 'success';
+      out.innerHTML = '<div class="alert alert-' + tipo + '">' + escEnd(d.conferidos) + ' linha(s) conferida(s), '
+        + escEnd(d.atualizados) + ' atualizada(s), <strong>' + escEnd(d.divergentes) + ' divergente(s)</strong>.'
+        + (d.divergentes ? ' Divergencia costuma significar `reference` em formato que o creator nao reconhece.' : '') + '</div>';
+    }
+  } catch (e) {
+    if (out) out.innerHTML = '<div class="alert alert-error">Erro de conexao: ' + escEnd((e && e.message) || e) + '</div>';
+  }
+  loadEnderecos();
+}
+
 function escapeHtml(s) {
   return (s||'').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -6318,6 +6741,12 @@ atualizarBotoesMarca();
 // allTickets esta vazio neste ponto) sem tocar no resto do #main-content.
 var barInicial = document.querySelector('.status-filter-bar');
 if (barInicial) barInicial.outerHTML = renderStatusFilterBar(getStatusCounts(allTickets));
+// Badge de "Tickets a Disparar": UMA requisicao leve no boot, so a contagem.
+// Nao contraria a regra de nao buscar nada ao abrir a pagina - essa regra existe
+// pelo peso da fila de tickets (milhares de linhas com corpo de e-mail), e aqui
+// a rota devolve so numeros. Sem isso o badge nao teria como existir, porque o
+// agente precisa ver o numero SEM entrar na aba - que e o ponto dele.
+atualizarBadgeEnderecos();
 renderTorre();
 
 
