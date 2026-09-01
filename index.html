@@ -2728,10 +2728,17 @@ function torreAbrirTicket() {
       // ticket" (pedido no prazo, ticket duplicado, precisa de escalonamento
       // humano...) - mostramos a mensagem real dele em vez de fingir um
       // resultado generico de sucesso/falha.
+      var fila = ticketOk ? res.j.fila : null;
       if (!ticketOk) {
         torreState.resultadoEnvio = { classe: 'err', titulo: 'Falha ao registrar o ticket.', mensagem: erroTicket };
       } else if (tc.encaminhado) {
         torreState.resultadoEnvio = { classe: 'ok', titulo: 'Ticket criado — protocolo ' + protocolo + '.', mensagem: 'Transportadora contatada automaticamente pelo TicketsCreator.' };
+      } else if (fila && fila.ok) {
+        // Pedido ainda nao saiu do CD (TicketsCreator devolveu "ORDER NO
+        // SENT") - a Torre ja registrou na fila do Diego, que dispara
+        // sozinho quando o pedido despachar. O agente nao precisa lembrar
+        // de voltar aqui depois.
+        torreState.resultadoEnvio = { classe: 'ok', titulo: 'Endereço na fila — protocolo ' + protocolo + '.', mensagem: (fila.jaExistia ? 'Endereço atualizado na fila' : 'Pedido ainda não saiu do CD') + ' - o ticket será aberto automaticamente com a transportadora assim que o pedido for despachado.' };
       } else if (tc.chamado) {
         var msgTc = (tc.resposta && (tc.resposta.message || tc.resposta.status)) || tc.motivo || 'sem detalhes';
         torreState.resultadoEnvio = { classe: 'warn', titulo: 'Ticket registrado — protocolo ' + protocolo + '.', mensagem: 'TicketsCreator: ' + msgTc };

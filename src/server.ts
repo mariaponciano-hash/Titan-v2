@@ -4026,6 +4026,36 @@ export default {
           ? `HTTP ${ticketCreator.status}${ticketCreator.retentativaComSufixoShopify ? ' (retentativa c/ #SHOPIFY)' : ''}: ${JSON.stringify(ticketCreator.resposta).slice(0, 500)}`
           : `nao chamado: ${ticketCreator.motivo}`;
 
+        // FILA DE ENDERECOS (01/09/2026): quando o pedido ainda nao saiu do
+        // CD, o TicketsCreator recusa com code "ORDER NO SENT" (literal, com
+        // espaco - nao e ORDER_NO_SENT) e action "no_ticket_needed" - em vez
+        // de deixar o agente com um beco sem saida, grava na fila do Diego
+        // (mesmo worker, chamada direta - ver enfileirarEndereco, nunca via
+        // HTTP) pra o cron dele disparar sozinho quando o pedido sair.
+        let filaEndereco: any = null;
+        if (
+          problema === 'Alterar Endereço' &&
+          ticketCreator.resposta?.code === 'ORDER NO SENT' &&
+          body.endereco_novo_partes
+        ) {
+          const p = body.endereco_novo_partes;
+          filaEndereco = await enfileirarEndereco(env, {
+            marca: body.marca,
+            numero_pedido: body.numero_pedido,
+            endereco_atual: body.endereco_entrega,
+            novo_endereco: body.endereco_novo,
+            logradouro: p.address1,
+            numero: p.address2,
+            complemento: p.address3,
+            bairro: p.address4,
+            cidade: p.city,
+            uf: p.state,
+            cep: p.zipcode,
+            responsavel: body.responsavel,
+            origem: 'torre',
+          });
+        }
+
         await env.DB.exec(
           `INSERT INTO tickets_logistica
              (protocolo, marca, numero_pedido, numero_nf, problema, transportadora, codigo_rastreio,
@@ -4058,6 +4088,7 @@ export default {
             motivo: ticketCreator.motivo,
             retentativa_com_sufixo_shopify: !!ticketCreator.retentativaComSufixoShopify,
           },
+          fila: filaEndereco,
         });
       } catch (e: any) {
         return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
