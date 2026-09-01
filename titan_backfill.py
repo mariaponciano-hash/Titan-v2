@@ -91,6 +91,19 @@ STATUS_FINAIS = ["EMBARCADO", "CANCELADO"]
 RECHECK_INTERVALO_HORAS = 2
 RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - deixa margem dentro do timeout do job (ver titan_backfill.yml)
 
+# Achado real (01/09/2026, reportado pela Ivna - pedido SH1197313KS/NF
+# 1197313/marca kokeshi sem tabela Eventos na Unilog CD apesar de ja estar
+# EMBARCADO): pedido descoberto so pelo backfill (que de proposito nao
+# coleta Eventos/Itens - ver LIMITACAO no topo do arquivo) fica com
+# eventos=NULL pra sempre se a situacao ja for final - buscar_situacao_presa
+# acima ignora de proposito EMBARCADO/CANCELADO (a situacao em si esta
+# certa, so falta Eventos/Itens). O unico outro caminho (server.ts
+# reenfileirar quando 'concluido' sem eventos, ver commit dad290a) so
+# dispara se alguem repetir a solicitacao daquela NF pela Torre - nao roda
+# sozinho. Confirmado >=1000 pedidos reais nesse estado via query direta no
+# Supabase (bateu o teto de 1000 da API, o numero real pode ser maior).
+EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - mesmo padrao do recheck de situacao presa acima
+
 
 def _agora_iso():
     return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
@@ -147,6 +160,45 @@ def rechecar_situacoes_presas(page):
                 titan_watcher.marcar_erro(item.get("numero_nf"), item.get("marca"), str(e))
         processados += 1
     print(f"Recheck de situacao concluido: {processados} pedido(s) processado(s).")
+
+
+def buscar_concluidos_sem_eventos(limite=500):
+    """Pedidos status='concluido' mas eventos ainda NULL (ver
+    EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS acima pro porque)."""
+    path = (
+        f"{TABELA}?status=eq.concluido&eventos=is.null"
+        f"&select=numero_nf,marca&limit={limite}"
+    )
+    return titan_watcher._supabase_request("GET", path) or []
+
+
+def rechecar_concluidos_sem_eventos(page):
+    """
+    Reconfere um por um (mesma logica do rechecar_situacoes_presas acima -
+    processar_pedido sempre clica na linha e extrai Eventos/Itens) os
+    pedidos que o backfill deixou concluidos mas sem essa informacao.
+    Orcamento de tempo proprio, separado do recheck de situacao presa.
+    """
+    pendentes = buscar_concluidos_sem_eventos()
+    if not pendentes:
+        print("Nenhum pedido concluido sem Eventos/Itens.")
+        return
+    print(f"{len(pendentes)} pedido(s) concluidos sem Eventos/Itens - completando "
+          f"(orcamento {EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS}s)...")
+    inicio = time.monotonic()
+    processados = 0
+    for item in pendentes:
+        if time.monotonic() - inicio > EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS:
+            print(f"  orcamento de tempo esgotado - {processados}/{len(pendentes)} completado(s), resto fica pra proxima rodada.")
+            break
+        try:
+            titan_watcher.processar_pedido(page, item)
+        except Exception as e:
+            print(f"  [NF {item.get('numero_nf')} / marca {item.get('marca')}] erro completando eventos/itens: {e}", file=sys.stderr)
+            if item.get("numero_nf") and item.get("marca"):
+                titan_watcher.marcar_erro(item.get("numero_nf"), item.get("marca"), str(e))
+        processados += 1
+    print(f"Recheck de eventos/itens concluido: {processados} pedido(s) processado(s).")
 
 
 def _supabase_upsert_lote(registros):
@@ -372,6 +424,9 @@ def main():
 
             print("\nReconferindo pedidos presos em situacao intermediaria fora da janela do backfill...")
             rechecar_situacoes_presas(page)
+
+            print("\nCompletando Eventos/Itens de pedidos que o backfill deixou concluidos sem essa informacao...")
+            rechecar_concluidos_sem_eventos(page)
         finally:
             browser.close()
 

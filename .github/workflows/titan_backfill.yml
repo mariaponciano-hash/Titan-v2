@@ -18,12 +18,13 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # 40min (era 30) - 28/08/2026: agora tambem reconfere pedidos presos em
-    # situacao intermediaria fora da janela de 10 dias (ver
-    # rechecar_situacoes_presas em titan_backfill.py), orcamento proprio de
-    # 10min pra essa etapa - da margem extra sem depender so do orcamento
-    # interno do script.
-    timeout-minutes: 40
+    # 50min (era 40) - 01/09/2026: agora tambem completa Eventos/Itens de
+    # pedidos que o backfill deixou concluidos sem essa informacao (ver
+    # rechecar_concluidos_sem_eventos em titan_backfill.py), mais 10min de
+    # orcamento proprio pra essa etapa - soma com os 10min do recheck de
+    # situacao presa (28/08/2026), da margem extra sem depender so do
+    # orcamento interno do script.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v7
 
