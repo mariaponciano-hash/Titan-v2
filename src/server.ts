@@ -4626,6 +4626,44 @@ export default {
       }
     }
 
+    // Contagem por status, SEM devolver linha nenhuma. Existe separada da
+    // /api/enderecos-list de proposito, por duas razoes:
+    //
+    // 1. EGRESS. O bootstrap desta pagina nao busca nada do Supabase ao abrir
+    //    (decisao de 10/08/2026 a pedido da Maria), e um badge no menu precisa
+    //    de UMA consulta pra saber o numero. Esta rota le so a coluna `status` -
+    //    alguns bytes por linha numa tabela que e fila de trabalho, nao
+    //    historico. Chamar a enderecos-list pra isso traria o endereco completo
+    //    de cada cliente pra contar linhas, o que seria absurdo.
+    // 2. PII. Contar nao precisa de endereco de cliente atravessando a rede.
+    if (url.pathname === '/api/enderecos-contadores' && request.method === 'GET') {
+      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const r = await fetchComTimeout(
+          `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?select=status&limit=5000`,
+          { headers: headersEnderecos(env) },
+          ENDERECO_TIMEOUT_MS
+        );
+        if (!r.ok) {
+          const t = await r.text().catch(() => '');
+          throw new Error(`Supabase HTTP ${r.status}: ${t.slice(0, 200)}`);
+        }
+        const rows: any[] = await r.json();
+        const porStatus: Record<string, number> = {};
+        rows.forEach((x: any) => { const k = x.status || '(vazio)'; porStatus[k] = (porStatus[k] || 0) + 1; });
+        // O badge conta o que espera ACAO de pessoa. `aguardando` fica fora: e o
+        // estado saudavel da fila, e um numero que nunca zera vira ruido que o
+        // agente aprende a ignorar - e aí o badge perde a funcao justamente
+        // quando tiver algo de verdade.
+        const precisamAtencao = (porStatus['erro'] || 0) + (porStatus['esgotado'] || 0)
+          + (porStatus['precisa_humano'] || 0);
+        return Response.json({ total: rows.length, porStatus, precisamAtencao });
+      } catch (e: any) {
+        console.error(`[enderecos-contadores] ${String((e && e.message) || e)}`);
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
     if (url.pathname === '/api/enderecos-processar' && request.method === 'POST') {
       if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
       try {

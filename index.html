@@ -411,6 +411,7 @@ textarea.field-input{min-height:140px;resize:vertical}
       <button class="nav-item" id="nav-enderecos" onclick="setTab('enderecos')">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 21s-7-5.5-7-11a7 7 0 1114 0c0 5.5-7 11-7 11z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="10" r="2.5" stroke="currentColor" stroke-width="1.8"/></svg>
         <span>Tickets a Disparar</span>
+        <span class="nav-badge" id="badge-enderecos" style="display:none">0</span>
       </button>
       <button class="nav-item" id="nav-regras" onclick="setTab('regras')">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M4 4.5A2.5 2.5 0 016.5 2H20v17.5a2.5 2.5 0 01-2.5 2.5H4V4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 4.5A2.5 2.5 0 016.5 2H20v17.5H6.5A2.5 2.5 0 004 22" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 7h9M8 11h9M8 15h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
@@ -5028,6 +5029,27 @@ var TICKET_STATUS_LABEL = {
 // rastro nenhum - a tela simplesmente ficaria parada parecendo saudavel.
 var LOTE_ATRASO_ALERTA_MS = 3 * 60 * 60 * 1000;
 
+
+// Badge do menu: quantas linhas esperam acao de pessoa (erro, esgotado,
+// precisa_humano). Usa a rota de contadores, que nao devolve linha nenhuma -
+// contar nao precisa trazer endereco de cliente pela rede.
+async function atualizarBadgeEnderecos() {
+  var el = document.getElementById('badge-enderecos');
+  if (!el) return;
+  try {
+    var r = await fetchComTimeout('/api/enderecos-contadores', { headers: headersEnd() }, 12000);
+    if (!r.ok) return;
+    var d = await r.json();
+    var n = (d && d.precisamAtencao) || 0;
+    el.textContent = n > 99 ? '99+' : String(n);
+    el.style.display = n > 0 ? 'inline' : 'none';
+    el.title = n === 1 ? '1 linha esperando alguem' : n + ' linhas esperando alguem';
+  } catch (e) {
+    // Silencioso de proposito: badge que nao carrega nao pode atrapalhar o
+    // resto da tela. A falha real aparece no banner dentro da aba.
+  }
+}
+
 function bannerUltimoLote(ul) {
   if (!ul) {
     return '<div class="alert alert-error" style="margin-bottom:12px">'
@@ -5088,6 +5110,15 @@ async function loadEnderecos() {
     _enderecosCache = data;
     renderEnderecosTopo(data);
     renderEnderecosLista(data);
+    // A listagem ja trouxe porStatus - atualiza o badge daqui em vez de gastar
+    // outra requisicao na rota de contadores.
+    var elBadge = document.getElementById('badge-enderecos');
+    if (elBadge) {
+      var ps = data.porStatus || {};
+      var n = (ps['erro'] || 0) + (ps['esgotado'] || 0) + (ps['precisa_humano'] || 0);
+      elBadge.textContent = n > 99 ? '99+' : String(n);
+      elBadge.style.display = n > 0 ? 'inline' : 'none';
+    }
   } catch (e) {
     lista.innerHTML = '<div class="alert alert-error">Erro de conexao: ' + escEnd((e && e.message) || e) + '</div>';
   }
@@ -5261,6 +5292,7 @@ async function criarTicketEnderecoManual(id, btn) {
     if (out) out.innerHTML = '<div class="alert alert-error">Erro de conexao: ' + escEnd((e && e.message) || e) + '</div>';
   }
   loadEnderecos();
+  atualizarBadgeEnderecos();
 }
 
 async function processarFilaEnderecos(btn) {
@@ -5282,6 +5314,7 @@ async function processarFilaEnderecos(btn) {
     if (out) out.innerHTML = '<div class="alert alert-error">Erro de conexao: ' + escEnd((e && e.message) || e) + '</div>';
   }
   loadEnderecos();
+  atualizarBadgeEnderecos();
 }
 
 async function reconciliarEnderecosUI(btn) {
@@ -5759,6 +5792,12 @@ atualizarBotoesMarca();
 // clicar num desses ramos (ver setStatusFilter) ou pesquisar dentro dela.
 var barInicial = document.querySelector('.status-filter-bar');
 if (barInicial) barInicial.outerHTML = renderStatusFilterBar(getStatusCounts(allTickets));
+// Badge de "Tickets a Disparar": UMA requisicao leve no boot, so a contagem.
+// Nao contraria a regra de nao buscar nada ao abrir a pagina - essa regra existe
+// pelo peso da fila de tickets (milhares de linhas com corpo de e-mail), e aqui
+// a rota devolve so numeros. Sem isso o badge nao teria como existir, porque o
+// agente precisa ver o numero SEM entrar na aba - que e o ponto dele.
+atualizarBadgeEnderecos();
 renderTorre();
 </script>
 </body>
