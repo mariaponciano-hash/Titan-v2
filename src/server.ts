@@ -5207,7 +5207,11 @@ export default {
       try {
         const b: any = await request.json().catch(() => ({}));
         const res = await enfileirarEndereco(env, { ...b, origem: b.origem || 'externo' });
-        if (!res.ok) {
+        // res.ok === false (nao "!res.ok"): peculiaridade real do TS 5.9 - a
+        // negacao nao estreita esse union discriminado (confirmado com um
+        // repro minimo), so a comparacao explicita. Sem efeito em runtime -
+        // e so o "tsc --noEmit" que reclamava.
+        if (res.ok === false) {
           return Response.json(
             { error: res.erro, code: res.code, ...(res.faltando ? { faltando: res.faltando } : {}) },
             { status: res.httpStatus }
