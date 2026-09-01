@@ -2856,6 +2856,25 @@ function renderTorreForm(d) {
     // fluxo - o e-mail real agora e o modelo fixo do TicketsCreator, sem
     // slot pra texto livre do agente.
     + '</div>'
+    // Previa ESTIMADA do e-mail (01/09/2026, a pedido da Ivna): a Torre nao
+    // manda mais e-mail nenhum - quem escreve e dispara pro transportadora e
+    // o TicketsCreator, e a doc dele nao tem modo "simular sem enviar". Isso
+    // aqui reconstroi o padrao usando o mesmo formato que os tickets reais
+    // do CX Hub (antecessor que ja chamava o TicketsCreator) mostravam no
+    // Gmail - ver torreGerarAssunto/torreGerarCorpoEmail, que ja existiam
+    // desde antes do TicketsCreator e ficaram sem uso quando o envio manual
+    // saiu do fluxo. NAO E garantido bater 100% com o texto real (a Torre
+    // nao ve o template do TicketsCreator) - so o endereco (quando for
+    // Alterar Endereço) e confirmado, porque a doc dele confirma que o
+    // fullAddress do correct_address vira o texto pro transportador
+    // VERBATIM.
+    + '<div class="tf-field full">'
+    +   '<button type="button" class="torre-btn-ghost" style="padding:7px 14px;border-radius:16px;font-size:12px" id="tf-btn-previa" onclick="torreTogglePreviaEmail()">Ver prévia estimada do e-mail</button>'
+    +   '<div id="tf-previa-email" style="display:none;margin-top:10px;background:var(--surface);border:1px solid var(--border-2);border-radius:var(--radius);padding:.9rem 1rem">'
+    +     '<div style="font-size:11px;color:var(--orange);font-weight:600;margin-bottom:8px">⚠ Estimativa baseada no padrão observado em tickets anteriores - o texto real é escrito pelo TicketsCreator e pode variar.</div>'
+    +     '<div id="tf-previa-conteudo"></div>'
+    +   '</div>'
+    + '</div>'
     + '<div class="tf-actions">'
     +   '<button class="torre-btn torre-btn-ghost" onclick="torreFecharForm()">Cancelar</button>'
     // Sem opcao de "so registrar" (removida 18/08/2026, a pedido da Ivna): o
@@ -3128,6 +3147,45 @@ function torreAtualizarUiTitan(d, tentativa) {
   return false;
 }
 function torreFecharForm() { torreState.formAberto = false; renderTorre(); }
+
+// Monta a previa ESTIMADA reaproveitando torreGerarAssunto/torreGerarCorpoEmail
+// (ver comentario grande no botao "Ver previa estimada", renderTorreForm) -
+// le os campos AO VIVO do formulario (nao so torrePreencherForm(d), que nao
+// tem o que o agente ja editou: problema, responsavel, romaneio corrigido,
+// endereco novo).
+function torreMontarPreviaEmail() {
+  var d = torreState.dados;
+  if (!d) return null;
+  var f = torrePreencherForm(d);
+  f.problema = (document.getElementById('tf-problema') || {}).value || f.problema;
+  f.responsavel = (document.getElementById('tf-responsavel') || {}).value || f.responsavel;
+  var romaneioCorrigido = (document.getElementById('tf-romaneio') || {}).value;
+  if (romaneioCorrigido) f.romaneio_transportadora = romaneioCorrigido;
+  if (f.problema === 'Alterar Endereço') f.endereco_novo = torreLerEnderecoNovo().fullAddress;
+  return { assunto: torreGerarAssunto(f), corpo: torreGerarCorpoEmail(f, '') };
+}
+
+function torreTogglePreviaEmail() {
+  var box = document.getElementById('tf-previa-email');
+  var btn = document.getElementById('tf-btn-previa');
+  if (!box || !btn) return;
+  var abrindo = box.style.display === 'none';
+  if (abrindo) {
+    var previa = torreMontarPreviaEmail();
+    var conteudo = document.getElementById('tf-previa-conteudo');
+    if (conteudo && previa) {
+      conteudo.innerHTML = '<div style="font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px">Assunto</div>'
+        + '<div style="font-size:13px;font-weight:600;margin-bottom:10px">' + tEsc(previa.assunto) + '</div>'
+        + '<div style="font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px">Corpo</div>'
+        + '<pre style="font-family:inherit;font-size:12.5px;white-space:pre-wrap;margin:0;color:var(--ink-2)">' + tEsc(previa.corpo) + '</pre>';
+    }
+    box.style.display = 'block';
+    btn.textContent = 'Ocultar prévia estimada';
+  } else {
+    box.style.display = 'none';
+    btn.textContent = 'Ver prévia estimada do e-mail';
+  }
+}
 
 // Mostra/esconde o campo "Endereço novo" so quando o problema selecionado e
 // "Alterar Endereço" - os outros 3 tipos de problema nao precisam dele. Feito
