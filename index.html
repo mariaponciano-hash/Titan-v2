@@ -2905,23 +2905,13 @@ function renderTorreForm(d) {
     // Alterar Endereço) e confirmado, porque a doc dele confirma que o
     // fullAddress do correct_address vira o texto pro transportador
     // VERBATIM.
-    // Painel fica no corpo do formulario (pra abrir logo acima dos botoes
-    // quando expandido), mas o BOTAO que abre ele mora em tf-actions, ao
-    // lado de "Abrir Ticket" (01/09/2026, a pedido da Ivna: o botao ficava
-    // "muito escondido" solto no meio do formulario). Tem seu PROPRIO botao
-    // "Abrir Ticket" aqui dentro tambem, pra quem esta olhando a previa nao
-    // precisar rolar a tela de volta pra confirmar - os dois chamam a mesma
-    // torreAbrirTicket().
-    + '<div id="tf-previa-email" style="display:none;margin-top:0 0 1rem;background:var(--surface);border:1px solid var(--border-2);border-radius:var(--radius);padding:.9rem 1rem">'
-    +   '<div style="font-size:11px;color:var(--orange);font-weight:600;margin-bottom:8px">⚠ Estimativa baseada no padrão observado em tickets anteriores - o texto real é escrito pelo TicketsCreator e pode variar.</div>'
-    +   '<div id="tf-previa-conteudo"></div>'
-    +   '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border-2);display:flex;justify-content:flex-end">'
-    +     '<button class="torre-btn" onclick="torreAbrirTicket()">Abrir Ticket</button>'
-    +   '</div>'
-    + '</div>'
+    // Virou pop-up (01/09/2026, a pedido da Ivna: o painel inline deixava
+    // "muita coisa na visão" quando expandido dentro do formulario) - ver
+    // torreMostrarModalPrevia. O botao continua em tf-actions, ao lado de
+    // "Abrir Ticket".
     + '<div class="tf-actions">'
     +   '<button class="torre-btn torre-btn-ghost" onclick="torreFecharForm()">Cancelar</button>'
-    +   '<button type="button" class="torre-btn torre-btn-ghost" id="tf-btn-previa" onclick="torreTogglePreviaEmail()">Ver prévia estimada do e-mail</button>'
+    +   '<button type="button" class="torre-btn torre-btn-ghost" onclick="torreMostrarModalPrevia()">Ver prévia estimada do e-mail</button>'
     // Sem opcao de "so registrar" (removida 18/08/2026, a pedido da Ivna): o
     // proposito de abrir um ticket de logistica e contatar a transportadora -
     // um registro que nao contata ninguem contradiz esse proposito. Desde
@@ -3215,26 +3205,26 @@ function torreMontarPreviaEmail() {
   return { assunto: torreGerarAssunto(f), corpo: torreGerarCorpoEmail(f, '') };
 }
 
-function torreTogglePreviaEmail() {
-  var box = document.getElementById('tf-previa-email');
-  var btn = document.getElementById('tf-btn-previa');
-  if (!box || !btn) return;
-  var abrindo = box.style.display === 'none';
-  if (abrindo) {
-    var previa = torreMontarPreviaEmail();
-    var conteudo = document.getElementById('tf-previa-conteudo');
-    if (conteudo && previa) {
-      conteudo.innerHTML = '<div style="font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px">Assunto</div>'
-        + '<div style="font-size:13px;font-weight:600;margin-bottom:10px">' + tEsc(previa.assunto) + '</div>'
-        + '<div style="font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px">Corpo</div>'
-        + '<pre style="font-family:inherit;font-size:12.5px;white-space:pre-wrap;margin:0;color:var(--ink-2)">' + tEsc(previa.corpo) + '</pre>';
-    }
-    box.style.display = 'block';
-    btn.textContent = 'Ocultar prévia estimada';
-  } else {
-    box.style.display = 'none';
-    btn.textContent = 'Ver prévia estimada do e-mail';
-  }
+// Pop-up da previa (01/09/2026, a pedido da Ivna: o painel inline dentro do
+// formulario deixava "muita coisa na visao" quando expandido) - mesmo
+// padrao de modal usado em "Responder"/torreMostrarModalResultado. O botao
+// "Abrir Ticket" aqui dentro fecha a previa antes de disparar a abertura de
+// verdade, pra nao ficarem dois modais empilhados quando o resultado abrir.
+function torreMostrarModalPrevia() {
+  var previa = torreMontarPreviaEmail();
+  if (!previa) return;
+  document.getElementById('modal-root').innerHTML =
+    '<div class="modal-overlay" onclick="if(event.target===this)closeModal()">' +
+    '<div class="modal" style="max-width:560px">' +
+    '<div class="modal-top"><div class="modal-title">Prévia estimada do e-mail</div><button class="modal-close" onclick="closeModal()">&#x2715;</button></div>' +
+    '<div class="modal-body">' +
+    '<div style="font-size:11px;color:var(--orange);font-weight:600;margin-bottom:12px">⚠ Estimativa baseada no padrão observado em tickets anteriores - o texto real é escrito pelo TicketsCreator e pode variar.</div>' +
+    '<div style="font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px">Assunto</div>' +
+    '<div style="font-size:13px;font-weight:600;margin-bottom:14px">' + tEsc(previa.assunto) + '</div>' +
+    '<div style="font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px">Corpo</div>' +
+    '<pre style="font-family:inherit;font-size:12.5px;white-space:pre-wrap;margin:0;color:var(--ink-2);max-height:40vh;overflow-y:auto">' + tEsc(previa.corpo) + '</pre>' +
+    '<div class="modal-actions"><button class="btn-cancel" onclick="closeModal()">Fechar</button><button class="btn-send" onclick="closeModal();torreAbrirTicket()">Abrir Ticket</button></div>' +
+    '</div></div></div>';
 }
 
 // Mostra/esconde o campo "Endereço novo" so quando o problema selecionado e
