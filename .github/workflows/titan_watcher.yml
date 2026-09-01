@@ -1,0 +1,84 @@
+name: Titan watcher
+
+# Roda uma passada pela fila 'pendente' de infos_titan com Playwright de
+# verdade (28/08/2026) - substitui o titan_cf_worker (Cloudflare Worker), que
+# nao consegue renderizar esse dashboard Power BI dentro do Browser Rendering
+# (POST .../powerbi/refresh/subscribe sempre abortado pelo navegador - ver
+# descritivo do chamado enviado pra Ivna nessa mesma data). Tambem substitui,
+# em regime normal, o titan_watcher.py rodando no PC via
+# rodar_titan_watcher.ps1 (continua disponivel pra uso local se precisar).
+#
+# CADENCIA CONSERVADORA DE PROPOSITO (repo privado, plano Free do GitHub =
+# 2.000 min/mes): 30 em 30 min, orcamento padrao curto (240s, ver
+# ORCAMENTO_UMA_VEZ_SEGUNDOS_PADRAO em titan_watcher.py). Uma rodada com a
+# fila vazia (esperado a maior parte do tempo em regime normal) termina em
+# segundos, sem abrir o Titan (ver checagem antes do login em main()) - o
+# custo real por mes depende de quantos pedidos novos chegam por dia, que
+# ainda nao medimos de verdade. Confira o consumo real em Settings > Billing
+# > Actions depois de alguns dias e ajuste o cron abaixo se precisar.
+#
+# BACKLOG GRANDE (ex: apos uma interrupcao longa): NAO deixe isso agendado -
+# dispare manualmente pela aba Actions ("Run workflow") e informe um
+# orcamento_segundos bem maior (ex: 1200 = 20min), repetindo manualmente
+# algumas vezes ate a fila 'pendente' baixar pra um nivel normal.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      orcamento_segundos:
+        description: 'Orcamento de tempo por rodada, em segundos (vazio = padrao curto de 240s - so aumente pra rodadas manuais de catch-up de backlog)'
+        required: false
+        type: string
+
+jobs:
+  watcher:
+    runs-on: ubuntu-latest
+    # Generoso de proposito (rodadas curtas/vazias nao chegam perto disso) -
+    # so importa de verdade numa rodada manual de catch-up com orcamento_segundos grande.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache do Chromium do Playwright
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Instalar dependencias
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Rodar
+        env:
+          TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
+          TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
+        run: |
+          if [ -n "${{ github.event.inputs.orcamento_segundos }}" ]; then
+            python titan_watcher.py --uma-vez --headless --orcamento-segundos "${{ github.event.inputs.orcamento_segundos }}"
+          else
+            python titan_watcher.py --uma-vez --headless
+          fi
+
+      # O runner some ao fim do job - sem isso, o print/HTML que
+      # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel.
+      # "always()" em vez de "failure()" (28/08/2026, achado real): cada item
+      # tem seu proprio try/except (rodar_fila_uma_vez) - o job inteiro "tem
+      # sucesso" mesmo com 100% dos itens falhando, entao "if: failure()"
+      # nunca disparava e os prints/HTML ficavam perdidos quando o runner
+      # terminava. if-no-files-found:ignore evita o passo falhar sozinho na
+      # rodada normal (sem nenhum diagnostico salvo).
+      - name: Subir diagnostico (se tiver)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: titan_debug
+          path: titan_debug/
+          retention-days: 7
+          if-no-files-found: ignore

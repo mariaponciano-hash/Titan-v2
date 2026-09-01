@@ -14,12 +14,26 @@ account_id = "76a6687a71df8132dfbf4b4c761714ba"
 [browser]
 binding = "MYBROWSER"
 
-# Acorda sozinho a cada 5 minutos e processa o que estiver 'pendente' em
-# infos_titan (mesma tabela que a Torre/Unilog CD ja usam) - substitui o loop
-# "while True: sleep(15)" do titan_watcher.py por um agendamento de verdade.
-# Ajuste a frequencia aqui se quiser mais/menos frequente (sintaxe cron padrao).
+# PAUSADO (28/08/2026, decisao da Ivna): o Browser Rendering do Cloudflare
+# aborta a conexao de streaming que o Power BI usa pra renderizar esse
+# dashboard (POST .../powerbi/refresh/subscribe -> net::ERR_ABORTED) - o
+# worker nunca consegue concluir um pedido, so fica devolvendo 'concluido'/
+# 'erro' presos pra 'pendente' sem processar, inflando a fila a toa. O
+# processamento de 'pendente'/recheck agora e feito por titan_watcher.py +
+# titan_backfill.py via GitHub Actions (Playwright de verdade, sem esse
+# bloqueio - ver .github/workflows/). Codigo/infra ficam intactos - pra
+# reativar, e so descomentar as duas linhas abaixo e rodar `wrangler deploy`
+# de novo.
 [triggers]
-crons = ["*/5 * * * *"]
+crons = []
+# crons = ["*/5 * * * *"]
+
+# Workers Logs (27/08/2026) - sem isso explicito aqui, cada `wrangler deploy`
+# reseta a opcao "Workers Logs" do painel pro padrao (desligado), mesmo que a
+# Ivna tenha ligado manualmente antes - foi o que estava acontecendo durante
+# a depuracao de hoje. Deixando fixo no config, sobrevive a redeploys.
+[observability]
+enabled = true
 
 # Segredos (NAO colar aqui - configure via `wrangler secret put <NOME>` ou
 # pelo painel Cloudflare, Workers & Pages > titan-watcher-worker > Settings >

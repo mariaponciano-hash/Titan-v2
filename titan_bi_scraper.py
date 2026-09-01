@@ -50,8 +50,10 @@ da Torre ja achar tudo pronto em vez de esperar uma consulta avulsa. Chave =
 Nota Fiscal (nao o "Numero do Pedido" do Titan, que e interno do armazem).
 """
 import argparse
+import datetime
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -164,9 +166,21 @@ def login(page, email, senha):
         raise
 
     try:
-        page.get_by_role("button", name="Entrar", exact=True).click()
+        # NAO depende mais do texto/idioma do botao (bug real, 27/08/2026,
+        # achado via titan_debug artifact no GitHub Actions: o Titan trocou
+        # o rotulo de "Entrar" pra "Login" em algum momento, quebrando o
+        # seletor por texto exato). button[type='submit'] e estavel mesmo se
+        # o idioma mudar nao importa mais o texto, e nao colide com o botao
+        # separado "Login with Microsoft" (esse e type='button', nao
+        # 'submit').
+        page.locator("button[type='submit']").first.click()
     except PWTimeout:
-        page.get_by_text("Entrar", exact=True).first.click()
+        # Unico ponto do login que nao salvava diagnostico nenhum na falha
+        # (achado 27/08/2026 rodando no GitHub Actions - sem isso, nao dava
+        # pra saber se o botao simplesmente nao apareceu, se um CAPTCHA/
+        # bloqueio por IP de datacenter surgiu, ou outra coisa).
+        salvar_diagnostico(page, "login_botao_entrar_nao_encontrado")
+        raise
 
     # Depois do clique, o botao mostra "Autenticando no TitanBI..." com um
     # spinner por um tempo - networkidle sozinho dispara ANTES desse processo
@@ -179,7 +193,10 @@ def login(page, email, senha):
         pass  # nao apareceu esse texto especifico - segue pro proximo cheque
     page.wait_for_load_state("networkidle", timeout=20000)
 
-    if page.get_by_role("button", name="Entrar", exact=True).is_visible():
+    # Mesmo motivo do clique acima: nao depende mais do rotulo do botao
+    # (ja quebrou uma vez, 27/08/2026) - o campo de senha continuar visivel
+    # e um sinal de "ainda no login" independente de idioma/rotulo.
+    if page.locator("input[type='password']").first.is_visible():
         salvar_diagnostico(page, "login_nao_saiu_da_tela")
         raise RuntimeError(
             "Ainda na tela de login depois de tentar entrar - confira "
@@ -199,43 +216,86 @@ def login(page, email, senha):
         pass  # pode ja ter caido direto numa URL diferente de /home - segue
 
 
+def _ir_pro_dashboard(page):
+    """page.goto com retry - a navegacao pos-login pode ainda estar em
+    andamento (confirmado com erro real: "interrupted by another navigation
+    to .../home")."""
+    for tentativa in range(3):
+        try:
+            page.goto(DASHBOARD_URL)
+            return
+        except Exception as e:
+            if "interrupted by another navigation" in str(e) and tentativa < 2:
+                time.sleep(1.5)  # deixa a navegacao concorrente (ex: redirect pos-login) terminar
+                continue
+            raise
+
+
 def get_dashboard_frame(page):
     """
     O conteudo real (tabela, filtros) fica dentro de um <iframe> - a pagina
     "de fora" so tem a barra lateral e o seletor de abas (Consulta/Exportacao).
     Se o Titan tiver mais de um iframe na pagina, ajuste o seletor abaixo (ex:
     'iframe[src*="embed"]') depois de checar com o DevTools (F12 -> Elements).
+
+    CORRIGIDO (31/08/2026, HTML+print reais salvos em titan_debug/
+    dashboard_iframe_nao_encontrado): o print mostrava a mensagem de erro do
+    proprio Titan "Request timed out: GET https://api.titanbi.com.br/api/
+    dashboard/.../token" - o backend dele falhou ao gerar o token de embed do
+    Power BI, e nesse caso o <iframe> nunca chega a existir no DOM (confirmado:
+    zero ocorrencias no HTML salvo). Esperar mais nao ajuda, ja que o elemento
+    simplesmente nao vai aparecer. E uma falha transitoria do lado do Titan,
+    nao do nosso seletor/timing - um reload completo (page.goto de novo)
+    resolve na pratica. Tenta ate 3 vezes antes de desistir.
     """
+    ultimo_erro = None
     for tentativa in range(3):
+        _ir_pro_dashboard(page)
         try:
-            page.goto(DASHBOARD_URL)
-            break
-        except Exception as e:
-            if "interrupted by another navigation" in str(e) and tentativa < 2:
-                time.sleep(1.5)  # deixa a navegacao concorrente (ex: redirect pos-login) terminar
-                continue
-            raise
-    try:
-        frame_el = page.wait_for_selector("iframe", timeout=30000)
-        frame = frame_el.content_frame()
-        elemento_visivel(frame.get_by_text("Informação Pedido", exact=False), timeout_ms=30000)
-    except PWTimeout:
-        salvar_diagnostico(page, "dashboard_iframe_nao_encontrado")
-        raise
-    return frame
+            frame_el = page.wait_for_selector("iframe", timeout=30000)
+            frame = frame_el.content_frame()
+            elemento_visivel(frame.get_by_text("Informação Pedido", exact=False), timeout_ms=30000)
+            return frame
+        except PWTimeout as e:
+            ultimo_erro = e
+            time.sleep(3)
+    salvar_diagnostico(page, "dashboard_iframe_nao_encontrado")
+    raise ultimo_erro
+
+
+# Mapa do rotulo visivel (h3 do slicer) pro aria-label TECNICO real do
+# combobox (nome do campo Power BI por baixo) - confirmado no HTML real
+# salvo em titan_debug/filtro_nao_encontrado.html (31/08/2026): o elemento
+# que abre o popup e <div role="combobox" data-testid="slicer-dropdown"
+# aria-label="nota_fiscal_saida_numero">, um irmao do <h3> do rotulo, nao um
+# filho - por isso clicar por coordenada relativa ao rotulo era fragil.
+ARIA_LABEL_POR_ROTULO = {
+    "Nota Fiscal de Saída": "nota_fiscal_saida_numero",
+    "Número do pedido": "numero",
+}
 
 
 def abrir_dropdown_filtro(frame, rotulo):
     """
-    Clicar direto no TEXTO do rotulo (ex: "Nota Fiscal de Saída") nao abre o
-    slicer - confirmado com print real: o clique nao fez nada, a tabela
-    continuou no estado padrao. O rotulo e so um titulo; o controle que
-    realmente abre o dropdown e a caixa "Todos" logo ABAIXO dele (mesmo
-    padrao que usei manualmente explorando o Titan pelo navegador). Como nao
-    consigo inspecionar o DOM real deste slicer, clico numa posicao relativa
-    ao rotulo (um pouco abaixo da sua caixa delimitadora) em vez de tentar
-    achar o elemento certo por seletor.
+    Abre o combobox do slicer. Preferencia: seletor real por aria-label
+    tecnico (ARIA_LABEL_POR_ROTULO) - so existe pros rotulos ja confirmados
+    no HTML. Fallback (rotulo desconhecido): clicar numa posicao relativa ao
+    rotulo, ~15-20px abaixo da sua caixa delimitadora (abordagem antiga,
+    usada quando ainda nao tinhamos o HTML real do slicer pra inspecionar -
+    confirmado, com print, que clicar direto no TEXTO do rotulo nao abre
+    nada; e essa mesma coordenada, por ser sensivel a diferencas finas de
+    fonte/DPI entre o PC da Ivna e o runner do GitHub Actions, foi a causa
+    real de falhas la mesmo com a pagina 100% carregada).
     """
+    aria_label = ARIA_LABEL_POR_ROTULO.get(rotulo)
+    if aria_label:
+        combobox = frame.locator(
+            f'div[role="combobox"][data-testid="slicer-dropdown"][aria-label="{aria_label}"]'
+        )
+        if combobox.count() > 0:
+            combobox.first.click(timeout=10000)
+            return
+
     titulo = elemento_visivel(frame.get_by_text(rotulo, exact=False))
     caixa = titulo.bounding_box()
     if not caixa:
@@ -285,23 +345,141 @@ def _abrir_dropdown_e_pegar_campo_busca(frame, rotulo, tentativas=3):
     """
     CORRIGIDO (24/08/2026, erro real reportado pela Ivna): abrir_dropdown_filtro
     as vezes clica certo (a setinha do rotulo vira pra cima, print confirmou)
-    mas o popup abre VAZIO por um instante - nem o campo "Pesquisar" aparece
+    mas o popup abre VAZIO por um instante - nem o campo de busca aparece
     a tempo, sem nenhum erro visivel na tela (so um retangulo em branco).
     Parece lentidao pontual do proprio Titan, nao um clique errado. Em vez de
     desistir na primeira, fecha (Escape) e tenta abrir de novo ate
     'tentativas' vezes antes de propagar o erro de verdade.
+
+    CORRIGIDO (31/08/2026, HTML real salvo em titan_debug/filtro_nao_encontrado.html):
+    o placeholder desse campo nao e fixo em portugues - e uma string de UI do
+    proprio Power BI, que segue o locale do navegador. No PC da Ivna renderiza
+    "Pesquisar"; no runner do GitHub Actions (locale em ingles) renderiza
+    "Search". Aceita os dois.
     """
     ultimo_erro = None
     for tentativa in range(tentativas):
         abrir_dropdown_filtro(frame, rotulo)
         time.sleep(0.8 + tentativa * 0.5)  # da mais folga a cada nova tentativa
         try:
-            return elemento_visivel(frame.get_by_placeholder("Pesquisar"), timeout_ms=10000)
+            return elemento_visivel(frame.get_by_placeholder(re.compile("Pesquisar|Search")), timeout_ms=10000)
         except PWTimeout as e:
             ultimo_erro = e
             frame.page.keyboard.press("Escape")
             time.sleep(0.5)
     raise ultimo_erro
+
+
+def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=15000):
+    """
+    Espera o painel "Informacao Pedido" realmente mostrar o valor filtrado,
+    em vez de confiar num sleep fixo. CORRIGIDO (31/08/2026, HTML real salvo
+    em titan_debug/tabela_linha_nao_encontrada.html): o slicer confirmava a
+    selecao certinha (slicer-restatement e o checkbox do item mostravam
+    "1285822" marcado, aria-selected="true"), mas a TABELA ainda mostrava os
+    dados antigos/default por mais tempo - um lag assincrono entre o slicer
+    comitar a selecao e o visual re-renderizar, mais lento no runner do
+    GitHub Actions do que no PC (mesma classe de lentidao ja vista no slicer
+    de periodo e no token do dashboard). Sem essa espera,
+    _achar_linha_pedido rodava cedo demais contra uma tabela desatualizada.
+    Se o valor nunca aparecer (NF que genuinamente nao existe pra essa
+    marca), so retorna sem erro - _achar_linha_pedido/extrair_linha_por_pedido
+    decidem "nao encontrado" do jeito de sempre.
+    """
+    painel = localizar_painel(frame, "Informação Pedido")
+    limite = time.time() + timeout_ms / 1000
+    while time.time() < limite:
+        try:
+            if str(valor) in painel.inner_text():
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
+def fechar_popup_calendario(frame, tentativas=5):
+    """
+    CONFIRMADO COM ERRO REAL (24/08/2026): um Escape sozinho as vezes NAO
+    fecha o popup do calendario - ele e um overlay do Angular Material (CDK),
+    e sobra um <div class="cdk-overlay-backdrop..."> TRANSPARENTE cobrindo a
+    tela inteira, que intercepta qualquer clique/hover seguinte (erro real:
+    "cdk-overlay-backdrop... subtree intercepts pointer events", travando
+    coletar_todos_registros no primeiro hover). CDK overlays fecham ao
+    clicar no proprio backdrop - entao clica nele (nao so aperta Escape) e
+    confirma que sumiu antes de seguir.
+    """
+    for _ in range(tentativas):
+        backdrop = frame.locator(".cdk-overlay-backdrop")
+        if backdrop.count() == 0:
+            return
+        try:
+            backdrop.first.click(timeout=1000, force=True)
+        except Exception:
+            frame.page.keyboard.press("Escape")
+        time.sleep(0.3)
+    if frame.locator(".cdk-overlay-backdrop").count() > 0:
+        raise PWTimeout("cdk-overlay-backdrop nao fechou depois de varias tentativas")
+
+
+# Janela usada por buscas avulsas (titan_watcher.processar_pedido) pra
+# garantir que o filtro "Data Inicial - Data Final" nao exclua o pedido
+# procurado - ver definir_periodo abaixo pro porque isso e necessario.
+PERIODO_AMPLO_INICIAL = "01/01/2020"
+
+
+def definir_periodo(frame, data_inicial, data_final):
+    """
+    CONFIRMADO COM TESTE REAL (24/08/2026, periodo 01/06-23/08/2026): o
+    clique-e-digita abaixo ACERTA os dois campos internos do slicer ("Data de
+    inicio"/"Data de termino", confirmados via aria-label) - o bug real do
+    "0 encontrados" nao era o valor setado, era ler a tabela cedo demais.
+    Sem fechar o popup (Escape) e sem esperar a query terminar, a tabela fica
+    vazia por varios segundos depois de mudar o periodo. Corrigido esperando
+    de verdade a 1a linha aparecer em vez de um sleep fixo.
+
+    MOVIDO de titan_backfill.py pra ca (01/09/2026, achado real - print
+    salvo em titan_debug/filtro_nao_encontrado.png): o Titan carrega o
+    dashboard com um filtro de periodo padrao ja aplicado (nao "todas as
+    datas"; visto "6/1/2026" numa captura e "7/1/2026" no dia seguinte -
+    parece ser relativo a data de hoje, nao fixo), entao uma busca avulsa
+    por NF (titan_watcher.processar_pedido, que nunca chamava esta funcao)
+    podia legitimamente dar "No results found" no proprio Power BI se a NF
+    procurada nao caisse dentro dessa janela padrao estreita - nao era bug
+    de seletor nenhum. Generalizada aqui pra processar_pedido tambem poder
+    abrir bem mais o periodo (ver PERIODO_AMPLO_INICIAL) antes de buscar por
+    NF, do mesmo jeito que o backfill ja fazia pra sua janela especifica.
+    """
+    try:
+        # timeout_ms=60000 (era o padrao de 30000) - achado real rodando via
+        # GitHub Actions (28/08/2026): o rotulo existe de verdade (confirmado
+        # print real da Ivna no navegador dela) mas nao apareceu NENHUMA VEZ
+        # no HTML capturado apos os 30s padrao - o runner (CPU compartilhada)
+        # parece ser bem mais lento que um PC normal pra este slicer
+        # especifico do Power BI terminar de renderizar.
+        rotulo = elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
+        caixa = rotulo.bounding_box()
+        if not caixa:
+            raise PWTimeout("rotulo 'Data Inicial - Data Final' visivel mas sem bounding_box (layout inesperado)")
+        x = caixa["x"] + caixa["width"] / 2
+        y = caixa["y"] + caixa["height"] + 15
+        frame.page.mouse.click(x, y)
+        time.sleep(0.5)
+        frame.page.keyboard.press("Control+A")
+        frame.page.keyboard.type(data_inicial, delay=60)
+        frame.page.keyboard.press("Tab")
+        time.sleep(0.3)
+        frame.page.keyboard.press("Control+A")
+        frame.page.keyboard.type(data_final, delay=60)
+        frame.page.keyboard.press("Enter")
+        time.sleep(0.5)
+        fechar_popup_calendario(frame)
+
+        painel = localizar_painel(frame, "Informação Pedido")
+        painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
+        time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
+    except PWTimeout:
+        salvar_diagnostico(frame, "set_filtro_data_nao_encontrado")
+        raise
 
 
 def filtrar(frame, nf=None, numero_pedido=None):
@@ -317,6 +495,7 @@ def filtrar(frame, nf=None, numero_pedido=None):
             marcar_item_da_lista(frame, campo, nf)
             time.sleep(1)  # deixa o filtro assincrono aplicar na tabela
             frame.page.keyboard.press("Escape")
+            _esperar_tabela_refletir_filtro(frame, nf)
         if numero_pedido:
             campo = _abrir_dropdown_e_pegar_campo_busca(frame, "Número do pedido")
             digitar_busca(campo, numero_pedido)
@@ -324,6 +503,7 @@ def filtrar(frame, nf=None, numero_pedido=None):
             marcar_item_da_lista(frame, campo, numero_pedido)
             time.sleep(1)
             frame.page.keyboard.press("Escape")
+            _esperar_tabela_refletir_filtro(frame, numero_pedido)
     except PWTimeout:
         salvar_diagnostico(frame, "filtro_nao_encontrado")
         raise
@@ -388,14 +568,27 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
     try:
         painel = localizar_painel(frame, titulo_painel)
         painel.hover()
-        botao_opcoes = elemento_visivel(painel.get_by_role("button", name="Mais opções"), timeout_ms=10000)
+        # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
+        # aria-label do botao "..." de "Mais opcoes" pra "More options",
+        # quebrando o get_by_role por nome. Confirmado via titan_debug
+        # artifact: o botao real tem data-testid="visual-more-options-btn"
+        # (classe vcMenuBtn), estavel independente do idioma do aria-label.
+        botao_opcoes = elemento_visivel(
+            painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
+        )
         botao_opcoes.click()
 
-        item_exportar = elemento_visivel(frame.get_by_text("Exportar dados", exact=True), timeout_ms=10000)
+        # Mesmo idioma trocou aqui tambem (confirmado via titan_debug: o menu
+        # do "..." agora mostra "Export data" em vez de "Exportar dados").
+        # Aceita os dois pra nao quebrar de novo se o Power BI voltar pro
+        # PT-BR em algum momento.
+        item_exportar = elemento_visivel(
+            frame.get_by_text(re.compile(r"^(Exportar dados|Export data)$")), timeout_ms=10000
+        )
         item_exportar.click()
 
         botao_exportar_dialogo = elemento_visivel(
-            frame.get_by_role("button", name="Exportar", exact=True), timeout_ms=15000
+            frame.get_by_role("button", name=re.compile(r"^(Exportar|Export)$")), timeout_ms=15000
         )
         with frame.page.expect_download(timeout=180000) as download_info:
             botao_exportar_dialogo.click()
@@ -506,14 +699,35 @@ def extrair_registros_do_painel(painel, marcadores_cabecalho):
     return registros
 
 
+def _normalizar_espacos(valor):
+    """
+    Colapsa qualquer sequencia de espaco (inclusive \\xa0, non-breaking space
+    - confirmado no HTML real, 31/08/2026: a celula "Nome Projeto" da NF
+    1283798 veio como 'BY\\xa0SAMIA', nao 'BY SAMIA') pra um unico espaco
+    normal. .strip() sozinho nao resolve - o \\xa0 fica NO MEIO do texto, nao
+    so nas pontas. str.split() sem argumento ja trata \\xa0 como espaco.
+    """
+    return " ".join(str(valor or "").split())
+
+
 def _bate_marca(registro, marca_esperada):
     """Compara "Nome Projeto" (ex: "RITUARIA") com o id de marca da Torre
-    (ex: "rituaria") - sem diferenciar caixa. Sem marca_esperada, aceita
-    qualquer linha (comportamento antigo)."""
+    (ex: "rituaria") - sem diferenciar caixa nem tipo de espaco. Sem
+    marca_esperada, aceita qualquer linha (comportamento antigo).
+
+    APICE (confirmado pela Ivna, 31/08/2026): e a UNICA marca cujo "Nome
+    Projeto" vem vazio no Titan (todas as outras marcas sempre preenchem
+    esse campo). Por isso celula vazia e tratada como sinal confiavel de
+    "essa linha e da apice", nao como "nao bate com marca nenhuma" - sem
+    isso, toda NF de apice era descartada como "nao encontrada" mesmo
+    existindo certinha na tabela (lote real de NFs em 31/08/2026)."""
     if not marca_esperada:
         return True
-    projeto = str(registro.get("Nome Projeto") or "").strip().upper()
-    return projeto == str(marca_esperada).strip().upper()
+    projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper()
+    esperado = _normalizar_espacos(marca_esperada).upper()
+    if not projeto:
+        return esperado == "APICE"
+    return projeto == esperado
 
 
 def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):

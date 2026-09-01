@@ -64,12 +64,14 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 import titan_bi_scraper as scraper
+import titan_watcher  # reusa processar_pedido/marcar_erro do recheck por-NF (28/08/2026, ver rechecar_situacoes_presas)
 
 SUPABASE_URL = "https://ozwcyrkzsqzmavjtsmsp.supabase.co"
 SUPABASE_KEY = "sb_publishable_CPF6bT_HC0jkTvYWnxHmDg_61qaWqSQ"
@@ -77,9 +79,126 @@ TABELA = "infos_titan"
 TAMANHO_LOTE = 200  # registros por chamada ao Supabase - evita 1 request por pedido
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabalho - o arquivo e apagado apos o upload
 
+# RECHECK DE SITUACAO PRESA (28/08/2026, achado real pela Ivna): a janela do
+# backfill acima e sempre "ultimos 10 dias corridos" - um pedido importado ha
+# mais de 10 dias que AINDA nao chegou em situacao final (EMBARCADO/
+# CANCELADO) cai fora dessa janela e nunca mais seria revisitado. Simetrico
+# ao recheck que ja existe no titan_cf_worker (Cloudflare) pro mesmo
+# problema, so que aqui roda com Playwright de verdade (sem o bloqueio de
+# renderizacao que o Browser Rendering do Cloudflare tem pra esse dashboard
+# Power BI - ver conversa de 28/08/2026).
+STATUS_FINAIS = ["EMBARCADO", "CANCELADO"]
+RECHECK_INTERVALO_HORAS = 2
+RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - deixa margem dentro do timeout do job (ver titan_backfill.yml)
+
+# Achado real (01/09/2026, reportado pela Ivna - pedido SH1197313KS/NF
+# 1197313/marca kokeshi sem tabela Eventos na Unilog CD apesar de ja estar
+# EMBARCADO): pedido descoberto so pelo backfill (que de proposito nao
+# coleta Eventos/Itens - ver LIMITACAO no topo do arquivo) fica com
+# eventos=NULL pra sempre se a situacao ja for final - buscar_situacao_presa
+# acima ignora de proposito EMBARCADO/CANCELADO (a situacao em si esta
+# certa, so falta Eventos/Itens). O unico outro caminho (server.ts
+# reenfileirar quando 'concluido' sem eventos, ver commit dad290a) so
+# dispara se alguem repetir a solicitacao daquela NF pela Torre - nao roda
+# sozinho. Confirmado >=1000 pedidos reais nesse estado via query direta no
+# Supabase (bateu o teto de 1000 da API, o numero real pode ser maior).
+EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - mesmo padrao do recheck de situacao presa acima
+
 
 def _agora_iso():
     return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
+def buscar_situacao_presa(limite=500):
+    """
+    Simetrico ao recheck que ja existe no titan_cf_worker (Cloudflare) pro
+    mesmo problema: pedidos status='concluido' com situacao ainda nao-final
+    (ou nula), sem atualizacao ha mais de RECHECK_INTERVALO_HORAS. "or" cobre
+    situacao NULL tambem - "not.in" sozinho nunca bate NULL (semantica de
+    NULL do Postgres).
+    """
+    lista_finais = ",".join(STATUS_FINAIS)
+    cutoff = (
+        datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        - datetime.timedelta(hours=RECHECK_INTERVALO_HORAS)
+    ).isoformat() + "Z"
+    path = (
+        f"{TABELA}?status=eq.concluido"
+        f"&atualizado_em=lt.{urllib.parse.quote(cutoff)}"
+        f"&or=(situacao.is.null,situacao.not.in.({lista_finais}))"
+        f"&select=numero_nf,marca&limit={limite}"
+    )
+    return titan_watcher._supabase_request("GET", path) or []
+
+
+def rechecar_situacoes_presas(page):
+    """
+    Reconfere um por um (mesma logica ja validada em titan_watcher.
+    processar_pedido - login com Playwright de verdade, sem o bloqueio de
+    renderizacao do Browser Rendering do Cloudflare pra esse dashboard Power
+    BI) os pedidos que ficaram presos numa situacao intermediaria fora da
+    janela fixa de 10 dias do backfill acima. Orcamento de tempo (nao so
+    contagem de itens) pra nao estourar o timeout do job independente de
+    quantos pedidos estiverem presos.
+    """
+    presos = buscar_situacao_presa()
+    if not presos:
+        print("Nenhum pedido preso em situacao intermediaria fora da janela do backfill.")
+        return
+    print(f"{len(presos)} pedido(s) presos em situacao intermediaria - reconferindo (orcamento {RECHECK_ORCAMENTO_SEGUNDOS}s)...")
+    inicio = time.monotonic()
+    processados = 0
+    for item in presos:
+        if time.monotonic() - inicio > RECHECK_ORCAMENTO_SEGUNDOS:
+            print(f"  orcamento de tempo esgotado - {processados}/{len(presos)} reconferido(s), resto fica pra proxima rodada.")
+            break
+        try:
+            titan_watcher.processar_pedido(page, item)
+        except Exception as e:
+            print(f"  [NF {item.get('numero_nf')} / marca {item.get('marca')}] erro no recheck: {e}", file=sys.stderr)
+            if item.get("numero_nf") and item.get("marca"):
+                titan_watcher.marcar_erro(item.get("numero_nf"), item.get("marca"), str(e))
+        processados += 1
+    print(f"Recheck de situacao concluido: {processados} pedido(s) processado(s).")
+
+
+def buscar_concluidos_sem_eventos(limite=500):
+    """Pedidos status='concluido' mas eventos ainda NULL (ver
+    EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS acima pro porque)."""
+    path = (
+        f"{TABELA}?status=eq.concluido&eventos=is.null"
+        f"&select=numero_nf,marca&limit={limite}"
+    )
+    return titan_watcher._supabase_request("GET", path) or []
+
+
+def rechecar_concluidos_sem_eventos(page):
+    """
+    Reconfere um por um (mesma logica do rechecar_situacoes_presas acima -
+    processar_pedido sempre clica na linha e extrai Eventos/Itens) os
+    pedidos que o backfill deixou concluidos mas sem essa informacao.
+    Orcamento de tempo proprio, separado do recheck de situacao presa.
+    """
+    pendentes = buscar_concluidos_sem_eventos()
+    if not pendentes:
+        print("Nenhum pedido concluido sem Eventos/Itens.")
+        return
+    print(f"{len(pendentes)} pedido(s) concluidos sem Eventos/Itens - completando "
+          f"(orcamento {EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS}s)...")
+    inicio = time.monotonic()
+    processados = 0
+    for item in pendentes:
+        if time.monotonic() - inicio > EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS:
+            print(f"  orcamento de tempo esgotado - {processados}/{len(pendentes)} completado(s), resto fica pra proxima rodada.")
+            break
+        try:
+            titan_watcher.processar_pedido(page, item)
+        except Exception as e:
+            print(f"  [NF {item.get('numero_nf')} / marca {item.get('marca')}] erro completando eventos/itens: {e}", file=sys.stderr)
+            if item.get("numero_nf") and item.get("marca"):
+                titan_watcher.marcar_erro(item.get("numero_nf"), item.get("marca"), str(e))
+        processados += 1
+    print(f"Recheck de eventos/itens concluido: {processados} pedido(s) processado(s).")
 
 
 def _supabase_upsert_lote(registros):
@@ -104,67 +223,6 @@ def _supabase_upsert_lote(registros):
     req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
     with urllib.request.urlopen(req, timeout=30) as resp:
         resp.read()
-
-
-def fechar_popup_calendario(frame, tentativas=5):
-    """
-    CONFIRMADO COM ERRO REAL (24/08/2026): um Escape sozinho as vezes NAO
-    fecha o popup do calendario - ele e um overlay do Angular Material (CDK),
-    e sobra um <div class="cdk-overlay-backdrop..."> TRANSPARENTE cobrindo a
-    tela inteira, que intercepta qualquer clique/hover seguinte (erro real:
-    "cdk-overlay-backdrop... subtree intercepts pointer events", travando
-    coletar_todos_registros no primeiro hover). CDK overlays fecham ao
-    clicar no proprio backdrop - entao clica nele (nao so aperta Escape) e
-    confirma que sumiu antes de seguir.
-    """
-    for _ in range(tentativas):
-        backdrop = frame.locator(".cdk-overlay-backdrop")
-        if backdrop.count() == 0:
-            return
-        try:
-            backdrop.first.click(timeout=1000, force=True)
-        except Exception:
-            frame.page.keyboard.press("Escape")
-        time.sleep(0.3)
-    if frame.locator(".cdk-overlay-backdrop").count() > 0:
-        raise PWTimeout("cdk-overlay-backdrop nao fechou depois de varias tentativas")
-
-
-def definir_periodo(frame, data_inicial, data_final):
-    """
-    CONFIRMADO COM TESTE REAL (24/08/2026, periodo 01/06-23/08/2026): o
-    clique-e-digita abaixo ACERTA os dois campos internos do slicer ("Data de
-    inicio"/"Data de termino", confirmados via aria-label) - o bug real do
-    "0 encontrados" nao era o valor setado, era ler a tabela cedo demais.
-    Sem fechar o popup (Escape) e sem esperar a query terminar, a tabela fica
-    vazia por varios segundos depois de mudar o periodo. Corrigido esperando
-    de verdade a 1a linha aparecer em vez de um sleep fixo.
-    """
-    try:
-        rotulo = scraper.elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False))
-        caixa = rotulo.bounding_box()
-        if not caixa:
-            raise PWTimeout("rotulo 'Data Inicial - Data Final' visivel mas sem bounding_box (layout inesperado)")
-        x = caixa["x"] + caixa["width"] / 2
-        y = caixa["y"] + caixa["height"] + 15
-        frame.page.mouse.click(x, y)
-        time.sleep(0.5)
-        frame.page.keyboard.press("Control+A")
-        frame.page.keyboard.type(data_inicial, delay=60)
-        frame.page.keyboard.press("Tab")
-        time.sleep(0.3)
-        frame.page.keyboard.press("Control+A")
-        frame.page.keyboard.type(data_final, delay=60)
-        frame.page.keyboard.press("Enter")
-        time.sleep(0.5)
-        fechar_popup_calendario(frame)
-
-        painel = scraper.localizar_painel(frame, "Informação Pedido")
-        painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
-        time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
-    except PWTimeout:
-        scraper.salvar_diagnostico(frame, "set_filtro_data_nao_encontrado")
-        raise
 
 
 def registro_para_supabase(r):
@@ -246,7 +304,7 @@ def main():
             frame = scraper.get_dashboard_frame(page)
 
             print(f"Definindo periodo {args.data_inicial} - {args.data_final}...")
-            definir_periodo(frame, args.data_inicial, args.data_final)
+            scraper.definir_periodo(frame, args.data_inicial, args.data_final)
 
             print("Exportando dados do painel 'Informação Pedido'...")
             caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
@@ -296,6 +354,12 @@ def main():
                       f"(marca) - sem os dois, nao da pra identificar com seguranca.")
             print("Eventos/Itens NAO foram trazidos por este backfill (ver LIMITACAO no topo do arquivo) - "
                   "continuam vindo via titan_watcher.py quando a Torre precisar de um pedido especifico.")
+
+            print("\nReconferindo pedidos presos em situacao intermediaria fora da janela do backfill...")
+            rechecar_situacoes_presas(page)
+
+            print("\nCompletando Eventos/Itens de pedidos que o backfill deixou concluidos sem essa informacao...")
+            rechecar_concluidos_sem_eventos(page)
         finally:
             browser.close()
 
