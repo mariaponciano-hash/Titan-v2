@@ -2544,6 +2544,13 @@ function torrePreencherForm(d) {
     plp_intelipost: p.plp_intelipost || '',
     romaneio_transportadora: p.romaneio_transportadora || '',
     endereco_entrega: enderecoCompleto,
+    // Endereco ATUAL em partes separadas - usado so pra pre-preencher o
+    // formulario de "Alterar Endereço" (ver renderTorreForm), pra o agente
+    // editar so o que mudou em vez de redigitar tudo do zero.
+    endereco_atual: {
+      rua: c.endereco || '', numero: c.numero || '', complemento: c.complemento || '',
+      bairro: c.bairro || '', cidade: c.cidade || '', uf: c.uf || '', cep: c.cep || '',
+    },
     transportadora: t.nome || '',
     codigo_rastreio: t.codigo_rastreio || '',
     previsao_entrega: p.previsao_entrega ? String(p.previsao_entrega).slice(0, 10) : '',
@@ -2666,11 +2673,17 @@ function torreAbrirTicket() {
   var problema = (document.getElementById('tf-problema') || {}).value || '';
   var responsavel = (document.getElementById('tf-responsavel') || {}).value || '';
   var romaneioCorrigido = (document.getElementById('tf-romaneio') || {}).value || '';
-  var enderecoNovo = (document.getElementById('tf-endereco-novo') || {}).value || '';
+  var enderecoNovo = torreLerEnderecoNovo();
   if (!problema) { alert('Selecione o problema.'); return; }
   if (!responsavel.trim()) { alert('Informe o responsável.'); return; }
-  if (problema === 'Alterar Endereço' && !enderecoNovo.trim()) {
-    alert('Informe o endereço novo (correto) antes de abrir o ticket.');
+  // Minimo pratico confirmado com quem mantem o TicketsCreator (01/09/2026):
+  // nao existe lista fixa de obrigatorios (nada da 400) - o que existe e um
+  // minimo funcional pra Regra 1 conseguir decidir: city+state, mais
+  // address1 OU zipcode. Sem isso, o ticket morre como
+  // ADDRESS_UNVERIFIABLE em vez de abrir de verdade.
+  var p = enderecoNovo.partes;
+  if (problema === 'Alterar Endereço' && (!p.city || !p.state || !(p.address1 || p.zipcode))) {
+    alert('Preencha ao menos Cidade, UF e (Rua ou CEP) do endereço novo antes de abrir o ticket.');
     return;
   }
   if (!confirm('Confirma a abertura deste ticket? A transportadora (' + (f.transportadora || 'não identificada') + ') será contatada automaticamente pelo TicketsCreator.\n\nEssa ação é real e não pode ser desfeita.')) {
@@ -2678,7 +2691,7 @@ function torreAbrirTicket() {
   }
 
   f.romaneio_transportadora = romaneioCorrigido;
-  f.endereco_novo = enderecoNovo;
+  f.endereco_novo = enderecoNovo.fullAddress;
   torreState.enviando = true;
   renderTorre();
 
@@ -2688,7 +2701,8 @@ function torreAbrirTicket() {
     dias_atraso: f.dias_atraso === '' ? null : Number(f.dias_atraso), destinatario: f.destinatario,
     cpf_destinatario: f.cpf_destinatario, chave_danfe: f.chave_danfe, plp_intelipost: f.plp_intelipost,
     romaneio_transportadora: f.romaneio_transportadora, endereco_entrega: f.endereco_entrega,
-    endereco_novo: f.endereco_novo || '', maps_url: gerarUrlGoogleMaps(f.endereco_novo),
+    endereco_novo: f.endereco_novo || '', endereco_novo_partes: problema === 'Alterar Endereço' ? enderecoNovo.partes : undefined,
+    maps_url: gerarUrlGoogleMaps(f.endereco_novo),
     responsavel: responsavel,
   };
 
@@ -2813,9 +2827,28 @@ function renderTorreForm(d) {
     // So aparece pra "Alterar Endereço" (ver torreAtualizarCamposProblema).
     // display:none por padrao porque nenhuma sugestao automatica de problema
     // resulta em "Alterar Endereço" - so o proprio agente escolhe isso.
+    // CAMPOS SEPARADOS, NAO UM texto livre (01/09/2026, bug real achado em
+    // producao): o TicketsCreator usa o objeto "correct_address" pra DUAS
+    // coisas - o texto que vai pra transportadora (que pode vir de
+    // "fullAddress") E a comparacao da Regra 1, que le SO os campos
+    // estruturados (city/state/address1/address2/zipcode) e NUNCA faz parse
+    // do fullAddress. Mandar so fullAddress passa da checagem de "veio
+    // endereco" mas morre depois como ADDRESS_UNVERIFIABLE (sem
+    // city/state pra comparar) - foi exatamente isso que aconteceu com todo
+    // ticket de Alterar Endereço aberto pela Torre ate agora. Pre-preenchido
+    // com o endereco ATUAL (destinatario.*) pra o agente so editar o que
+    // realmente mudou, em vez de redigitar tudo.
     +   '<div class="tf-field full" id="tf-grupo-endereco-novo" style="display:' + (f.problema === 'Alterar Endereço' ? 'block' : 'none') + '">'
     +     '<label class="tf-label">Endereço novo (correto) <span class="req">*</span></label>'
-    +     '<input class="tf-input" id="tf-endereco-novo" placeholder="Rua, número, bairro, cidade/UF, CEP" oninput="torreAtualizarLinkMaps()">'
+    +     '<div class="tf-grid" style="margin-top:4px">'
+    +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">Rua/Av</label><input class="tf-input" id="tf-end-rua" value="' + tEsc(f.endereco_atual.rua) + '" oninput="torreAtualizarLinkMaps()"></div>'
+    +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">Número</label><input class="tf-input" id="tf-end-numero" value="' + tEsc(f.endereco_atual.numero) + '" oninput="torreAtualizarLinkMaps()"></div>'
+    +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">Complemento</label><input class="tf-input" id="tf-end-complemento" value="' + tEsc(f.endereco_atual.complemento) + '" oninput="torreAtualizarLinkMaps()"></div>'
+    +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">Bairro</label><input class="tf-input" id="tf-end-bairro" value="' + tEsc(f.endereco_atual.bairro) + '" oninput="torreAtualizarLinkMaps()"></div>'
+    +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">Cidade <span class="req">*</span></label><input class="tf-input" id="tf-end-cidade" value="' + tEsc(f.endereco_atual.cidade) + '" oninput="torreAtualizarLinkMaps()"></div>'
+    +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">UF <span class="req">*</span></label><input class="tf-input" id="tf-end-uf" value="' + tEsc(f.endereco_atual.uf) + '" maxlength="2" style="text-transform:uppercase" oninput="torreAtualizarLinkMaps()"></div>'
+    +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">CEP</label><input class="tf-input" id="tf-end-cep" value="' + tEsc(f.endereco_atual.cep) + '" oninput="torreAtualizarLinkMaps()"></div>'
+    +     '</div>'
     +     '<a href="#" id="tf-link-maps" target="_blank" rel="noopener" style="display:none;font-size:11px;color:var(--blue);margin-top:5px">Ver no Google Maps ↗</a>'
     +   '</div>'
     // "Observação para a transportadora" removida (31/08/2026, a pedido da
@@ -3107,14 +3140,38 @@ function torreAtualizarCamposProblema() {
   if (grupo) grupo.style.display = (problema === 'Alterar Endereço') ? 'block' : 'none';
 }
 
-// Atualiza o link "Ver no Google Maps" em tempo real conforme o agente digita
+// Le os campos separados do endereco novo (ver renderTorreForm) e devolve
+// tanto as partes (pro correct_address estruturado que a Regra 1 do
+// TicketsCreator exige) quanto o texto composto (fullAddress - o que vai
+// literal pra transportadora, mesma ordem que o proprio TicketsCreator usa
+// como fallback quando fullAddress nao vem: address1,address2,address3,
+// address4,city,state,country_code,zipcode).
+// Limpa pontuacao sobrando (01/09/2026, achado real: a Intelipost devolveu
+// "585," com virgula no numero) - so a chamada DIRETA ao TicketsCreator
+// (pedido ja despachado) passa por aqui; a fila do Diego ja limpa do lado
+// dela pro caminho que passa por enfileirarEndereco().
+function torreLerEnderecoNovo() {
+  function v(id) {
+    var el = document.getElementById(id);
+    return el ? el.value.trim().replace(/^[,;\-\s]+|[,;\-\s]+$/g, '') : '';
+  }
+  var partes = {
+    address1: v('tf-end-rua'), address2: v('tf-end-numero'), address3: v('tf-end-complemento'),
+    address4: v('tf-end-bairro'), city: v('tf-end-cidade'), state: v('tf-end-uf').toUpperCase(),
+    zipcode: v('tf-end-cep'), country_code: 'BR',
+  };
+  var fullAddress = [partes.address1, partes.address2, partes.address3, partes.address4,
+    partes.city, partes.state, partes.country_code, partes.zipcode].filter(Boolean).join(', ');
+  return { partes: partes, fullAddress: fullAddress };
+}
+
+// Atualiza o link "Ver no Google Maps" em tempo real conforme o agente edita
 // o endereco novo - assim ele confirma visualmente que digitou certo ANTES de
 // mandar pra transportadora.
 function torreAtualizarLinkMaps() {
-  var input = document.getElementById('tf-endereco-novo');
   var link = document.getElementById('tf-link-maps');
-  if (!input || !link) return;
-  var url = gerarUrlGoogleMaps(input.value);
+  if (!link) return;
+  var url = gerarUrlGoogleMaps(torreLerEnderecoNovo().fullAddress);
   if (url) { link.href = url; link.style.display = 'inline-block'; }
   else { link.style.display = 'none'; }
 }

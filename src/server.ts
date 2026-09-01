@@ -2269,7 +2269,13 @@ async function postarTicketsCreator(env: Env, payload: Record<string, any>): Pro
 
 async function chamarTicketsCreator(
   env: Env,
-  params: { marca: string; problema: string; numeroPedido: string; enderecoNovo?: string }
+  params: {
+    marca: string;
+    problema: string;
+    numeroPedido: string;
+    enderecoNovo?: string;
+    enderecoNovoPartes?: { address1?: string; address2?: string; address3?: string; address4?: string; city?: string; state?: string; zipcode?: string; country_code?: string };
+  }
 ): Promise<{ chamado: boolean; status: number | null; resposta: any; motivo?: string; retentativaComSufixoShopify?: boolean }> {
   if (!env.TICKETS_CREATOR_URL) {
     return { chamado: false, status: null, resposta: null, motivo: 'TICKETS_CREATOR_URL nao configurado' };
@@ -2283,13 +2289,33 @@ async function chamarTicketsCreator(
   }
 
   const variables: Record<string, any> = {};
-  if (issue === 'Endereço Errado' && params.enderecoNovo) {
-    // fullAddress e o unico campo que resolveFullAddress() aceita sem
-    // precisar dos sub-campos estruturados (address1/city/state/...) que a
-    // Torre nao coleta separadamente - o worker usa isso direto no e-mail
-    // pra transportadora e pula so a validacao extra de "endereco plausivel"
-    // (que exige city/state estruturados), sem bloquear a abertura.
-    variables.correct_address = { fullAddress: params.enderecoNovo };
+  if (issue === 'Endereço Errado' && params.enderecoNovoPartes) {
+    // BUG REAL (01/09/2026, doc oficial do TicketsCreator confirmou): a Regra
+    // 1 (que decide se a mudanca de endereco pode ser aceita) SO le os campos
+    // estruturados (city/state/address1/address2/zipcode) - nunca faz parse
+    // de fullAddress. Mandar so fullAddress (o que este codigo fazia antes)
+    // passa da checagem de "veio endereco" (ADDRESS_MISSING) mas morre logo
+    // depois como ADDRESS_UNVERIFIABLE por falta de city/state pra comparar -
+    // ou seja, TODO ticket de Alterar Endereço aberto pela Torre ate agora
+    // escalava pra humano em vez de abrir de verdade. Agora manda as duas
+    // formas: as partes estruturadas (pra Regra 1 conseguir decidir) E
+    // fullAddress composto a partir delas na MESMA ordem que o proprio
+    // TicketsCreator usa como fallback (address1,address2,address3,address4,
+    // city,state,country_code,zipcode), pra nunca haver divergencia entre o
+    // texto que vai pro e-mail da transportadora e o que foi validado.
+    const p = params.enderecoNovoPartes;
+    const fullAddress = params.enderecoNovo || [p.address1, p.address2, p.address3, p.address4, p.city, p.state, p.country_code || 'BR', p.zipcode].filter(Boolean).join(', ');
+    variables.correct_address = {
+      address1: p.address1 || '',
+      address2: p.address2 || '',
+      address3: p.address3 || '',
+      address4: p.address4 || '',
+      city: p.city || '',
+      state: p.state || '',
+      zipcode: p.zipcode || '',
+      country_code: p.country_code || 'BR',
+      fullAddress,
+    };
   }
   // executed_by (31/08/2026, a pedido da Ivna): identifica o SISTEMA que
   // chamou, nao o agente individual - "Central Tickets" fixo, igual aos
@@ -2842,6 +2868,7 @@ export default {
           problema,
           numeroPedido: body.numero_pedido,
           enderecoNovo: body.endereco_novo,
+          enderecoNovoPartes: body.endereco_novo_partes,
         });
         // Sucesso real = action:"ticket_created" no corpo - o worker devolve
         // HTTP 200 tambem pra "ja existe"/"nao precisa"/"escalar pra humano",
