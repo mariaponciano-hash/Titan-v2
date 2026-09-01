@@ -50,6 +50,7 @@ da Torre ja achar tudo pronto em vez de esperar uma consulta avulsa. Chave =
 Nota Fiscal (nao o "Numero do Pedido" do Titan, que e interno do armazem).
 """
 import argparse
+import datetime
 import json
 import os
 import re
@@ -394,6 +395,91 @@ def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=15000):
         except Exception:
             pass
         time.sleep(0.5)
+
+
+def fechar_popup_calendario(frame, tentativas=5):
+    """
+    CONFIRMADO COM ERRO REAL (24/08/2026): um Escape sozinho as vezes NAO
+    fecha o popup do calendario - ele e um overlay do Angular Material (CDK),
+    e sobra um <div class="cdk-overlay-backdrop..."> TRANSPARENTE cobrindo a
+    tela inteira, que intercepta qualquer clique/hover seguinte (erro real:
+    "cdk-overlay-backdrop... subtree intercepts pointer events", travando
+    coletar_todos_registros no primeiro hover). CDK overlays fecham ao
+    clicar no proprio backdrop - entao clica nele (nao so aperta Escape) e
+    confirma que sumiu antes de seguir.
+    """
+    for _ in range(tentativas):
+        backdrop = frame.locator(".cdk-overlay-backdrop")
+        if backdrop.count() == 0:
+            return
+        try:
+            backdrop.first.click(timeout=1000, force=True)
+        except Exception:
+            frame.page.keyboard.press("Escape")
+        time.sleep(0.3)
+    if frame.locator(".cdk-overlay-backdrop").count() > 0:
+        raise PWTimeout("cdk-overlay-backdrop nao fechou depois de varias tentativas")
+
+
+# Janela usada por buscas avulsas (titan_watcher.processar_pedido) pra
+# garantir que o filtro "Data Inicial - Data Final" nao exclua o pedido
+# procurado - ver definir_periodo abaixo pro porque isso e necessario.
+PERIODO_AMPLO_INICIAL = "01/01/2020"
+
+
+def definir_periodo(frame, data_inicial, data_final):
+    """
+    CONFIRMADO COM TESTE REAL (24/08/2026, periodo 01/06-23/08/2026): o
+    clique-e-digita abaixo ACERTA os dois campos internos do slicer ("Data de
+    inicio"/"Data de termino", confirmados via aria-label) - o bug real do
+    "0 encontrados" nao era o valor setado, era ler a tabela cedo demais.
+    Sem fechar o popup (Escape) e sem esperar a query terminar, a tabela fica
+    vazia por varios segundos depois de mudar o periodo. Corrigido esperando
+    de verdade a 1a linha aparecer em vez de um sleep fixo.
+
+    MOVIDO de titan_backfill.py pra ca (01/09/2026, achado real - print
+    salvo em titan_debug/filtro_nao_encontrado.png): o Titan carrega o
+    dashboard com um filtro de periodo padrao ja aplicado (nao "todas as
+    datas"; visto "6/1/2026" numa captura e "7/1/2026" no dia seguinte -
+    parece ser relativo a data de hoje, nao fixo), entao uma busca avulsa
+    por NF (titan_watcher.processar_pedido, que nunca chamava esta funcao)
+    podia legitimamente dar "No results found" no proprio Power BI se a NF
+    procurada nao caisse dentro dessa janela padrao estreita - nao era bug
+    de seletor nenhum. Generalizada aqui pra processar_pedido tambem poder
+    abrir bem mais o periodo (ver PERIODO_AMPLO_INICIAL) antes de buscar por
+    NF, do mesmo jeito que o backfill ja fazia pra sua janela especifica.
+    """
+    try:
+        # timeout_ms=60000 (era o padrao de 30000) - achado real rodando via
+        # GitHub Actions (28/08/2026): o rotulo existe de verdade (confirmado
+        # print real da Ivna no navegador dela) mas nao apareceu NENHUMA VEZ
+        # no HTML capturado apos os 30s padrao - o runner (CPU compartilhada)
+        # parece ser bem mais lento que um PC normal pra este slicer
+        # especifico do Power BI terminar de renderizar.
+        rotulo = elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
+        caixa = rotulo.bounding_box()
+        if not caixa:
+            raise PWTimeout("rotulo 'Data Inicial - Data Final' visivel mas sem bounding_box (layout inesperado)")
+        x = caixa["x"] + caixa["width"] / 2
+        y = caixa["y"] + caixa["height"] + 15
+        frame.page.mouse.click(x, y)
+        time.sleep(0.5)
+        frame.page.keyboard.press("Control+A")
+        frame.page.keyboard.type(data_inicial, delay=60)
+        frame.page.keyboard.press("Tab")
+        time.sleep(0.3)
+        frame.page.keyboard.press("Control+A")
+        frame.page.keyboard.type(data_final, delay=60)
+        frame.page.keyboard.press("Enter")
+        time.sleep(0.5)
+        fechar_popup_calendario(frame)
+
+        painel = localizar_painel(frame, "Informação Pedido")
+        painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
+        time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
+    except PWTimeout:
+        salvar_diagnostico(frame, "set_filtro_data_nao_encontrado")
+        raise
 
 
 def filtrar(frame, nf=None, numero_pedido=None):

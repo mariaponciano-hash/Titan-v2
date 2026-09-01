@@ -68,7 +68,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 import titan_bi_scraper as scraper
 import titan_watcher  # reusa processar_pedido/marcar_erro do recheck por-NF (28/08/2026, ver rechecar_situacoes_presas)
@@ -225,73 +225,6 @@ def _supabase_upsert_lote(registros):
         resp.read()
 
 
-def fechar_popup_calendario(frame, tentativas=5):
-    """
-    CONFIRMADO COM ERRO REAL (24/08/2026): um Escape sozinho as vezes NAO
-    fecha o popup do calendario - ele e um overlay do Angular Material (CDK),
-    e sobra um <div class="cdk-overlay-backdrop..."> TRANSPARENTE cobrindo a
-    tela inteira, que intercepta qualquer clique/hover seguinte (erro real:
-    "cdk-overlay-backdrop... subtree intercepts pointer events", travando
-    coletar_todos_registros no primeiro hover). CDK overlays fecham ao
-    clicar no proprio backdrop - entao clica nele (nao so aperta Escape) e
-    confirma que sumiu antes de seguir.
-    """
-    for _ in range(tentativas):
-        backdrop = frame.locator(".cdk-overlay-backdrop")
-        if backdrop.count() == 0:
-            return
-        try:
-            backdrop.first.click(timeout=1000, force=True)
-        except Exception:
-            frame.page.keyboard.press("Escape")
-        time.sleep(0.3)
-    if frame.locator(".cdk-overlay-backdrop").count() > 0:
-        raise PWTimeout("cdk-overlay-backdrop nao fechou depois de varias tentativas")
-
-
-def definir_periodo(frame, data_inicial, data_final):
-    """
-    CONFIRMADO COM TESTE REAL (24/08/2026, periodo 01/06-23/08/2026): o
-    clique-e-digita abaixo ACERTA os dois campos internos do slicer ("Data de
-    inicio"/"Data de termino", confirmados via aria-label) - o bug real do
-    "0 encontrados" nao era o valor setado, era ler a tabela cedo demais.
-    Sem fechar o popup (Escape) e sem esperar a query terminar, a tabela fica
-    vazia por varios segundos depois de mudar o periodo. Corrigido esperando
-    de verdade a 1a linha aparecer em vez de um sleep fixo.
-    """
-    try:
-        # timeout_ms=60000 (era o padrao de 30000) - achado real rodando via
-        # GitHub Actions (28/08/2026): o rotulo existe de verdade (confirmado
-        # print real da Ivna no navegador dela) mas nao apareceu NENHUMA VEZ
-        # no HTML capturado apos os 30s padrao - o runner (CPU compartilhada)
-        # parece ser bem mais lento que um PC normal pra este slicer
-        # especifico do Power BI terminar de renderizar.
-        rotulo = scraper.elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
-        caixa = rotulo.bounding_box()
-        if not caixa:
-            raise PWTimeout("rotulo 'Data Inicial - Data Final' visivel mas sem bounding_box (layout inesperado)")
-        x = caixa["x"] + caixa["width"] / 2
-        y = caixa["y"] + caixa["height"] + 15
-        frame.page.mouse.click(x, y)
-        time.sleep(0.5)
-        frame.page.keyboard.press("Control+A")
-        frame.page.keyboard.type(data_inicial, delay=60)
-        frame.page.keyboard.press("Tab")
-        time.sleep(0.3)
-        frame.page.keyboard.press("Control+A")
-        frame.page.keyboard.type(data_final, delay=60)
-        frame.page.keyboard.press("Enter")
-        time.sleep(0.5)
-        fechar_popup_calendario(frame)
-
-        painel = scraper.localizar_painel(frame, "Informação Pedido")
-        painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
-        time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
-    except PWTimeout:
-        scraper.salvar_diagnostico(frame, "set_filtro_data_nao_encontrado")
-        raise
-
-
 def registro_para_supabase(r):
     """
     CHAVE = (numero_nf, marca) - migrado de so-NF em 24/08/2026 depois de
@@ -371,7 +304,7 @@ def main():
             frame = scraper.get_dashboard_frame(page)
 
             print(f"Definindo periodo {args.data_inicial} - {args.data_final}...")
-            definir_periodo(frame, args.data_inicial, args.data_final)
+            scraper.definir_periodo(frame, args.data_inicial, args.data_final)
 
             print("Exportando dados do painel 'Informação Pedido'...")
             caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)

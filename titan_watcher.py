@@ -108,7 +108,16 @@ def processar_pedido(page, item):
         return
 
     print(f"[NF {numero_nf} / marca {marca} / pedido {numero_pedido}] consultando no Titan BI...")
-    frame = scraper.get_dashboard_frame(page)  # recarrega o relatorio do zero - reseta os filtros da rodada anterior
+    frame = scraper.get_dashboard_frame(page)  # recarrega o relatorio do zero
+    # Achado real (01/09/2026, print salvo em titan_debug/filtro_nao_encontrado.png):
+    # um reload NAO volta pro "sem filtro nenhum" - o Titan carrega o
+    # dashboard com um filtro de periodo estreito ja aplicado por padrao
+    # (visto "6/1/2026" numa captura e "7/1/2026" no dia seguinte - parece
+    # relativo a data de hoje). Sem abrir bem essa janela antes, uma busca
+    # por NF de outro periodo dava "No results found" no proprio Power BI -
+    # nao era bug de seletor. Ver scraper.definir_periodo/PERIODO_AMPLO_INICIAL.
+    hoje = datetime.datetime.now().strftime("%d/%m/%Y")
+    scraper.definir_periodo(frame, scraper.PERIODO_AMPLO_INICIAL, hoje)
     scraper.filtrar(frame, nf=numero_nf)
     scraper.rolar_tabela_ate_o_fim(frame)
 
