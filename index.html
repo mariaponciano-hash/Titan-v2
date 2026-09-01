@@ -2276,16 +2276,12 @@ function renderTorreTimeline(d) {
 }
 
 // --- Tickets: ja existe ou abre um novo? --------------------------------
+// O resultado do envio (torreState.resultadoEnvio) virou pop-up (ver
+// torreMostrarModalResultado) em vez de um alerta discreto aqui dentro
+// (01/09/2026, a pedido da Ivna: o alerta "ficava pouco visivel, nao vi") -
+// nao renderiza mais nada a partir dele, so guarda o ultimo resultado.
 function renderTorreTickets(d) {
   var tickets = d.tickets_existentes || [];
-  if (torreState.resultadoEnvio) {
-    var r = torreState.resultadoEnvio;
-    // titulo/mensagem vem prontos de torreEnviarTicket - cada combinacao
-    // possivel (email+ticket ok, so um dos dois falhou, os dois falharam) tem
-    // seu proprio texto, pra nunca dizer "falha ao registrar" quando o ticket
-    // na verdade foi registrado (so o e-mail que nao saiu), ou vice-versa.
-    return '<div class="torre-alert ' + r.classe + '"><b>' + tEsc(r.titulo) + '</b> ' + tEsc(r.mensagem || '') + '</div>' + renderTorreTicketsLista(d, tickets);
-  }
   return renderTorreTicketsLista(d, tickets);
 }
 
@@ -2746,12 +2742,37 @@ function torreAbrirTicket() {
         torreState.resultadoEnvio = { classe: 'warn', titulo: 'Ticket registrado — protocolo ' + protocolo + '.', mensagem: 'TicketsCreator não foi chamado (' + (tc.motivo || 'não configurado') + ') - contate a transportadora manualmente.' };
       }
       renderTorre();
+      torreMostrarModalResultado(torreState.resultadoEnvio);
     })
     .catch(function(e) {
       torreState.enviando = false;
       torreState.resultadoEnvio = { classe: 'err', titulo: 'Falha ao registrar o ticket.', mensagem: String((e && e.message) || e) };
       renderTorre();
+      torreMostrarModalResultado(torreState.resultadoEnvio);
     });
+}
+
+// Pop-up de confirmacao pos-envio (01/09/2026, a pedido da Ivna: o alerta
+// discreto dentro da tela "ficava pouco visivel, nao vi que tinha aberto") -
+// reaproveita o mesmo padrao de modal ja usado em "Responder"
+// (.modal-overlay/.modal/.modal-top/.modal-actions), so trocando o corpo.
+function torreMostrarModalResultado(r) {
+  if (!r) return;
+  var icones = { ok: '✓', warn: '⚠', err: '✕' };
+  var cores = { ok: 'var(--green)', warn: 'var(--orange)', err: 'var(--red)' };
+  document.getElementById('modal-root').innerHTML =
+    '<div class="modal-overlay" onclick="if(event.target===this)closeModal()">' +
+    '<div class="modal" style="max-width:440px">' +
+    '<div class="modal-top">' +
+    '<div class="modal-title" style="display:flex;align-items:center;gap:9px">' +
+    '<span style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;background:' + cores[r.classe] + ';color:#fff;font-size:14px;flex-shrink:0">' + icones[r.classe] + '</span>' +
+    tEsc(r.titulo) +
+    '</div>' +
+    '<button class="modal-close" onclick="closeModal()">&#x2715;</button>' +
+    '</div>' +
+    '<div class="modal-body"><p style="font-size:13.5px;color:var(--ink-2);line-height:1.6;margin:0">' + tEsc(r.mensagem || '') + '</p>' +
+    '<div class="modal-actions"><button class="btn-send" onclick="closeModal()">Entendi</button></div>' +
+    '</div></div></div>';
 }
 
 function campoRO(label, valor) {
@@ -2832,7 +2853,10 @@ function renderTorreForm(d) {
     // qualquer campo que o agente ja tivesse preenchido enquanto espera).
     +   (f.marcaId === 'gocase' ? '' : campoEditavel('tf-romaneio', 'Romaneio', f.romaneio_titan, true))
     +   campoRO('PLP (lote de postagem)', f.plp_intelipost)
-    +   '<div class="tf-field full">'
+    // Nao aparece pra "Avaria" (01/09/2026, a pedido da Ivna): avaria e sobre
+    // o estado do produto, nao sobre localizar a entrega - o endereco nao e
+    // relevante pra esse problema.
+    +   '<div class="tf-field full" id="tf-grupo-endereco-entrega" style="display:' + (f.problema === 'Avaria' ? 'none' : '') + '">'
     +     '<label class="tf-label">Endereço de entrega'
     +       (f.endereco_entrega ? ' <span class="tf-prefilled">✓ automático</span>' : '') + '</label>'
     +     '<input class="tf-input" readonly value="' + tEsc(f.endereco_entrega || '—') + '">'
@@ -2862,7 +2886,7 @@ function renderTorreForm(d) {
     +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">UF <span class="req">*</span></label><input class="tf-input" id="tf-end-uf" value="' + tEsc(f.endereco_atual.uf) + '" maxlength="2" style="text-transform:uppercase" oninput="torreAtualizarLinkMaps()"></div>'
     +       '<div class="tf-field"><label class="tf-label" style="font-weight:400;font-size:10px">CEP</label><input class="tf-input" id="tf-end-cep" value="' + tEsc(f.endereco_atual.cep) + '" oninput="torreAtualizarLinkMaps()"></div>'
     +     '</div>'
-    +     '<a href="#" id="tf-link-maps" target="_blank" rel="noopener" style="display:none;font-size:11px;color:var(--blue);margin-top:5px">Ver no Google Maps ↗</a>'
+    +     '<a href="#" id="tf-link-maps" target="_blank" rel="noopener" style="display:none;margin-top:10px;font-size:12.5px;font-weight:600;color:var(--blue)">📍 Ver endereço novo no Google Maps ↗</a>'
     +   '</div>'
     // "Observação para a transportadora" removida (31/08/2026, a pedido da
     // Ivna): so existia pra montar o corpo do e-mail manual, que saiu do
@@ -2881,15 +2905,23 @@ function renderTorreForm(d) {
     // Alterar Endereço) e confirmado, porque a doc dele confirma que o
     // fullAddress do correct_address vira o texto pro transportador
     // VERBATIM.
-    + '<div class="tf-field full">'
-    +   '<button type="button" class="torre-btn-ghost" style="padding:7px 14px;border-radius:16px;font-size:12px" id="tf-btn-previa" onclick="torreTogglePreviaEmail()">Ver prévia estimada do e-mail</button>'
-    +   '<div id="tf-previa-email" style="display:none;margin-top:10px;background:var(--surface);border:1px solid var(--border-2);border-radius:var(--radius);padding:.9rem 1rem">'
-    +     '<div style="font-size:11px;color:var(--orange);font-weight:600;margin-bottom:8px">⚠ Estimativa baseada no padrão observado em tickets anteriores - o texto real é escrito pelo TicketsCreator e pode variar.</div>'
-    +     '<div id="tf-previa-conteudo"></div>'
+    // Painel fica no corpo do formulario (pra abrir logo acima dos botoes
+    // quando expandido), mas o BOTAO que abre ele mora em tf-actions, ao
+    // lado de "Abrir Ticket" (01/09/2026, a pedido da Ivna: o botao ficava
+    // "muito escondido" solto no meio do formulario). Tem seu PROPRIO botao
+    // "Abrir Ticket" aqui dentro tambem, pra quem esta olhando a previa nao
+    // precisar rolar a tela de volta pra confirmar - os dois chamam a mesma
+    // torreAbrirTicket().
+    + '<div id="tf-previa-email" style="display:none;margin-top:0 0 1rem;background:var(--surface);border:1px solid var(--border-2);border-radius:var(--radius);padding:.9rem 1rem">'
+    +   '<div style="font-size:11px;color:var(--orange);font-weight:600;margin-bottom:8px">⚠ Estimativa baseada no padrão observado em tickets anteriores - o texto real é escrito pelo TicketsCreator e pode variar.</div>'
+    +   '<div id="tf-previa-conteudo"></div>'
+    +   '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border-2);display:flex;justify-content:flex-end">'
+    +     '<button class="torre-btn" onclick="torreAbrirTicket()">Abrir Ticket</button>'
     +   '</div>'
     + '</div>'
     + '<div class="tf-actions">'
     +   '<button class="torre-btn torre-btn-ghost" onclick="torreFecharForm()">Cancelar</button>'
+    +   '<button type="button" class="torre-btn torre-btn-ghost" id="tf-btn-previa" onclick="torreTogglePreviaEmail()">Ver prévia estimada do e-mail</button>'
     // Sem opcao de "so registrar" (removida 18/08/2026, a pedido da Ivna): o
     // proposito de abrir um ticket de logistica e contatar a transportadora -
     // um registro que nao contata ninguem contradiz esse proposito. Desde
@@ -3012,6 +3044,11 @@ function torreAbrirForm() {
   torreState.resultadoEnvio = null;
   renderTorre();
   torreSolicitarTitan();
+  // Preenche o link do Maps de cara quando "Alterar Endereço" ja vem
+  // pre-selecionado (01/09/2026, a pedido da Ivna) - sem isso o link so
+  // aparecia depois do agente digitar algo, porque o valor pre-preenchido
+  // via "value=" no HTML nao dispara o oninput dos campos.
+  torreAtualizarLinkMaps();
 }
 
 // Pede pro Titan BI consultar o romaneio de verdade deste pedido (24/08/2026,
@@ -3209,6 +3246,9 @@ function torreAtualizarCamposProblema() {
   var problema = (document.getElementById('tf-problema') || {}).value || '';
   var grupo = document.getElementById('tf-grupo-endereco-novo');
   if (grupo) grupo.style.display = (problema === 'Alterar Endereço') ? 'block' : 'none';
+  var grupoEntrega = document.getElementById('tf-grupo-endereco-entrega');
+  if (grupoEntrega) grupoEntrega.style.display = (problema === 'Avaria') ? 'none' : '';
+  if (problema === 'Alterar Endereço') torreAtualizarLinkMaps();
 }
 
 // Le os campos separados do endereco novo (ver renderTorreForm) e devolve
