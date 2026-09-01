@@ -2710,7 +2710,16 @@ const COSMOS_CAMPOS_STATUS_CANDIDATOS = [
 const COSMOS_ESTADOS_NAO_ENVIADO_PADRAO = ['waiting', 'aguardando', 'pending', 'created'];
 
 // Estados que significam "nem vai mais" - pedido morto antes de sair.
-const COSMOS_ESTADOS_MORTOS = ['canceled', 'cancelled', 'cancelado', 'refunded', 'estornado'];
+// Estados em que a troca de endereco perdeu o sentido. Cancelado e obvio;
+// ENTREGUE entrou em 01/09/2026 depois de uma observacao da Ivna - um pedido que
+// ja chegou nao tem endereco pra alterar, e o que existe dali pra frente e
+// devolucao ou reenvio, que e outro fluxo. Sem isso o gate lia 'delivered' como
+// "saiu, pode disparar" e a Central abriria ticket de troca de endereco pra
+// pedido que o cliente ja recebeu.
+const COSMOS_ESTADOS_MORTOS = [
+  'canceled', 'cancelled', 'cancelado', 'refunded', 'estornado',
+  'delivered', 'entregue',
+];
 
 function cosmosOrgIds(env: Env): Record<string, string> {
   const raw = env.COSMOS_ORG_IDS;
@@ -2919,6 +2928,11 @@ async function pedidoSaiuPeloMiddlewareV1(env: Env, ecomId: string, row: any): P
   if (!reg) {
     return { veredito: 'desconhecido', detalhe: `pedido ${row.pedido} nao esta no middleware v1 (pode ser inexistente ou ainda nao exportado)` };
   }
+  // Mesmo motivo do 'delivered' no Cosmos: pedido entregue nao tem endereco pra
+  // alterar. No Middleware V1 o sinal e o delivered_at preenchido.
+  if (reg.delivered_at) {
+    return { veredito: 'morto', detalhe: `entregue em ${String(reg.delivered_at).slice(0, 10)}` };
+  }
   const st = String(reg.status || '').trim().toLowerCase();
   if (!st) return { veredito: 'desconhecido', detalhe: 'registro sem campo status' };
   if (st === MIDDLEWARE_V1_STATUS_SAIU) return { veredito: 'sim', detalhe: `status=${st}` };
@@ -2977,6 +2991,140 @@ async function pedidoEstaSent(env: Env, row: any): Promise<{ veredito: StatusPed
     : COSMOS_ESTADOS_NAO_ENVIADO_PADRAO).map((x) => x.trim().toLowerCase()).filter(Boolean);
   if (naoEnviado.indexOf(valor) !== -1) return { veredito: 'nao', detalhe: `${campo}=${valor}` };
   return { veredito: 'sim', detalhe: `${campo}=${valor}` };
+}
+
+
+// ============ ENFILEIRAR UM ENDERECO (porta unica de escrita) ============
+//
+// Chamada de dois lugares: da rota /api/enderecos-enfileirar (pra quem estiver
+// FORA deste worker) e direto da Torre de Controle, que roda no MESMO worker e
+// portanto nao precisa de HTTP, URL nem secret pra falar com a fila.
+//
+// Existe pra ser o unico escritor da tabela vindo de dentro: quem chama nao
+// precisa conhecer a chave (pedido, marca), nem a regra de nunca escrever
+// `status` - que se violada faz a Central abrir um SEGUNDO ticket no mesmo
+// pedido -, nem o mapeamento address1..4 do creator, onde address2 e o numero e
+// address4 e o bairro.
+interface EntradaEndereco {
+  marca: string;
+  numero_pedido: string;
+  endereco_atual?: string;
+  novo_endereco?: string;
+  logradouro?: string;
+  numero?: string;
+  complemento?: string;
+  bairro?: string;
+  cidade?: string;
+  uf?: string;
+  cep?: string;
+  pais?: string;
+  responsavel?: string;
+  origem?: string;
+}
+
+type ResultadoEnfileirar =
+  | { ok: true; id: any; status: string | null; jaExistia: boolean }
+  | { ok: false; httpStatus: number; code: string; erro: string; faltando?: string[] };
+
+// A Intelipost as vezes devolve o numero com pontuacao sobrando - a Ivna achou
+// um pedido Kokeshi cujo "numero" vinha como "585," (01/09/2026). O agente
+// consegue corrigir na tela, mas o que chegar aqui vai VERBATIM pro texto que a
+// transportadora le, entao a limpeza acontece no unico lugar por onde todo
+// endereco passa.
+function limparParte(v: any): string {
+  return String(v == null ? '' : v).trim().replace(/[\s,;.]+$/, '').trim();
+}
+
+async function enfileirarEndereco(env: Env, p: EntradaEndereco): Promise<ResultadoEnfileirar> {
+  const marca = limparParte(p.marca).toUpperCase();
+  const pedido = limparParte(p.numero_pedido);
+  if (!marca || !pedido) {
+    return { ok: false, httpStatus: 400, code: 'CAMPOS_OBRIGATORIOS', erro: 'marca e numero_pedido sao obrigatorios' };
+  }
+  if (!marcaParaBrand(marca)) {
+    return {
+      ok: false, httpStatus: 400, code: 'MARCA_DESCONHECIDA',
+      erro: `marca "${marca}" nao mapeia pra nenhuma das 9 do creator (${Object.keys(MARCA_PARA_BRAND).join(', ')})`,
+    };
+  }
+
+  const cidade = limparParte(p.cidade);
+  const uf = limparParte(p.uf).toUpperCase();
+  const logradouro = limparParte(p.logradouro);
+  const cep = limparParte(p.cep);
+
+  // Barra na porta em vez de enfileirar algo condenado. A Regra 1 do creator
+  // compara SO as partes (city/state/address1/address2/zipcode) e nunca faz
+  // parse do texto composto: sem cidade+UF e sem logradouro nem CEP ela nao tem
+  // o que comparar, e o ticket morreria em ADDRESS_UNVERIFIABLE depois de
+  // esperar o pedido sair. Melhor quem chamou saber agora.
+  if (!cidade || !uf || (!logradouro && !cep)) {
+    return {
+      ok: false, httpStatus: 400, code: 'ENDERECO_INSUFICIENTE',
+      erro: 'faltam dados pra transportadora conseguir avaliar a troca: cidade e UF sao obrigatorios, mais logradouro ou CEP',
+      faltando: [
+        ...(!cidade ? ['cidade'] : []),
+        ...(!uf ? ['uf'] : []),
+        ...(!logradouro && !cep ? ['logradouro ou cep'] : []),
+      ],
+    };
+  }
+
+  const numero = limparParte(p.numero);
+  const complemento = limparParte(p.complemento);
+  const bairro = limparParte(p.bairro);
+  const pais = limparParte(p.pais) || 'BR';
+
+  // fullAddress: usa o que vier pronto; senao compoe na ordem que o creator
+  // usaria (address1, address2, address3, address4, city, state, country_code,
+  // zipcode).
+  const composto = [logradouro, numero, complemento, bairro, cidade, uf, pais, cep].filter(Boolean).join(', ');
+  const novoEndereco = limparParte(p.novo_endereco) || composto;
+
+  const linha = {
+    pedido, marca,
+    endereco_atual: limparParte(p.endereco_atual) || null,
+    novo_endereco: novoEndereco,
+    end_logradouro: logradouro || null,
+    end_numero: numero || null,
+    end_complemento: complemento || null,
+    end_bairro: bairro || null,
+    end_cidade: cidade,
+    end_uf: uf,
+    end_cep: cep || null,
+    end_pais: pais,
+    origem: limparParte(p.origem) || 'torre',
+    responsavel: limparParte(p.responsavel) || null,
+  };
+  // `status` NAO entra no corpo, de proposito - ver o comentario acima. Com
+  // merge-duplicates so as colunas presentes sao atualizadas, entao um segundo
+  // registro no mesmo pedido troca o endereco e deixa o estado da fila em paz.
+
+  const r = await fetch(
+    `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?on_conflict=pedido,marca`,
+    {
+      method: 'POST',
+      headers: headersEnderecos(env, {
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=representation',
+      }),
+      body: JSON.stringify(linha),
+    }
+  );
+  const corpo = await r.text();
+  if (!r.ok) {
+    console.error(`[enfileirarEndereco] Supabase HTTP ${r.status}: ${corpo.slice(0, 300)}`);
+    return { ok: false, httpStatus: 502, code: 'FALHA_AO_GRAVAR', erro: `HTTP ${r.status}: ${corpo.slice(0, 300)}` };
+  }
+  let rows: any[] = [];
+  try { rows = JSON.parse(corpo); } catch {}
+  const g = Array.isArray(rows) && rows.length ? rows[0] : null;
+  return {
+    ok: true,
+    id: g ? g.id : null,
+    status: g ? g.status : null,
+    jaExistia: !!(g && g.criado_em && g.atualizado_em && g.criado_em !== g.atualizado_em),
+  };
 }
 
 // ============ FILA DE TICKETS DE ENDERECO ============
@@ -5024,122 +5172,22 @@ export default {
     //    historico. Chamar a enderecos-list pra isso traria o endereco completo
     //    de cada cliente pra contar linhas, o que seria absurdo.
     // 2. PII. Contar nao precisa de endereco de cliente atravessando a rede.
-    // ============ PORTA DE ENTRADA PRA TORRE DE CONTROLE ============
-    //
-    // A Torre chama isto quando o chamarTicketsCreator dela recebe
-    // code "ORDER NO SENT" (literal, com espacos, HTTP 200, action
-    // "no_ticket_needed"): em vez de mostrar um erro morto pro agente, o pedido
-    // entra na fila e e disparado quando o pedido sair.
-    //
-    // POR QUE UM ENDPOINT E NAO O SCHEMA DA TABELA: a Torre nao precisa conhecer
-    // a chave (pedido, marca), nem a regra de nunca escrever `status` - que se
-    // violada faz a Central abrir um SEGUNDO ticket no mesmo pedido -, nem o
-    // mapeamento address1..4 do creator, onde address2 e o numero e address4 e o
-    // bairro. Um escritor so na tabela, um lugar so pra errar.
-    //
-    // Os nomes aqui sao em portugues de proposito: quem chama descreve um
-    // endereco, nao o payload de terceiro que ele vai virar.
+    // Porta HTTP pra quem estiver FORA deste worker. A Torre de Controle roda
+    // aqui dentro e chama enfileirarEndereco() direto - sem HTTP, sem URL, sem
+    // secret. Esta rota existe pro caso de o bot ou o n8n quererem usar.
     if (url.pathname === '/api/enderecos-enfileirar' && request.method === 'POST') {
       if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
       try {
         const b: any = await request.json().catch(() => ({}));
-        const txt = (v: any) => String(v == null ? '' : v).trim();
-
-        const marca = txt(b.marca).toUpperCase();
-        const pedido = txt(b.numero_pedido || b.pedido);
-        if (!marca || !pedido) {
-          return Response.json({ error: 'marca e numero_pedido sao obrigatorios', code: 'CAMPOS_OBRIGATORIOS' }, { status: 400 });
+        const res = await enfileirarEndereco(env, { ...b, origem: b.origem || 'externo' });
+        if (!res.ok) {
+          return Response.json(
+            { error: res.erro, code: res.code, ...(res.faltando ? { faltando: res.faltando } : {}) },
+            { status: res.httpStatus }
+          );
         }
-        if (!marcaParaBrand(marca)) {
-          return Response.json({
-            error: `marca "${marca}" nao mapeia pra nenhuma das 9 do creator (${Object.keys(MARCA_PARA_BRAND).join(', ')})`,
-            code: 'MARCA_DESCONHECIDA',
-          }, { status: 400 });
-        }
-
-        const cidade = txt(b.cidade);
-        const uf = txt(b.uf).toUpperCase();
-        const logradouro = txt(b.logradouro);
-        const cep = txt(b.cep);
-
-        // Barra na porta em vez de enfileirar algo condenado. A Regra 1 do
-        // creator compara SO as partes (city/state/address1/address2/zipcode) e
-        // nunca faz parse do texto composto - sem cidade+UF e sem logradouro nem
-        // CEP ela nao tem o que comparar, e o ticket morreria em
-        // ADDRESS_UNVERIFIABLE depois de esperar o pedido sair. Melhor o agente
-        // saber agora, com a tela aberta e o cliente na linha, do que a linha
-        // apodrecer na fila.
-        if (!cidade || !uf || (!logradouro && !cep)) {
-          return Response.json({
-            error: 'faltam dados pra transportadora conseguir avaliar a troca: cidade e UF sao obrigatorios, mais logradouro ou CEP',
-            code: 'ENDERECO_INSUFICIENTE',
-            faltando: [
-              ...(!cidade ? ['cidade'] : []),
-              ...(!uf ? ['uf'] : []),
-              ...(!logradouro && !cep ? ['logradouro ou cep'] : []),
-            ],
-          }, { status: 400 });
-        }
-
-        const numero = txt(b.numero);
-        const complemento = txt(b.complemento);
-        const bairro = txt(b.bairro);
-        const pais = txt(b.pais) || 'BR';
-
-        // fullAddress: usa o que vier pronto; senao compoe na ordem que o creator
-        // usaria (address1, address2, address3, address4, city, state,
-        // country_code, zipcode).
-        const composto = [logradouro, numero, complemento, bairro, cidade, uf, pais, cep]
-          .filter(Boolean).join(', ');
-        const novoEndereco = txt(b.novo_endereco || b.endereco_novo) || composto;
-
-        const linha: any = {
-          pedido, marca,
-          endereco_atual: txt(b.endereco_atual) || null,
-          novo_endereco: novoEndereco,
-          end_logradouro: logradouro || null,
-          end_numero: numero || null,
-          end_complemento: complemento || null,
-          end_bairro: bairro || null,
-          end_cidade: cidade,
-          end_uf: uf,
-          end_cep: cep || null,
-          end_pais: pais,
-          origem: 'torre',
-          responsavel: txt(b.responsavel) || null,
-        };
-        // `status` NAO entra no corpo de proposito - ver o comentario grande
-        // acima. Com merge-duplicates, so as colunas presentes sao atualizadas,
-        // entao um segundo registro no mesmo pedido troca o endereco e deixa o
-        // estado da fila em paz.
-
-        const r = await fetch(
-          `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?on_conflict=pedido,marca`,
-          {
-            method: 'POST',
-            headers: headersEnderecos(env, {
-              'Content-Type': 'application/json',
-              Prefer: 'resolution=merge-duplicates,return=representation',
-            }),
-            body: JSON.stringify(linha),
-          }
-        );
-        const corpo = await r.text();
-        if (!r.ok) {
-          console.error(`[enderecos-enfileirar] Supabase HTTP ${r.status}: ${corpo.slice(0, 300)}`);
-          return Response.json({ error: `falha ao gravar: HTTP ${r.status}`, detalhe: corpo.slice(0, 300) }, { status: 502 });
-        }
-        let rows: any[] = [];
-        try { rows = JSON.parse(corpo); } catch {}
-        const linhaGravada = Array.isArray(rows) && rows.length ? rows[0] : null;
         return Response.json({
-          ok: true,
-          id: linhaGravada ? linhaGravada.id : null,
-          status: linhaGravada ? linhaGravada.status : null,
-          // A Torre mostra isso pro agente: se ja existia, ele nao registrou em
-          // duplicidade - so atualizou o endereco.
-          jaExistia: !!(linhaGravada && linhaGravada.criado_em && linhaGravada.atualizado_em
-            && linhaGravada.criado_em !== linhaGravada.atualizado_em),
+          ok: true, id: res.id, status: res.status, jaExistia: res.jaExistia,
           mensagem: 'Pedido registrado na fila. O ticket sera aberto automaticamente quando o pedido sair.',
         });
       } catch (e: any) {
