@@ -5316,6 +5316,10 @@ export default {
         return Response.json(resultado);
       } catch (e: any) {
         console.error(`[enderecos-reconciliar] ${String((e && e.message) || e)}`);
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
     // CRON DIARIO — STATUS INTELIPOST GOCASE (21/08/2026): busca tickets_gocase
     // em aberto (nao concluido/extravio), cruza numero_nf com nfe_number na
     // pergunta salva do Metabase (card 28432, "maria-ultimo-status" - filtrada
