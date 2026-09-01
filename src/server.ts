@@ -66,9 +66,17 @@ export interface Env {
   SHOPIFY_TOKEN_BARBOURS?: string;
   SHOPIFY_TOKEN_RITUARIA?: string;
   SHOPIFY_TOKEN_APICE?: string;
-  // Destino final do ticket de logistica (CX Hub / n8n). Enquanto nao existir,
-  // o ticket fica gravado so localmente - ver /api/logistica/abrir-ticket.
-  CXHUB_TICKET_WEBHOOK?: string;
+  // REMOVIDO (01/09/2026): CXHUB_TICKET_WEBHOOK encaminhava pro CX Hub/n8n, um
+  // sistema anterior ao TicketsCreator que ele mesmo usava pra abrir tickets
+  // do lado dele. Desde que a Torre passou a chamar o TicketsCreator direto
+  // (31/08/2026, ver chamarTicketsCreator), esse encaminhamento virou codigo
+  // morto - nunca chegou a ser configurado, e o payload que ele montava
+  // (protocolo/problema/endereco_novo) nao tem nada a ver com o contrato do
+  // TicketsCreator (brand/orderId/issue/variables.correct_address). Achado
+  // reportado por um colega revisando o repo: se alguem configurasse esse
+  // secret apontando pra URL do TicketsCreator por engano, tomaria 400
+  // INVALID_PAYLOAD. As colunas "encaminhado"/"resposta_webhook" continuam na
+  // tabela (ficam sempre 0/vazio agora) pra nao exigir migracao de schema.
   // TicketsCreator (31/08/2026, a pedido da Ivna): o mesmo worker que o CX Hub
   // ja usa pra abrir tickets de verdade (cx-ticketcreator, doc real confirmada
   // pela Ivna). TICKETS_CREATOR_URL e a URL COMPLETA de destino, INCLUINDO o
@@ -1567,6 +1575,18 @@ const MARCAS_LOGISTICA: MarcaLogistica[] = [
 
 const LOG_TIMEOUT_MS = 12000;
 
+// BUG REAL (01/09/2026, primeiro teste real da Maria/agente em prod): 2 de 4
+// tickets abertos vieram com "ticket_creator_resposta: nao chamado: falha de
+// rede: The operation was aborted" - ou seja, nosso proprio AbortController
+// cortou a chamada, nao o TicketsCreator. Faz sentido: cada chamada dele faz
+// uma busca na origem (Shopify/Cosmos/Factory) MAIS uma na Intelipost antes
+// de decidir - sao dois hops externos encadeados, nao uma unica chamada
+// rapida tipo Supabase (o que LOG_TIMEOUT_MS foi calibrado pra cobrir). Os
+// outros 2 tickets, que completaram dentro de 12s, devolveram resposta real
+// (ESCALATE_TO_HUMAN) normalmente - o problema e so timeout curto demais, nao
+// o payload nem a integracao em si.
+const TICKETS_CREATOR_TIMEOUT_MS = 30000;
+
 function getMarcaLogistica(id: string): MarcaLogistica | null {
   const alvo = (id || '').trim().toLowerCase();
   return MARCAS_LOGISTICA.find((m) => m.id === alvo) || null;
@@ -2241,7 +2261,7 @@ async function postarTicketsCreator(env: Env, payload: Record<string, any>): Pro
       },
       body: JSON.stringify(payload),
     },
-    LOG_TIMEOUT_MS
+    TICKETS_CREATOR_TIMEOUT_MS
   );
   const resposta = await r.json().catch(async () => ({ raw: (await r.text().catch(() => '')).slice(0, 500) }));
   return { status: r.status, resposta };
@@ -2774,15 +2794,12 @@ export default {
         const protocolo = 'LOG-' + Date.now().toString(36).toUpperCase();
         const criadoEm = new Date().toISOString();
 
-        // ENCAMINHAMENTO PRO DESTINO REAL (CX Hub / n8n): fica DESLIGADO enquanto
-        // o secret CXHUB_TICKET_WEBHOOK nao existir. Foi feito assim de proposito
-        // - nao da pra inventar o endpoint de um sistema de producao que eu nunca
-        // vi. Sem o secret, o ticket e gravado localmente (env.DB) e a tela avisa
-        // que ficou em rascunho. Com o secret configurado, o mesmo payload e
-        // encaminhado e a resposta fica registrada em resposta_webhook.
-        const webhook = (env as any).CXHUB_TICKET_WEBHOOK;
-        let encaminhado = 0;
-        let respostaWebhook = '';
+        // encaminhado/respostaWebhook: sempre 0/'' agora - ver comentario grande
+        // em CXHUB_TICKET_WEBHOOK (Env interface) sobre por que esse
+        // encaminhamento foi removido. Colunas mantidas so pra nao exigir
+        // migracao de schema.
+        const encaminhado = 0;
+        const respostaWebhook = '';
         const payload = {
           protocolo,
           marca: body.marca,
@@ -2817,20 +2834,6 @@ export default {
           email_enviado: body.email_enviado ? 1 : 0,
           email_resposta: String(body.email_resposta || '').slice(0, 500),
         };
-
-        if (webhook) {
-          try {
-            const r = await fetchComTimeout(webhook, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload),
-            }, LOG_TIMEOUT_MS);
-            encaminhado = r.ok ? 1 : 0;
-            respostaWebhook = `HTTP ${r.status}: ${(await r.text().catch(() => '')).slice(0, 300)}`;
-          } catch (e: any) {
-            respostaWebhook = 'falha: ' + String((e && e.message) || e);
-          }
-        }
 
         // TICKETS CREATOR (31/08/2026): destino real do ticket - ver
         // chamarTicketsCreator (fica desligado ate TICKETS_CREATOR_URL existir).
@@ -2871,7 +2874,6 @@ export default {
           ok: true,
           protocolo,
           encaminhado: !!encaminhado,
-          destino: webhook ? 'webhook configurado' : 'rascunho local (CXHUB_TICKET_WEBHOOK nao configurado)',
           resposta_webhook: respostaWebhook,
           ticket_creator: {
             chamado: ticketCreator.chamado,
