@@ -39,6 +39,12 @@ export interface Env {
   GMAIL_CLIENT_ID_GOCASE_AGENTES?: string;
   GMAIL_CLIENT_SECRET_GOCASE_AGENTES?: string;
   GMAIL_REFRESH_TOKEN_GOCASE_AGENTES?: string;
+  // Metabase - usado so pelo cron /api/atualizar-status-intelipost (21/08/2026).
+  // Usa a pergunta salva 28432 ("maria-ultimo-status") via /api/card/:id/query -
+  // mais simples que SQL solto, reusa o que a Maria ja validou no Metabase.
+  INTELIPOST_METABASE_URL?: string; // ex: https://metabase.gocase.com.br
+  INTELIPOST_METABASE_CARD_ID?: string; // id da pergunta salva, ex: "28432"
+  INTELIPOST_METABASE_API_KEY?: string; // header x-api-key
   // Torre de Controle Logistica (17/08/2026) - uma chave Intelipost e um token
   // Shopify por marca. Ficam como secrets do app (nunca no codigo): varias
   // marcas compartilham a mesma chave Intelipost hoje, mas manter uma entrada
@@ -63,6 +69,22 @@ export interface Env {
   // Destino final do ticket de logistica (CX Hub / n8n). Enquanto nao existir,
   // o ticket fica gravado so localmente - ver /api/logistica/abrir-ticket.
   CXHUB_TICKET_WEBHOOK?: string;
+  // TicketsCreator (31/08/2026, a pedido da Ivna): o mesmo worker que o CX Hub
+  // ja usa pra abrir tickets de verdade (cx-ticketcreator, doc real confirmada
+  // pela Ivna). TICKETS_CREATOR_URL e a URL COMPLETA de destino, INCLUINDO o
+  // path "/gogroup-tickets-clind" - a Torre nao completa nenhum path sozinha:
+  //   prod:    https://cx-ticketcreator-prod.rpa-ia.workers.dev/gogroup-tickets-clind
+  //   staging: https://cx-ticketcreator-staging.rpa-ia.workers.dev/gogroup-tickets-clind
+  // (staging e "seguro" pra testar: o worker so redireciona e-mail/automacao
+  // de transportadora/chat pra sandbox quando STAGE=staging do lado dele -
+  // consultas reais de pedido continuam acontecendo). TICKETS_CREATOR_WEBHOOK_SECRET
+  // e o valor de WEBHOOK_SECRET daquele worker (Infisical) - exigido no header
+  // x-webhook-secret. Fica DESLIGADO enquanto TICKETS_CREATOR_URL nao existir
+  // - ver chamarTicketsCreator. Configurados em central-tickets-teste (appId
+  // c6da9f74) apontando pra STAGING em 31/08/2026 - trocar pra prod so depois
+  // de validar um pedido real de cada sistema (Gocase/Apice/Cosmos).
+  TICKETS_CREATOR_URL?: string;
+  TICKETS_CREATOR_WEBHOOK_SECRET?: string;
   // GOCASE (24/08/2026): usa a Intelipost real (INTELIPOST_KEY_GOCASE acima)
   // pro rastreio, mas o pedido (NF/CPF/endereco/itens - papel da Shopify pras
   // outras marcas) ainda vem do ERP "Factory" via API do Metabase
@@ -100,6 +122,19 @@ const TITAN_SB_KEY = 'sb_publishable_CPF6bT_HC0jkTvYWnxHmDg_61qaWqSQ';
 function titanHeaders() {
   return { apikey: TITAN_SB_KEY, Authorization: `Bearer ${TITAN_SB_KEY}`, 'Content-Type': 'application/json' };
 }
+
+// UNILOG CD - abertura automatica (31/08/2026): Worker Cloudflare PERMANENTE
+// (fora do GoDeploy de proposito - GoDeploy nao expoe binding de Browser
+// Rendering pros apps que hospeda), publicado direto na conta RPA Gogroup via
+// wrangler. Preenche o formulario publico real da Unilog (Bitrix24) e clica
+// Enviar de verdade - ver comentario grande UNILOG CD abaixo e o codigo em
+// unilog_cf_abertura/src/index.ts. Timeout bem mais alto que o resto dos
+// fetches deste arquivo porque abrir um browser real + preencher varios
+// campos + comboboxes leva bem mais que os ~150ms tipicos de uma chamada
+// Supabase - confirmado por teste real levando ate ~40s.
+const UNILOG_WORKER_URL = 'https://unilog-cf-abertura.rpa-ia.workers.dev';
+const UNILOG_WORKER_TIMEOUT_MS = 150000;
+
 
 const AI_PROXY_URL = 'https://ai-proxy.gogroupbr.com/v1/chat/completions';
 const AI_PROXY_MODEL = 'gpt-5.4-mini';
@@ -1367,8 +1402,30 @@ async function buscarTicketsProxy(tabela: string, opts: OpcoesListaTickets): Pro
       encodeURIComponent('"Número do pedido"') + '.ilike.' + encodeURIComponent(padrao),
       'subject.ilike.' + encodeURIComponent(padrao),
     ].join(',')})&order=id.asc&limit=500`;
-    const r = await fetch(url, { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } });
-    if (!r.ok) throw new Error(`Supabase HTTP ${r.status}`);
+    const r = await fetchComTimeout(
+      url,
+      { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } },
+      // FIX ERRO 500 NA BUSCA POR TERMO (21/08/2026, achado real em producao -
+      // Maria reportou "Erro ao buscar: Supabase HTTP 500" buscando "SH58"):
+      // buscarTicketsProxy com opts.termo faz ILIKE '%termo%' (wildcard nos dois
+      // lados, nao usa indice btree) em 3 colunas ao mesmo tempo, sem filtro de
+      // data. Em tickets_gocase (88k linhas) o EXPLAIN ANALYZE mediu 6.36s de
+      // Seq Scan - estoura o statement_timeout da role anon do Supabase (erro
+      // Postgres 57014), que o PostgREST devolve como HTTP 500. Ja existiam
+      // indices trigram GIN (idx_tickets_<tabela>_numero_nf_trgm, _pedido_trgm,
+      // _subject_trgm, extensao pg_trgm) criados nesta mesma correcao - com
+      // eles a mesma query cai pra ~2ms. Este timeout de 12s aqui e so uma rede
+      // de seguranca (ex.: se os indices forem removidos futuramente por engano
+      // ou o volume crescer muito de novo), pra nao deixar a requisicao pendurada
+      // esperando o timeout do proprio browser.
+      12000
+    );
+    if (!r.ok) {
+      const errBody = await r.text().catch(() => '');
+      const msg = `Supabase HTTP ${r.status}${errBody ? `: ${errBody.slice(0, 300)}` : ''}`;
+      console.error(`[tickets-list termo="${opts.termo}" tabela=${tabela}] ${msg}`);
+      throw new Error(msg);
+    }
     return r.json();
   }
   // FIX TIMEOUT (12/08/2026, achado real em producao - Maria reportou erro
@@ -1513,6 +1570,25 @@ const LOG_TIMEOUT_MS = 12000;
 function getMarcaLogistica(id: string): MarcaLogistica | null {
   const alvo = (id || '').trim().toLowerCase();
   return MARCAS_LOGISTICA.find((m) => m.id === alvo) || null;
+}
+
+// BUG REAL achado 31/08/2026 (auditoria de campos a pedido da Ivna): o
+// payload que o formulario da Torre manda pra /api/logistica/abrir-ticket usa
+// "marca" = f.marca = d.marca.nome, o NOME DE EXIBICAO ("Rituária", "Gocase",
+// "Apice"...) - nunca o id minusculo ("rituaria", "gocase", "apice") que o
+// TicketsCreator exige (comparacao exata, sem normalizar acento/caixa - ver
+// GOCASE_BRAND/APICE_BRAND/ORGANIZATION_ID_BY_BRAND no worker). Sem esse
+// resolvedor, TODO ticket aberto pela Torre (nao so pelas marcas Gobeaute)
+// cairia em UNSUPPORTED_SLICE porque nenhuma marca bate exatamente. Aceita
+// tanto o id minusculo (se algum chamador futuro ja mandar certo) quanto o
+// nome de exibicao atual, e cai pra minusculo puro se nao achar nenhum dos
+// dois - nunca lanca erro, so faz o melhor esforco.
+const MARCA_ID_POR_NOME = new Map(MARCAS_LOGISTICA.map((m) => [m.nome.toLowerCase(), m.id]));
+function resolverMarcaTicketCreator(valor: string): string {
+  const v = (valor || '').trim();
+  const porId = getMarcaLogistica(v);
+  if (porId) return porId.id;
+  return MARCA_ID_POR_NOME.get(v.toLowerCase()) ?? v.toLowerCase();
 }
 
 // Descobre a marca pelo proprio numero do pedido quando o agente deixa o
@@ -1791,6 +1867,18 @@ function normalizarIntelipost(node: any): any {
   for (const evento of timeline) {
     const pod = evento.anexos.find((a: any) => a.tipo === 'POD' && a.url);
     if (pod) { comprovanteEntrega = { ...pod, data_evento: evento.data, hora_evento: evento.hora }; break; }
+  }
+  // FALLBACK (01/09/2026, bug real reportado pela Ivna - pedido J&T Express):
+  // nem toda transportadora marca o anexo do canhoto com tipo exatamente
+  // "POD" - a timeline ja mostra "📎 anexo" pra QUALQUER anexo do evento (ver
+  // index.html, coluna Status), entao o comprovante nao pode exigir esse tipo
+  // exato. Se nao achou por POD, usa o primeiro anexo do proprio evento de
+  // ENTREGA (nunca de outro evento, pra nao pegar uma foto de tentativa
+  // anterior/devolucao e chamar de "comprovante de entrega").
+  if (!comprovanteEntrega) {
+    const eventoEntrega = timeline.find((e: any) => e.status === 'Entregue');
+    const anexo = eventoEntrega && eventoEntrega.anexos.find((a: any) => a.url);
+    if (anexo) comprovanteEntrega = { ...anexo, data_evento: eventoEntrega.data, hora_evento: eventoEntrega.hora };
   }
 
   const produtos = (Array.isArray(vol.products) ? vol.products : []).map((p: any) => ({
@@ -2082,6 +2170,12 @@ async function initTicketsLogisticaTable(env: Env): Promise<void> {
     // so um deep link - ver gerarUrlGoogleMaps no frontend).
     'endereco_novo TEXT',
     'maps_url TEXT',
+    // TICKETS CREATOR (31/08/2026) - guarda se a chamada real foi feita e o
+    // que ela respondeu, pro mesmo motivo das colunas de e-mail acima:
+    // registrar o resultado de verdade, nao so "encaminhado: sim/nao".
+    'ticket_creator_chamado INTEGER DEFAULT 0',
+    'ticket_creator_status INTEGER',
+    'ticket_creator_resposta TEXT',
   ];
   for (const coluna of novasColunas) {
     try {
@@ -2089,6 +2183,125 @@ async function initTicketsLogisticaTable(env: Env): Promise<void> {
     } catch {
       /* coluna ja existe */
     }
+  }
+}
+
+// TICKETS CREATOR (31/08/2026, a pedido da Ivna): destino real do ticket de
+// logistica - o MESMO worker (cx-ticketcreator-prod) que o CX Hub ja usa hoje
+// pra abrir tickets, via POST /gogroup-tickets-clind. Fica desligado (retorna
+// chamado:false) enquanto TICKETS_CREATOR_URL nao for configurado - mesmo
+// motivo do CXHUB_TICKET_WEBHOOK acima: nao da pra inventar a URL de um
+// sistema de producao que a Ivna nao me mostrou.
+//
+// Mapeamento problema -> issue: os nomes NAO sao identicos - a Torre usa
+// "Alterar Endereço"/"Barra Entrega", o TicketsCreator espera "Endereço
+// Errado"/"barra_entrega" (ver SUPPORTED_ISSUES no worker). "Acareação" e
+// "Pedido Atrasado" sao iguais nos dois lados.
+const ISSUE_TICKET_CREATOR_POR_PROBLEMA: Record<string, string> = {
+  'Acareação': 'Acareação',
+  'Pedido Atrasado': 'Pedido Atrasado',
+  'Alterar Endereço': 'Endereço Errado',
+  'Barra Entrega': 'barra_entrega',
+  'Avaria': 'Avaria',
+  'Extravio': 'Extravio',
+};
+
+// orderId: o TicketsCreator NAO aceita um id interno - ele mesmo busca o
+// pedido no sistema de origem de cada marca (Cosmos pras 6 Gobeaute com
+// Shopify + Apice via middleware proprio, ERP Factory pra Gocase). Usamos
+// numero_pedido (o mesmo valor que a Torre ja resolveu via Shopify/Factory)
+// por ser o unico identificador que a Torre tem hoje pra qualquer marca.
+//
+// FORMATO CONFIRMADO CONTRA O BANCO REAL DO COSMOS (31/08/2026, via Metabase
+// Gobeaute, database "Cosmos" id 38, tabela public.orders): o external_id que
+// o TicketsCreator usa pra buscar bate exatamente com o numero_pedido da Torre
+// (ex. "SH1197825RT") NA MAIORIA dos casos - mas ~208k/276k/13k/752/31 pedidos
+// das organizacoes 3/4/5/6/8 (Lescent/Kokeshi/BySamia/Aua/Barbours - NAO
+// Rituaria, que nao tem nenhum caso) guardam external_id com um sufixo
+// "#SHOPIFY" que o numero_pedido da Torre nao carrega. NAO e um corte por data
+// (pedidos com e sem sufixo aparecem misturados ao longo de quase 1 ano) mas E
+// raro nos ultimos 30 dias (0-2 casos por marca na consulta feita) - por isso
+// o caminho principal manda sem sufixo, e so tenta de novo COM "#SHOPIFY" se o
+// TicketsCreator responder ESCALATE_TO_HUMAN (o sinal exato de "nao achei esse
+// external_id" - ver CosmosOrderNotFoundError no worker) numa marca Gobeaute.
+const MARCAS_TICKET_CREATOR_COSMOS_SEM_APICE = new Set(['lescent', 'kokeshi', 'bysamia', 'aua', 'barbours', 'rituaria']);
+
+async function postarTicketsCreator(env: Env, payload: Record<string, any>): Promise<{ status: number; resposta: any }> {
+  // TICKETS_CREATOR_URL e a URL COMPLETA pra onde postar (ex. o webhook do
+  // n8n confirmado pela Ivna: https://n8n-.../webhook/gogroup-tickets-clind,
+  // ou uma variante prod dele) - nao completamos mais nenhum path aqui, pra
+  // nao assumir que e sempre a URL crua do worker + "/gogroup-tickets-clind".
+  const r = await fetchComTimeout(
+    env.TICKETS_CREATOR_URL!,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(env.TICKETS_CREATOR_WEBHOOK_SECRET ? { 'x-webhook-secret': env.TICKETS_CREATOR_WEBHOOK_SECRET } : {}),
+      },
+      body: JSON.stringify(payload),
+    },
+    LOG_TIMEOUT_MS
+  );
+  const resposta = await r.json().catch(async () => ({ raw: (await r.text().catch(() => '')).slice(0, 500) }));
+  return { status: r.status, resposta };
+}
+
+async function chamarTicketsCreator(
+  env: Env,
+  params: { marca: string; problema: string; numeroPedido: string; enderecoNovo?: string }
+): Promise<{ chamado: boolean; status: number | null; resposta: any; motivo?: string; retentativaComSufixoShopify?: boolean }> {
+  if (!env.TICKETS_CREATOR_URL) {
+    return { chamado: false, status: null, resposta: null, motivo: 'TICKETS_CREATOR_URL nao configurado' };
+  }
+  const issue = ISSUE_TICKET_CREATOR_POR_PROBLEMA[params.problema];
+  if (!issue) {
+    return { chamado: false, status: null, resposta: null, motivo: `sem mapeamento de issue pra "${params.problema}"` };
+  }
+  if (!params.numeroPedido) {
+    return { chamado: false, status: null, resposta: null, motivo: 'numero_pedido vazio' };
+  }
+
+  const variables: Record<string, any> = {};
+  if (issue === 'Endereço Errado' && params.enderecoNovo) {
+    // fullAddress e o unico campo que resolveFullAddress() aceita sem
+    // precisar dos sub-campos estruturados (address1/city/state/...) que a
+    // Torre nao coleta separadamente - o worker usa isso direto no e-mail
+    // pra transportadora e pula so a validacao extra de "endereco plausivel"
+    // (que exige city/state estruturados), sem bloquear a abertura.
+    variables.correct_address = { fullAddress: params.enderecoNovo };
+  }
+  // executed_by (31/08/2026, a pedido da Ivna): identifica o SISTEMA que
+  // chamou, nao o agente individual - "Central Tickets" fixo, igual aos
+  // outros chamadores do TicketsCreator (bot, CX Hub, etc.). O nome do agente
+  // continua so em tickets_logistica.responsavel (uso interno da Torre).
+  variables.executed_by = 'Central Tickets';
+
+  const payloadBase = {
+    brand: params.marca,
+    issue,
+    callerType: 'agent',
+    ...(Object.keys(variables).length ? { variables } : {}),
+  };
+
+  try {
+    let { status, resposta } = await postarTicketsCreator(env, { ...payloadBase, orderId: params.numeroPedido });
+    let retentativa = false;
+    const numeroJaTemSufixo = params.numeroPedido.toUpperCase().includes('#SHOPIFY');
+    if (
+      resposta?.status === 'ESCALATE_TO_HUMAN' &&
+      MARCAS_TICKET_CREATOR_COSMOS_SEM_APICE.has(params.marca) &&
+      !numeroJaTemSufixo
+    ) {
+      retentativa = true;
+      ({ status, resposta } = await postarTicketsCreator(env, {
+        ...payloadBase,
+        orderId: params.numeroPedido + '#SHOPIFY',
+      }));
+    }
+    return { chamado: true, status, resposta, retentativaComSufixoShopify: retentativa };
+  } catch (e: any) {
+    return { chamado: false, status: null, resposta: null, motivo: 'falha de rede: ' + String((e && e.message) || e) };
   }
 }
 
@@ -2352,6 +2565,7 @@ async function torreBuscarNaMarca(env: any, marca: MarcaLogistica, termo: string
   };
 }
 
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -2404,6 +2618,30 @@ export default {
           candidatas = [m];
         } else {
           candidatas = tipo === 'pedido' ? inferirMarcasPorPedido(termo) : MARCAS_LOGISTICA;
+        }
+
+        // Contexto do toggle da sidebar (Gobeaute x Gocase - 31/08/2026, a
+        // pedido da Ivna): sem isso, "Detectar automaticamente" ou uma
+        // inferencia por sufixo podia achar um pedido da OUTRA conta mesmo
+        // com o toggle numa marca especifica - ex. buscar "sh1099815RT" com o
+        // toggle em Gocase ainda encontrava a Rituaria, porque
+        // inferirMarcasPorPedido nunca olha pro toggle, so pro sufixo do
+        // termo. Restringe candidatas ao contexto ANTES de tentar qualquer
+        // marca, nao so filtra o resultado depois.
+        const contexto = (url.searchParams.get('contexto') || '').trim().toLowerCase();
+        if (contexto === 'gocase') {
+          candidatas = candidatas.filter((m) => m.id === 'gocase');
+        } else if (contexto === 'gobeaute') {
+          candidatas = candidatas.filter((m) => m.id !== 'gocase');
+        }
+        if (!candidatas.length) {
+          return Response.json({
+            encontrado: false,
+            termo,
+            tipo_busca: tipo,
+            marcas_tentadas: [],
+            error: `Nenhuma marca do contexto atual (${contexto || 'auto'}) corresponde a esse termo.`,
+          }, { status: 404 });
         }
 
         const tentadas: string[] = [];
@@ -2524,7 +2762,7 @@ export default {
     if (url.pathname === '/api/logistica/abrir-ticket' && request.method === 'POST') {
       try {
         const body: any = await request.json().catch(() => ({}));
-        const problemasValidos = ['Acareação', 'Pedido Atrasado', 'Alterar Endereço', 'Barra Entrega'];
+        const problemasValidos = ['Acareação', 'Pedido Atrasado', 'Alterar Endereço', 'Barra Entrega', 'Avaria', 'Extravio'];
         const problema = String(body.problema || '');
         if (!problemasValidos.includes(problema)) {
           return Response.json({ error: `problema invalido. Validos: ${problemasValidos.join(', ')}` }, { status: 400 });
@@ -2594,21 +2832,39 @@ export default {
           }
         }
 
+        // TICKETS CREATOR (31/08/2026): destino real do ticket - ver
+        // chamarTicketsCreator (fica desligado ate TICKETS_CREATOR_URL existir).
+        const ticketCreator = await chamarTicketsCreator(env, {
+          marca: resolverMarcaTicketCreator(body.marca),
+          problema,
+          numeroPedido: body.numero_pedido,
+          enderecoNovo: body.endereco_novo,
+        });
+        // Sucesso real = action:"ticket_created" no corpo - o worker devolve
+        // HTTP 200 tambem pra "ja existe"/"nao precisa"/"escalar pra humano",
+        // entao status<400 sozinho NAO distingue ticket aberto de rejeitado.
+        const ticketCreatorEncaminhado = ticketCreator.chamado && ticketCreator.resposta?.action === 'ticket_created' ? 1 : 0;
+        const ticketCreatorResposta = ticketCreator.chamado
+          ? `HTTP ${ticketCreator.status}${ticketCreator.retentativaComSufixoShopify ? ' (retentativa c/ #SHOPIFY)' : ''}: ${JSON.stringify(ticketCreator.resposta).slice(0, 500)}`
+          : `nao chamado: ${ticketCreator.motivo}`;
+
         await env.DB.exec(
           `INSERT INTO tickets_logistica
              (protocolo, marca, numero_pedido, numero_nf, problema, transportadora, codigo_rastreio,
               previsao_entrega, dias_atraso, destinatario, observacao, responsavel, encaminhado,
               resposta_webhook, criado_em, cpf_destinatario, chave_danfe, plp_intelipost,
               romaneio_transportadora, endereco_entrega, email_para, email_assunto, email_enviado,
-              email_resposta, endereco_novo, maps_url, email_cc, email_bcc)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              email_resposta, endereco_novo, maps_url, email_cc, email_bcc,
+              ticket_creator_chamado, ticket_creator_status, ticket_creator_resposta)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           [protocolo, payload.marca, payload.numero_pedido, payload.numero_nf, problema, payload.transportadora,
            payload.codigo_rastreio, payload.previsao_entrega, payload.dias_atraso, payload.destinatario,
            payload.observacao, payload.responsavel, encaminhado, respostaWebhook, criadoEm,
            payload.cpf_destinatario, payload.chave_danfe, payload.plp_intelipost,
            payload.romaneio_transportadora, payload.endereco_entrega, payload.email_para,
            payload.email_assunto, payload.email_enviado, payload.email_resposta,
-           payload.endereco_novo, payload.maps_url, payload.email_cc, payload.email_bcc]
+           payload.endereco_novo, payload.maps_url, payload.email_cc, payload.email_bcc,
+           ticketCreatorEncaminhado, ticketCreator.status, ticketCreatorResposta]
         );
 
         return Response.json({
@@ -2617,6 +2873,14 @@ export default {
           encaminhado: !!encaminhado,
           destino: webhook ? 'webhook configurado' : 'rascunho local (CXHUB_TICKET_WEBHOOK nao configurado)',
           resposta_webhook: respostaWebhook,
+          ticket_creator: {
+            chamado: ticketCreator.chamado,
+            encaminhado: !!ticketCreatorEncaminhado,
+            status: ticketCreator.status,
+            resposta: ticketCreator.resposta,
+            motivo: ticketCreator.motivo,
+            retentativa_com_sufixo_shopify: !!ticketCreator.retentativaComSufixoShopify,
+          },
         });
       } catch (e: any) {
         return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
@@ -2647,6 +2911,95 @@ export default {
       }
     }
 
+    // ---- Unilog CD: preenche e envia a ocorrencia de verdade no formulario
+    // publico real da Unilog, via o Worker unilog_cf_abertura (ver
+    // UNILOG_WORKER_URL acima). Grava o rascunho em ocorrencias_unilog
+    // (mesmo Supabase/TITAN_SB_URL/titanHeaders que infos_titan ja usa, NAO
+    // o D1/env.DB deste app - mesmo motivo do comentario grande UNILOG CD
+    // logo abaixo: um processo fora do GoDeploy pode precisar ler isso sem
+    // sessao logada) ANTES de chamar o Worker, pra manter um registro mesmo
+    // se o envio falhar ou travar no meio.
+    if (url.pathname === '/api/logistica/unilog-ocorrencia' && request.method === 'POST') {
+      try {
+        const body: any = await request.json().catch(() => ({}));
+        const payloadWorker = {
+          cnpj: String(body.cnpj || ''),
+          nome_agente: String(body.nome_agente || ''),
+          telefone: String(body.telefone || ''),
+          email: String(body.email || ''),
+          tipo_ocorrencia: String(body.tipo_ocorrencia || ''),
+          especificacao: String(body.especificacao || ''),
+          endereco_entrega: String(body.endereco_entrega || ''),
+          numero_nf: String(body.numero_nf || ''),
+          numero_pedido: String(body.numero_pedido || ''),
+          descricao: String(body.descricao || ''),
+          anexos: Array.isArray(body.anexos) ? body.anexos : [],
+          enviar: true,
+        };
+        if (!payloadWorker.cnpj) return Response.json({ error: 'cnpj obrigatorio (campo obrigatorio no formulario real da Unilog)' }, { status: 400 });
+        if (!payloadWorker.numero_nf) return Response.json({ error: 'numero_nf obrigatorio (campo obrigatorio no formulario real da Unilog)' }, { status: 400 });
+        if (!payloadWorker.tipo_ocorrencia) return Response.json({ error: 'tipo_ocorrencia obrigatorio' }, { status: 400 });
+        if (!payloadWorker.especificacao) return Response.json({ error: 'especificacao obrigatoria' }, { status: 400 });
+        if (!payloadWorker.descricao) return Response.json({ error: 'descricao obrigatoria' }, { status: 400 });
+
+        const protocolo = 'UNI-' + Date.now().toString(36).toUpperCase();
+        await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/ocorrencias_unilog`, {
+          method: 'POST',
+          headers: { ...titanHeaders(), Prefer: 'return=minimal' },
+          body: JSON.stringify({
+            protocolo,
+            marca: String(body.marca || ''),
+            numero_pedido: payloadWorker.numero_pedido || null,
+            numero_nf: payloadWorker.numero_nf || null,
+            cnpj: payloadWorker.cnpj || null,
+            nome_agente: payloadWorker.nome_agente || null,
+            telefone: payloadWorker.telefone || null,
+            email: payloadWorker.email || null,
+            tipo_ocorrencia: payloadWorker.tipo_ocorrencia,
+            especificacao: payloadWorker.especificacao,
+            descricao: payloadWorker.descricao,
+            endereco_entrega: payloadWorker.endereco_entrega || null,
+            anexos: payloadWorker.anexos,
+            status: 'enviando',
+          }),
+        }, LOG_TIMEOUT_MS).catch(() => {});
+
+        let resultadoWorker: any = {};
+        try {
+          const rWorker = await fetchComTimeout(UNILOG_WORKER_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payloadWorker),
+          }, UNILOG_WORKER_TIMEOUT_MS);
+          resultadoWorker = await rWorker.json().catch(() => ({ sucesso: false, erro: 'resposta do worker nao e JSON valido' }));
+        } catch (e: any) {
+          resultadoWorker = { sucesso: false, erro: `falha ao chamar o worker de abertura: ${String(e?.message || e)}` };
+        }
+
+        const enviado = !!resultadoWorker.enviado;
+        const motivoErro = enviado ? null : String(resultadoWorker.erro || resultadoWorker.motivo_nao_enviado || 'falha desconhecida');
+        await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/ocorrencias_unilog?protocolo=eq.${encodeURIComponent(protocolo)}`, {
+          method: 'PATCH',
+          headers: { ...titanHeaders(), Prefer: 'return=minimal' },
+          body: JSON.stringify({
+            status: enviado ? 'enviado' : 'erro',
+            enviado_em: enviado ? new Date().toISOString() : null,
+            erro_envio: motivoErro,
+          }),
+        }, LOG_TIMEOUT_MS).catch(() => {});
+
+        return Response.json({
+          protocolo,
+          enviado,
+          erro: motivoErro,
+          etapas: resultadoWorker.etapas || [],
+          screenshot_base64: resultadoWorker.screenshot_base64 || null,
+        });
+      } catch (e: any) {
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
     // ---- Torre de Controle: tickets de logistica ja registrados aqui ----
     if (url.pathname === '/api/logistica/tickets-abertos' && request.method === 'GET') {
       try {
@@ -2660,6 +3013,7 @@ export default {
         return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
       }
     }
+
 
     if (url.pathname === '/api/debug-fetch-tickets-timing' && request.method === 'GET') {
       if (!autorizado(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
@@ -3192,7 +3546,15 @@ export default {
         const rows = await ticketsListComCache(env, tabela, { termo, ini, fim, statusExato, heuristicaExtravio });
         return Response.json(rows);
       } catch (e: any) {
-        return Response.json({ __error: String((e && e.message) || e) });
+        // FIX OBSERVABILIDADE (21/08/2026): antes essa rota devolvia
+        // Response.json({ __error }) com status 200, entao qualquer falha
+        // (timeout do Supabase, coluna invalida, etc.) aparecia como
+        // "outcome: ok" nos logs do GoDeploy - nada disparava como erro,
+        // dificultando o diagnostico. Agora loga de verdade e devolve
+        // status 500, mantendo o campo __error pro frontend continuar
+        // funcionando igual.
+        console.error(`[tickets-list] erro: ${String((e && e.message) || e)}`);
+        return Response.json({ __error: String((e && e.message) || e) }, { status: 500 });
       }
     }
 
@@ -3610,6 +3972,130 @@ export default {
         await salvarRegrasNegocio(env, conteudo, updatedBy);
         return Response.json({ ok: true });
       } catch (e: any) {
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
+    // CRON DIARIO — STATUS INTELIPOST GOCASE (21/08/2026): busca tickets_gocase
+    // em aberto (nao concluido/extravio), cruza numero_nf com nfe_number na
+    // pergunta salva do Metabase (card 28432, "maria-ultimo-status" - filtrada
+    // por public.orders, ultimos 45 dias), grava public.orders.delivery_state
+    // como "Último Status". Precisa de 3 secrets (INTELIPOST_METABASE_URL,
+    // INTELIPOST_METABASE_CARD_ID, INTELIPOST_METABASE_API_KEY) que AINDA NAO
+    // foram configurados - sem eles a rota devolve 501 com o que falta, em vez de
+    // rodar e nao fazer nada silenciosamente. Ver conversa com a Maria 21/08/2026.
+    if (url.pathname === '/api/atualizar-status-intelipost' && request.method === 'POST') {
+      if (!autorizado(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      try {
+        const faltando: string[] = [];
+        if (!env.INTELIPOST_METABASE_URL) faltando.push('INTELIPOST_METABASE_URL');
+        if (!env.INTELIPOST_METABASE_CARD_ID) faltando.push('INTELIPOST_METABASE_CARD_ID');
+        if (!env.INTELIPOST_METABASE_API_KEY) faltando.push('INTELIPOST_METABASE_API_KEY');
+        if (faltando.length) {
+          return Response.json(
+            { error: `secrets nao configurados: ${faltando.join(', ')}. Configura em Settings > Secrets do app e roda de novo.` },
+            { status: 501 }
+          );
+        }
+
+        // 1. Busca tickets_gocase em aberto dos ultimos 30 dias com numero_nf
+        const rTickets = await fetch(
+          `${SB_URL}/rest/v1/tickets_gocase?select=numero_nf&numero_nf=not.is.null` +
+            `&or=(Status_resposta_tickets.is.null,Status_resposta_tickets.eq.aguardando)` +
+            `&data_email=gte.${encodeURIComponent(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())}`,
+          { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
+        );
+        if (!rTickets.ok) {
+          const t = await rTickets.text().catch(() => '');
+          throw new Error(`Supabase (buscar tickets) HTTP ${rTickets.status}: ${t.slice(0, 300)}`);
+        }
+        const ticketsRows: any[] = await rTickets.json();
+        const numerosNfAbertos = new Set(ticketsRows.map((t) => String(t.numero_nf || '').trim()).filter(Boolean));
+
+        // 2. Roda a pergunta salva do Metabase (card 28432) - ela ja vem filtrada
+        // por periodo (ultimos 45 dias) e so com as 3 colunas que precisamos.
+        const rMeta = await fetch(
+          `${env.INTELIPOST_METABASE_URL}/api/card/${env.INTELIPOST_METABASE_CARD_ID}/query`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': env.INTELIPOST_METABASE_API_KEY!,
+            },
+            body: JSON.stringify({}),
+          }
+        );
+        if (!rMeta.ok) {
+          const t = await rMeta.text().catch(() => '');
+          throw new Error(`Metabase HTTP ${rMeta.status}: ${t.slice(0, 300)}`);
+        }
+        const dataMeta: any = await rMeta.json();
+        const cols = (dataMeta.data && dataMeta.data.cols) || [];
+        const rows = (dataMeta.data && dataMeta.data.rows) || [];
+        const nomesColunas = cols.map((c: any) => c.name);
+
+        // Mantem so a linha mais recente (maior updated_at) por nfe_number, e so
+        // pros NFs que de fato tem ticket em aberto agora - evita atualizar coisa
+        // fora do escopo aprovado.
+        const maisRecentePorNf = new Map<string, { delivery_state: string; updated_at: string }>();
+        for (const linha of rows) {
+          const obj: any = {};
+          nomesColunas.forEach((nome: string, idx: number) => { obj[nome] = linha[idx]; });
+          const nf = obj.nfe_number ? String(obj.nfe_number).trim() : '';
+          if (!nf || !obj.delivery_state || !numerosNfAbertos.has(nf)) continue;
+          const atual = maisRecentePorNf.get(nf);
+          if (!atual || new Date(obj.updated_at) > new Date(atual.updated_at)) {
+            maisRecentePorNf.set(nf, { delivery_state: String(obj.delivery_state), updated_at: obj.updated_at });
+          }
+        }
+
+        // 3. Agrupa por status e grava em lote no Supabase
+        const nfsPorStatus = new Map<string, string[]>();
+        for (const [nf, info] of maisRecentePorNf) {
+          if (!nfsPorStatus.has(info.delivery_state)) nfsPorStatus.set(info.delivery_state, []);
+          nfsPorStatus.get(info.delivery_state)!.push(nf);
+        }
+
+        let totalAtualizados = 0;
+        const erros: string[] = [];
+        for (const [status, nfs] of nfsPorStatus) {
+          for (let i = 0; i < nfs.length; i += 1500) {
+            const bloco = nfs.slice(i, i + 1500);
+            const listaFiltro = bloco.map((nf) => encodeURIComponent(nf)).join(',');
+            const rUpdate = await fetch(
+              `${SB_URL}/rest/v1/tickets_gocase?numero_nf=in.(${listaFiltro})` +
+                `&or=(Status_resposta_tickets.is.null,Status_resposta_tickets.eq.aguardando)` +
+                `&data_email=gte.${encodeURIComponent(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())}`,
+              {
+                method: 'PATCH',
+                headers: {
+                  apikey: SB_KEY,
+                  Authorization: `Bearer ${SB_KEY}`,
+                  'Content-Type': 'application/json',
+                  Prefer: 'return=minimal',
+                },
+                body: JSON.stringify({ 'Último Status': status, updated_at: new Date().toISOString() }),
+              }
+            );
+            if (!rUpdate.ok) {
+              const t = await rUpdate.text().catch(() => '');
+              erros.push(`status "${status}" bloco ${i}: HTTP ${rUpdate.status} ${t.slice(0, 200)}`);
+              continue;
+            }
+            totalAtualizados += bloco.length;
+          }
+        }
+
+        return Response.json({
+          ticketsAbertosEncontrados: ticketsRows.length,
+          numerosNfAbertosDistintos: numerosNfAbertos.size,
+          linhasRecebidasDoMetabase: rows.length,
+          nfsComStatusEncontrado: maisRecentePorNf.size,
+          totalAtualizados,
+          erros,
+        });
+      } catch (e: any) {
+        console.error('[atualizar-status-intelipost] erro:', String((e && e.message) || e));
         return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
       }
     }
