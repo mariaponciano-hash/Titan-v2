@@ -2564,6 +2564,48 @@ function cosmosLerStatus(env: Env, pedido: any): { campo: string | null; valor: 
 }
 
 
+
+// ---- Registro do ultimo lote ----
+//
+// POR QUE ISSO EXISTE: a rota do cron responde HTTP 200 mesmo quando o lote
+// falha, de proposito - medido em 26/08/2026 que 5xx faz o cron do GoDeploy
+// reexecutar a cada 30s, e nenhuma das falhas possiveis melhora com retry.
+// Só que isso criou um painel que mente: entre 26/08 e 01/09 o cron rodou ~140
+// vezes reportando status=200 / outcome ok enquanto TODAS as execucoes morriam
+// em "column proxima_tentativa_em does not exist". O erro existia no
+// console.error, mas ninguem olha log de hora em hora.
+//
+// Entao o desfecho do lote passa a ser gravado e devolvido pra tela. A falha
+// aparece onde alguem olha, sem voltar pro laco de 30s.
+async function initUltimoLoteTable(env: Env): Promise<void> {
+  await env.DB.exec(`CREATE TABLE IF NOT EXISTS enderecos_ultimo_lote (k TEXT PRIMARY KEY, v TEXT)`, []);
+}
+
+// NUNCA lanca: se gravar o diagnostico falhar, o erro original e que importa e
+// nao pode ser mascarado por uma falha no registro dele.
+async function registrarUltimoLote(env: Env, payload: any): Promise<void> {
+  try {
+    await initUltimoLoteTable(env);
+    await env.DB.exec(
+      `INSERT INTO enderecos_ultimo_lote (k, v) VALUES ('ultimo', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+      [JSON.stringify({ em: new Date().toISOString(), ...payload })]
+    );
+  } catch (e: any) {
+    console.error(`[enderecos] falhou ao registrar o resultado do lote: ${String((e && e.message) || e)}`);
+  }
+}
+
+async function lerUltimoLote(env: Env): Promise<any | null> {
+  try {
+    await initUltimoLoteTable(env);
+    const res = await env.DB.query(`SELECT v FROM enderecos_ultimo_lote WHERE k = ?`, ['ultimo']);
+    if (!res.rows || !res.rows.length) return null;
+    return JSON.parse(res.rows[0].v);
+  } catch {
+    return null;
+  }
+}
+
 // ---- Middleware V1: o caminho da Apice ----
 //
 // A Apice nao esta no Cosmos (confirmado por tres vias independentes: o resolver
@@ -4574,6 +4616,9 @@ export default {
           // agente achar que criou ticket de verdade.
           temSecretCreator: !!env.TICKET_WEBHOOK_SECRET,
           issueType: TICKET_ISSUE_TYPE_ENDERECO,
+          // Diagnostico do cron. Sem isso, lote falhando de hora em hora nao
+          // aparece em nenhum lugar que alguem olhe.
+          ultimoLote: await lerUltimoLote(env),
         });
       } catch (e: any) {
         console.error(`[enderecos-list] ${String((e && e.message) || e)}`);
@@ -4589,6 +4634,13 @@ export default {
         // tres caminhos da tela sem depender do creator.
         const mock = url.searchParams.get('mock');
         const resultado = await processarLoteEnderecos(env, limit, mock);
+        await registrarUltimoLote(env, {
+          ok: true,
+          fila: resultado.fila, criados: resultado.criados,
+          aindaAguardando: resultado.aindaAguardando, bloqueados: resultado.bloqueados,
+          precisamHumano: resultado.precisamHumano, comErro: resultado.comErro,
+          resgatadas: resultado.resgatadas, mock: resultado.mock,
+        });
         return Response.json({ ok: true, ...resultado });
       } catch (e: any) {
         // 200 mesmo em falha, DE PROPOSITO. Medido em 26/08/2026: quando esta
@@ -4599,6 +4651,7 @@ export default {
         // busca do pedido na origem mais uma na Intelipost. O erro vai no corpo
         // e no console.error - visivel, sem virar tempestade.
         console.error(`[enderecos-processar] ${String((e && e.message) || e)}`);
+        await registrarUltimoLote(env, { ok: false, erro: String((e && e.message) || e).slice(0, 500) });
         return Response.json({ ok: false, error: String((e && e.message) || e) });
       }
     }

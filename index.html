@@ -5021,6 +5021,44 @@ var TICKET_STATUS_LABEL = {
   manual:     'precisa de pessoa (sem automacao)'
 };
 
+
+// Banner de saude do cron. Cobre DOIS modos de falha que antes eram invisiveis:
+// o lote que roda e falha (ok:false) e o lote que parou de rodar (registro
+// velho). O segundo importa porque um cron desabilitado ou apagado nao deixa
+// rastro nenhum - a tela simplesmente ficaria parada parecendo saudavel.
+var LOTE_ATRASO_ALERTA_MS = 3 * 60 * 60 * 1000;
+
+function bannerUltimoLote(ul) {
+  if (!ul) {
+    return '<div class="alert alert-error" style="margin-bottom:12px">'
+      + '<strong>O lote nunca rodou.</strong> Nenhum registro de execução — '
+      + 'o cron pode não estar configurado, ou nunca chegou a completar.</div>';
+  }
+  var quando = horaCurta(ul.em);
+  var idadeMs = ul.em ? (Date.now() - new Date(ul.em).getTime()) : null;
+  var velho = idadeMs !== null && idadeMs > LOTE_ATRASO_ALERTA_MS;
+
+  if (ul.ok === false) {
+    return '<div class="alert alert-error" style="margin-bottom:12px">'
+      + '<strong>O último lote falhou</strong> (' + escEnd(quando) + '): '
+      + escEnd(String(ul.erro || 'sem detalhe')) + '</div>';
+  }
+  var resumo = escEnd(ul.criados || 0) + ' criado(s), '
+    + escEnd(ul.aindaAguardando || 0) + ' aguardando, '
+    + escEnd(ul.comErro || 0) + ' com erro'
+    + (ul.resgatadas ? ', ' + escEnd(ul.resgatadas) + ' resgatada(s)' : '');
+  if (velho) {
+    var horas = Math.floor(idadeMs / 3600000);
+    return '<div class="alert alert-error" style="margin-bottom:12px">'
+      + '<strong>O lote não roda há ' + horas + 'h.</strong> Último sucesso em '
+      + escEnd(quando) + ' (' + resumo + '). O cron deveria rodar de hora em hora — '
+      + 'vale checar se está habilitado.</div>';
+  }
+  return '<div class="alert alert-success" style="margin-bottom:12px">'
+    + 'Último lote em ' + escEnd(quando) + ': ' + resumo
+    + (ul.mock ? ' <strong>(mock: ' + escEnd(ul.mock) + ')</strong>' : '') + '</div>';
+}
+
 function enderecoPill(status) {
   var cor = ENDERECO_STATUS_COR[status] || ['var(--gray-bg)', 'var(--gray)'];
   var lbl = ENDERECO_STATUS_LABEL[status] || status || '—';
@@ -5081,7 +5119,8 @@ function renderEnderecosTopo(data) {
     + 'O secret do cx-ticketcreator (TICKET_WEBHOOK_SECRET) nao esta configurado, entao nenhum ticket '
     + 'e criado de verdade - os disparos abaixo sao simulados. Configure o secret para valer.</div>';
 
-  el.innerHTML = avisoMock
+  el.innerHTML = bannerUltimoLote(data.ultimoLote)
+    + avisoMock
     + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px">'
     + todos + chips
     + '<div style="flex:1"></div>'
