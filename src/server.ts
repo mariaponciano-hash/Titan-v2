@@ -2530,15 +2530,29 @@ async function cosmosBuscarPedido(env: Env, orgId: string, orderId: string): Pro
   const limpo = String(orderId || '').replace(/^#/, '').trim();
   const org = encodeURIComponent(orgId);
 
-  const busca = await fetchComTimeout(
-    `${base}/api/v3/organizations/${org}/orders?external_id=${encodeURIComponent(limpo)}&page=1&per_page=1`,
-    { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } },
-    COSMOS_TIMEOUT_MS
-  );
-  if (busca.status === 404) return null;
-  if (!busca.ok) throw new Error(`cosmos: busca HTTP ${busca.status}`);
-  const bd: any = await busca.json();
-  const lista: any[] = Array.isArray(bd) ? bd : (bd && (bd.orders || bd.data)) || [];
+  // SUFIXO "#SHOPIFY" (achado da Ivna, no chamarTicketsCreator da Torre): parte
+  // dos pedidos das marcas Cosmos guarda o external_id com esse sufixo, que o
+  // numero do pedido nao carrega. Nao e corte por data - aparece misturado ao
+  // longo de quase um ano, e e raro nos ultimos 30 dias, mas existe. Sem a
+  // segunda tentativa a busca nao acha o pedido, o gate devolve 'desconhecido' e
+  // para de gatear justamente esses casos - sem errar a resposta, mas em
+  // silencio, que e o modo de falha que a gente vem evitando.
+  const tentar = async (externalId: string) => {
+    const r = await fetchComTimeout(
+      `${base}/api/v3/organizations/${org}/orders?external_id=${encodeURIComponent(externalId)}&page=1&per_page=1`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } },
+      COSMOS_TIMEOUT_MS
+    );
+    if (r.status === 404) return [];
+    if (!r.ok) throw new Error(`cosmos: busca HTTP ${r.status}`);
+    const d: any = await r.json();
+    return (Array.isArray(d) ? d : (d && (d.orders || d.data)) || []) as any[];
+  };
+
+  let lista = await tentar(limpo);
+  if (!lista.length && !limpo.toUpperCase().includes('#SHOPIFY')) {
+    lista = await tentar(limpo + '#SHOPIFY');
+  }
   if (!lista.length) return null;
   const cosmosId = lista[0] && lista[0].id;
   if (cosmosId == null) throw new Error('cosmos: resultado de busca sem id');
