@@ -4164,8 +4164,13 @@ export default {
         // torreAbrirTicket), nem tenta o creator - trata como se ele tivesse
         // respondido "ORDER NO SENT" corretamente, o que a logica de fila
         // logo abaixo ja sabe tratar.
+        // intelipost_conhece_pedido !== true (nao so === false) de proposito:
+        // aba antiga em cache (frontend anterior ao 62105d3) nao manda o
+        // campo, e ausente nao e a mesma coisa que "Intelipost conhece" -
+        // tratar os dois como "nao sei" e mandar pra fila e mais seguro do
+        // que arriscar cair no caminho velho (chamar o creator direto).
         const pularCreatorPorGateQuebrado =
-          problema === 'Alterar Endereço' && body.intelipost_conhece_pedido === false;
+          problema === 'Alterar Endereço' && body.intelipost_conhece_pedido !== true;
         const ticketCreator: { chamado: boolean; status: number | null; resposta: any; motivo?: string; retentativaComSufixoShopify?: boolean } =
           pularCreatorPorGateQuebrado
             ? {
