@@ -2944,7 +2944,7 @@ async function middlewareV1BuscarPedido(env: Env, ecomId: string, orderId: strin
   return reg;
 }
 
-async function pedidoSaiuPeloMiddlewareV1(env: Env, ecomId: string, row: any): Promise<{ veredito: StatusPedido; detalhe: string }> {
+async function pedidoSaiuPeloMiddlewareV1(env: Env, ecomId: string, row: any): Promise<VereditoGate> {
   let reg: any;
   try {
     reg = await middlewareV1BuscarPedido(env, ecomId, row.pedido);
@@ -2952,23 +2952,36 @@ async function pedidoSaiuPeloMiddlewareV1(env: Env, ecomId: string, row: any): P
     return { veredito: 'desconhecido', detalhe: `middleware v1 indisponivel: ${String((e && e.message) || e)}` };
   }
   if (!reg) {
-    return { veredito: 'desconhecido', detalhe: `pedido ${row.pedido} nao esta no middleware v1 (pode ser inexistente ou ainda nao exportado)` };
+    return { veredito: 'desconhecido', fonte: 'middleware_v1', detalhe: `pedido ${row.pedido} nao esta no middleware v1 (pode ser inexistente ou ainda nao exportado)` };
   }
+  const carrierMw = String(reg.carrier_name || reg.carrier || '').trim() || undefined;
   // Mesmo motivo do 'delivered' no Cosmos: pedido entregue nao tem endereco pra
   // alterar. No Middleware V1 o sinal e o delivered_at preenchido.
+  const base = { fonte: 'middleware_v1', carrier: carrierMw };
   if (reg.delivered_at) {
-    return { veredito: 'morto', detalhe: `entregue em ${String(reg.delivered_at).slice(0, 10)}` };
+    return { ...base, veredito: 'morto', statusOrigem: 'delivered', detalhe: `entregue em ${String(reg.delivered_at).slice(0, 10)}` };
   }
   const st = String(reg.status || '').trim().toLowerCase();
-  if (!st) return { veredito: 'desconhecido', detalhe: 'registro sem campo status' };
-  if (st === MIDDLEWARE_V1_STATUS_SAIU) return { veredito: 'sim', detalhe: `status=${st}` };
-  if (MIDDLEWARE_V1_STATUS_NAO_SAIU.indexOf(st) !== -1) return { veredito: 'nao', detalhe: `status=${st}` };
+  if (!st) return { ...base, veredito: 'desconhecido', detalhe: 'registro sem campo status' };
+  if (st === MIDDLEWARE_V1_STATUS_SAIU) return { ...base, veredito: 'sim', statusOrigem: st, detalhe: `status=${st}` };
+  if (MIDDLEWARE_V1_STATUS_NAO_SAIU.indexOf(st) !== -1) return { ...base, veredito: 'nao', statusOrigem: st, detalhe: `status=${st}` };
   // Valor novo: nao chuta. Segue pra criacao e deixa o creator decidir - mesma
   // logica de lista invertida usada no Cosmos.
-  return { veredito: 'desconhecido', detalhe: `status desconhecido "${st}" - deixando o creator decidir` };
+  return { ...base, veredito: 'desconhecido', statusOrigem: st, detalhe: `status desconhecido "${st}" - deixando o creator decidir` };
 }
 
 type StatusPedido = 'sim' | 'nao' | 'morto' | 'desconhecido';
+
+// O gate devolve tambem o que LEU e de ONDE, nao so a conclusao. Sem isso, uma
+// linha que virou `criado` num pedido nao despachado fica inexplicavel depois -
+// foi exatamente o que aconteceu em 01/09 e eu nao consegui reconstruir.
+interface VereditoGate {
+  veredito: StatusPedido;
+  detalhe: string;
+  fonte?: string;        // cosmos | middleware_v1 | nenhuma
+  statusOrigem?: string; // o valor cru: waiting, sent, in_transit...
+  carrier?: string;      // transportadora, quando a origem informa
+}
 
 // 'sim'          -> saiu: pode chamar a criacao
 // 'nao'          -> confirmadamente ainda nao saiu: nao gasta chamada do creator
@@ -2977,7 +2990,7 @@ type StatusPedido = 'sim' | 'nao' | 'morto' | 'desconhecido';
 //                   Cosmos fora, campo de status nao identificado). Segue pra
 //                   criacao e deixa o creator decidir - a alternativa seria
 //                   travar a fila por limitacao nossa.
-async function pedidoEstaSent(env: Env, row: any): Promise<{ veredito: StatusPedido; detalhe: string }> {
+async function pedidoEstaSent(env: Env, row: any): Promise<VereditoGate> {
   const brandPre = marcaParaBrand(row.marca);
   // Marca que vai pelo Middleware V1 nao depende do Cosmos estar configurado.
   if (!cosmosConfigurado(env)) {
@@ -2993,7 +3006,7 @@ async function pedidoEstaSent(env: Env, row: any): Promise<{ veredito: StatusPed
     // inconclusivo e o creator decide.
     const ecomId = brand ? middlewareV1Ids(env)[brand] : null;
     if (ecomId) return pedidoSaiuPeloMiddlewareV1(env, ecomId, row);
-    return { veredito: 'desconhecido', detalhe: `marca ${row.marca} sem fonte de status configurada (nem Cosmos nem Middleware V1)` };
+    return { veredito: 'desconhecido', fonte: 'nenhuma', detalhe: `marca ${row.marca} sem fonte de status configurada (nem Cosmos nem Middleware V1)` };
   }
   let pedido: any;
   try {
@@ -3005,18 +3018,26 @@ async function pedidoEstaSent(env: Env, row: any): Promise<{ veredito: StatusPed
     return { veredito: 'desconhecido', detalhe: `pedido ${row.pedido} nao encontrado no Cosmos (org ${orgId})` };
   }
 
+  // transportadora: o pedido do Cosmos traz carrier.name (ex. "J&T"), que e a
+  // informacao que decide se a Regra 1 vai aceitar a alteracao.
+  const carrierCosmos = String(
+    (pedido && pedido.carrier && pedido.carrier.name) ||
+    (pedido && pedido.shipping && pedido.shipping.service_name) || ''
+  ).trim() || undefined;
+  const baseCosmos = { fonte: 'cosmos', carrier: carrierCosmos };
+
   const { campo, valor } = cosmosLerStatus(env, pedido);
   if (!valor) {
-    return { veredito: 'desconhecido', detalhe: 'nao achei campo de status no pedido do Cosmos - use /api/enderecos-cosmos-debug e fixe COSMOS_CAMPO_STATUS' };
+    return { ...baseCosmos, veredito: 'desconhecido', detalhe: 'nao achei campo de status no pedido do Cosmos - use /api/enderecos-cosmos-debug e fixe COSMOS_CAMPO_STATUS' };
   }
   if (COSMOS_ESTADOS_MORTOS.indexOf(valor) !== -1) {
-    return { veredito: 'morto', detalhe: `${campo}=${valor}` };
+    return { ...baseCosmos, veredito: 'morto', statusOrigem: valor, detalhe: `${campo}=${valor}` };
   }
   const naoEnviado = (env.COSMOS_ESTADOS_NAO_ENVIADO
     ? String(env.COSMOS_ESTADOS_NAO_ENVIADO).split(',')
     : COSMOS_ESTADOS_NAO_ENVIADO_PADRAO).map((x) => x.trim().toLowerCase()).filter(Boolean);
-  if (naoEnviado.indexOf(valor) !== -1) return { veredito: 'nao', detalhe: `${campo}=${valor}` };
-  return { veredito: 'sim', detalhe: `${campo}=${valor}` };
+  if (naoEnviado.indexOf(valor) !== -1) return { ...baseCosmos, veredito: 'nao', statusOrigem: valor, detalhe: `${campo}=${valor}` };
+  return { ...baseCosmos, veredito: 'sim', statusOrigem: valor, detalhe: `${campo}=${valor}` };
 }
 
 
@@ -3546,14 +3567,24 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
   const brandDaLinha = marcaParaBrand(row.marca);
   const temFonteDeStatus = cosmosConfigurado(env)
     || !!(brandDaLinha && middlewareV1Ids(env)[brandDaLinha]);
+  let gateGravado: any = {};
   if (!mock && temFonteDeStatus) {
     const g = await pedidoEstaSent(env, row);
+    // Persistido em TODOS os caminhos, inclusive quando libera. Antes so o "nao"
+    // deixava rastro, e por isso um `criado` indevido ficava sem explicacao.
+    gateGravado = {
+      gate_veredito: g.veredito,
+      gate_status_origem: g.statusOrigem || null,
+      gate_fonte: g.fonte || null,
+      gate_visto_em: new Date().toISOString(),
+      ...(g.carrier ? { carrier: g.carrier } : {}),
+    };
     if (g.veredito === 'nao') {
       // Nao gastou chamada do creator. Volta pra fila com o mesmo backoff.
       await enderecoAtualizar(env, row.id, {
+        ...gateGravado,
         status: 'aguardando',
         ultimo_code: 'COSMOS_NAO_ENVIADO',
-        delivery_status: g.detalhe.split('=')[1] || null,
         status_visto_em: new Date().toISOString(),
         disparado_em: null,
         proxima_tentativa_em: new Date(Date.now() + ENDERECO_BACKOFF_NAO_ENVIADO_MS).toISOString(),
@@ -3563,6 +3594,7 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
     }
     if (g.veredito === 'morto') {
       await enderecoAtualizar(env, row.id, {
+        ...gateGravado,
         status: 'nao_se_aplica',
         ultimo_code: 'COSMOS_PEDIDO_MORTO',
         status_visto_em: new Date().toISOString(),
@@ -3592,7 +3624,15 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
     resultado = { desfecho: 'erro', code: null, detalhe: String((e && e.message) || e) };
   }
 
-  const comum = { tentativas, ultimo_code: resultado.code, atualizado_em: new Date().toISOString() };
+  const comum = {
+    ...gateGravado,
+    tentativas,
+    ultimo_code: resultado.code,
+    // Guardado tambem no sucesso: e a unica evidencia de POR QUE o creator
+    // aceitou. Sem isso, ticket aberto indevidamente fica inauditavel.
+    resposta_creator: String(resultado.detalhe || '').slice(0, 800),
+    atualizado_em: new Date().toISOString(),
+  };
 
   if (resultado.desfecho === 'criado') {
     await enderecoAtualizar(env, row.id, {
@@ -3621,8 +3661,10 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
     // Nao conta como falha - e "ainda nao deu a hora". Volta pra fila com
     // backoff, sem incrementar nada que leve ao teto de tentativas.
     await enderecoAtualizar(env, row.id, {
+      ...gateGravado,
       status: 'aguardando',
       ultimo_code: resultado.code,
+      resposta_creator: String(resultado.detalhe || '').slice(0, 800),
       disparado_em: null,
       proxima_tentativa_em: new Date(Date.now() + ENDERECO_BACKOFF_NAO_ENVIADO_MS).toISOString(),
       ultimo_erro: null, ultimo_erro_em: null,

@@ -5957,6 +5957,10 @@ function codeEmPortugues(c) { return CODE_EM_PORTUGUES[c] || c || ''; }
 
 // Status de entrega que vem no corpo da criacao (data.delivery_status).
 var ENTREGA_EM_PORTUGUES = {
+  waiting:            'Aguardando no CD',
+  ready_for_shipping: 'Pronto para envio',
+  imported:           'Importado, nao saiu',
+  sent:               'Despachado',
   created:          'Pronto para envio',
   in_transit:       'Em transito',
   out_for_delivery: 'Saiu para entrega',
@@ -6177,9 +6181,10 @@ function renderEnderecosLista(data) {
       : 'A fila esta vazia. O bot alimenta esta tabela quando um cliente pede troca de endereco.') + '</p></div>';
     return;
   }
-  var head = '<div class="t-head" style="grid-template-columns:110px 90px 1fr 1fr 130px 150px 110px">'
+  var head = '<div class="t-head" style="grid-template-columns:110px 84px 1fr 1fr 132px 104px 128px 138px 96px">'
     + '<span>Pedido</span><span>Marca</span><span>Endereco atual</span><span>Novo endereco</span>'
-    + '<span>Nossa fila</span><span>Ticket no creator</span><span></span></div>';
+    + '<span>Nossa fila</span><span>Status na origem</span><span>Transportadora</span>'
+    + '<span>Ticket no creator</span><span></span></div>';
 
   var corpo = rows.map(function(r) {
     // 'bloqueado' NAO ganha botao: a Regra 1 do creator recusou e redisparar
@@ -6226,23 +6231,36 @@ function renderEnderecosLista(data) {
         + ';border-radius:4px;padding:6px 9px;font-size:11px;margin-top:4px">' + selo
         + escEnd(String(r.ultimo_erro).slice(0, 400)) + motivo + '</div>'
       : '';
+    // A resposta do creator aparece na linha quando existe - e a evidencia de
+    // por que ele aceitou ou recusou, e antes ela nao ia pra tela nenhuma.
+    var respLinha = r.resposta_creator
+      ? '<div style="grid-column:1/-1;background:var(--surface);color:var(--ink-3);border-radius:4px;'
+        + 'padding:5px 9px;font-size:10px;margin-top:3px" class="mono">creator: '
+        + escEnd(String(r.resposta_creator).slice(0, 300)) + '</div>'
+      : '';
     if (r.ultimo_code && r.ultimo_erro) {
       selo = '<span class="mono" style="background:var(--white);border:1px solid currentColor;border-radius:3px;'
         + 'padding:0 4px;margin-right:6px" title="' + escEnd(codeEmPortugues(r.ultimo_code)) + '">'
         + escEnd(r.ultimo_code) + '</span>';
     }
-    return '<div class="t-row-wrap"><div class="t-row" style="grid-template-columns:110px 90px 1fr 1fr 130px 150px 110px;cursor:default">'
+    return '<div class="t-row-wrap"><div class="t-row" style="grid-template-columns:110px 84px 1fr 1fr 132px 104px 128px 138px 96px;cursor:default">'
       + '<div class="mono" style="font-size:11px;font-weight:600">' + escEnd(r.pedido) + '</div>'
       + '<div><span class="t-marca">' + escEnd(r.marca) + '</span></div>'
       + '<div style="font-size:11px;color:var(--ink-2)">' + escEnd(r.endereco_atual || '—') + '</div>'
       + '<div style="font-size:11px;font-weight:600">' + escEnd(r.novo_endereco || '—') + '</div>'
       + '<div>' + enderecoPill(r.status) + '</div>'
+      + '<div style="font-size:11px">' + (r.gate_status_origem
+          ? '<span style="background:var(--cyan-bg);color:var(--cyan);padding:1px 5px;border-radius:3px;font-weight:600">'
+            + escEnd(entregaEmPortugues(r.gate_status_origem)) + '</span>'
+            + (r.gate_fonte ? '<div style="color:var(--ink-4);font-size:10px">' + escEnd(r.gate_fonte) + '</div>' : '')
+          : '<span style="color:var(--ink-4)">nao consultado</span>') + '</div>'
+      + '<div style="font-size:11px">' + (r.carrier ? escEnd(r.carrier) : '<span style="color:var(--ink-4)">—</span>') + '</div>'
       + '<div>' + ticketCel + '</div>'
       + '<div>' + (podeCriar
           ? '<button class="btn-resp" style="padding:5px 9px;font-size:10px" onclick="criarTicketEnderecoManual(\''
             + escEnd(r.id) + '\',this)">' + (r.status === 'aguardando' ? 'Criar ticket' : 'Redisparar') + '</button>'
           : '') + '</div>'
-      + infoLinha + erroLinha + '</div></div>';
+      + infoLinha + erroLinha + respLinha + '</div></div>';
   }).join('');
 
   el.innerHTML = '<div class="ticket-table">' + head + corpo + '</div>';
