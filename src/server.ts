@@ -3635,9 +3635,16 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
   };
 
   if (resultado.desfecho === 'criado') {
+    // `criado` significa "NOS abrimos o ticket agora" - so ADDRESS_TICKET_CREATED.
+    // TICKET_EXISTS e TICKET_COMPLETED sao o creator dizendo que JA HAVIA ticket
+    // pra esse par (reference + issue_type), e nesses casos a Central nao criou
+    // nada. Antes os tres viravam `criado`, e a tela anunciava "Ticket criado"
+    // num caso em que nao houve criacao - foi isso que fez a Maria estranhar,
+    // com razao, um ticket em pedido nao despachado.
+    const jaHavia = resultado.code === 'TICKET_EXISTS' || resultado.code === 'TICKET_COMPLETED';
     await enderecoAtualizar(env, row.id, {
       ...comum,
-      status: 'criado',
+      status: jaHavia ? 'ja_existia' : 'criado',
       ticket_reference: resultado.reference || row.ticket_reference || null,
       ticket_id: resultado.ticketId != null ? resultado.ticketId : row.ticket_id,
       ticket_status: resultado.ticketStatus || null,
@@ -3652,7 +3659,9 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
       ultimo_erro: null, ultimo_erro_em: null,
     });
     return {
-      ...base, acao: 'ticket criado', code: resultado.code,
+      ...base,
+      acao: jaHavia ? 'ja existia ticket no creator' : 'ticket criado',
+      code: resultado.code,
       reference: resultado.reference, deliveryStatus: resultado.deliveryStatus,
     };
   }
@@ -3749,6 +3758,7 @@ async function processarLoteEnderecos(env: Env, limit: number, mock?: string | n
     redisparos: paraRedisparo.length,
     resgatadas: presas.length,
     criados: conta('ticket criado'),
+    jaExistiam: conta('ja existia'),
     aindaAguardando: conta('pedido ainda nao enviado'),
     bloqueados: conta('bloqueado'),
     precisamHumano: conta('precisa de pessoa'),
@@ -3768,7 +3778,8 @@ async function processarLoteEnderecos(env: Env, limit: number, mock?: string | n
 // sinal de que algo se perdeu no meio.
 async function reconciliarEnderecos(env: Env, limit: number): Promise<any> {
   const rows = await enderecoBuscar(env, { limit });
-  const alvo = rows.filter((r: any) => r.ticket_reference && (r.status === 'criado' || r.status === 'precisa_humano'));
+  const alvo = rows.filter((r: any) => r.ticket_reference
+    && (r.status === 'criado' || r.status === 'ja_existia' || r.status === 'precisa_humano'));
   let atualizados = 0;
   let divergentes = 0;
   const semReference = rows.filter((r: any) => !r.ticket_reference && r.status === 'criado').length;
@@ -3786,7 +3797,7 @@ async function reconciliarEnderecos(env: Env, limit: number): Promise<any> {
           });
           atualizados++;
         }
-      } else if (row.status === 'criado') {
+      } else if (row.status === 'criado' || row.status === 'ja_existia') {
         divergentes++;
         detalhes.push({ pedido: row.pedido, reference: row.ticket_reference, problema: 'marcamos criado mas o creator devolveu exists:false' });
         await enderecoAtualizar(env, row.id, {

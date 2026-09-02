@@ -6024,6 +6024,7 @@ var ENDERECO_STATUS_LABEL = {
   precisa_humano: 'Precisa de pessoa',
   disparando:    'Disparando...',
   criado:        'Ticket criado',
+  ja_existia:    'Ja havia ticket',
   erro:          'Erro',
   esgotado:      'Esgotado',
   nao_se_aplica: 'Nao se aplica'
@@ -6035,6 +6036,7 @@ var ENDERECO_STATUS_COR = {
   precisa_humano: ['var(--purple-bg)', 'var(--purple)'],
   disparando:    ['var(--blue-bg)',   'var(--blue)'],
   criado:        ['var(--green-bg)',  'var(--green)'],
+  ja_existia:    ['var(--cyan-bg)',   'var(--cyan)'],
   erro:          ['var(--red-bg)',    'var(--red)'],
   esgotado:      ['var(--purple-bg)', 'var(--purple)'],
   nao_se_aplica: ['var(--gray-bg)',   'var(--gray)']
@@ -6153,7 +6155,7 @@ function renderEnderecosTopo(data) {
   var el = document.getElementById('end-topo');
   if (!el) return;
   var ps = data.porStatus || {};
-  var ordem = ['aguardando', 'precisa_humano', 'bloqueado', 'erro', 'esgotado', 'sem_fonte_de_status', 'disparando', 'criado', 'nao_se_aplica'];
+  var ordem = ['aguardando', 'precisa_humano', 'bloqueado', 'erro', 'esgotado', 'sem_fonte_de_status', 'disparando', 'criado', 'ja_existia', 'nao_se_aplica'];
   var chips = ordem.filter(function(s) { return ps[s]; }).map(function(s) {
     var ativo = enderecoFiltroStatus === s;
     return '<button onclick="setEnderecoFiltro(\'' + s + '\')" style="border:1px solid ' + (ativo ? 'var(--blue)' : 'var(--border-2)')
