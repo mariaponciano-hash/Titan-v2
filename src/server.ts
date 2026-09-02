@@ -3813,9 +3813,27 @@ async function processarLoteEnderecos(env: Env, limit: number, mock?: string | n
     // Uma linha que estoura (ex.: schema atras do codigo) NAO pode derrubar o
     // lote inteiro - as outras seguem, e o erro dela aparece no resultado.
     try {
-      resultado.push(await enderecoProcessarLinha(env, row, mock));
+      const r = await enderecoProcessarLinha(env, row, mock);
+      resultado.push(r);
+      // UMA LINHA DE LOG POR PEDIDO (02/09/2026).
+      //
+      // O corpo da resposta do lote nao vai pra log nenhum: quando o cron roda,
+      // a plataforma so registra o status HTTP e a duracao. Isso deixou o lote
+      // cego - passei tres tentativas tentando explicar um ticket indevido sem
+      // conseguir, porque o unico registro do que aconteceu era a propria
+      // tabela, e ela nao guardava o veredito do gate.
+      //
+      // De proposito NAO tem endereco aqui: numero de pedido, marca, veredito e
+      // desfecho bastam pra auditar, e log de endereco de cliente e dado
+      // pessoal parado num lugar que nao precisa dele.
+      console.log(
+        `[enderecos] ${r.pedido} (${r.marca}) gate=${r.cosmos || '-'} `
+        + `code=${r.code || '-'} -> ${r.acao || '-'}`
+      );
     } catch (e: any) {
-      resultado.push({ id: row.id, pedido: row.pedido, marca: row.marca, acao: 'erro - falha ao processar', erro: String((e && e.message) || e) });
+      const msg = String((e && e.message) || e);
+      resultado.push({ id: row.id, pedido: row.pedido, marca: row.marca, acao: 'erro - falha ao processar', erro: msg });
+      console.log(`[enderecos] ${row.pedido} (${row.marca}) ESTOUROU: ${msg}`);
     }
   }
 
