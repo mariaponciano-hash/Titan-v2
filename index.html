@@ -654,15 +654,23 @@ textarea.fluxo-node-texto.field-input{flex:1;min-height:44px;resize:vertical}
   </style>
 </head>
 <body>
-<div class="app-shell">
+<div id="marca-select-screen" style="display:none;position:fixed;inset:0;z-index:1000;background:var(--surface);align-items:center;justify-content:center;font-family:'Poppins',sans-serif">
+  <div style="text-align:center;max-width:440px;padding:2rem">
+    <img src="data:image/png;base64,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" style="width:56px;height:56px;border-radius:12px;background:var(--blue);padding:8px;margin-bottom:1rem">
+    <div style="font-size:20px;font-weight:700;color:var(--ink);margin-bottom:.35rem">Central de Tickets</div>
+    <div style="font-size:13px;color:var(--ink-3);margin-bottom:2rem">Selecione a marca para continuar</div>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+      <button type="button" onclick="escolherMarcaInicial('gobeaute')" style="min-width:150px;padding:16px 22px;border-radius:14px;border:1.5px solid var(--border-2);background:var(--white);color:var(--ink);font-size:14px;font-weight:700;font-family:'Poppins',sans-serif;cursor:pointer;text-transform:uppercase;letter-spacing:.03em">Gobeaute</button>
+      <button type="button" onclick="escolherMarcaInicial('gocase')" style="min-width:150px;padding:16px 22px;border-radius:14px;border:1.5px solid var(--border-2);background:var(--white);color:var(--ink);font-size:14px;font-weight:700;font-family:'Poppins',sans-serif;cursor:pointer;text-transform:uppercase;letter-spacing:.03em">Gocase</button>
+    </div>
+  </div>
+</div>
+<div class="app-shell" id="app-shell">
   <aside class="sidebar">
     <div class="sidebar-brand">
       <div class="sidebar-brand-row"><img class="sidebar-mark" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADcAAABACAYAAAC+/O8/AAAQ8UlEQVRo3u2ae3BeZZ3HP7/nvLdc3iS0TZM2TSlIWUhaKVYgpRUQkeKKSpIiKrKooI7S1t3RXZ1FHGFm167DrgNFWETXBXWHW9J2BKuVXSy3BBmqpfQi1zZp0qRtSpM0b/JezvPbP55z3tzbBFzdcfqbOfPOec85z/P7Pr/L87s8cJJO0kn6U5L8XwxaXbfm+LPpiHsFq9Dx/Pr/n+Cql60ZZnh4XA+IBJeHIHk4ig/4CFkUH8GO/L699Y8D9B2Bq14WSMgx5gEFQCEQDUa3KDnABlc4p8mDdvc5YAhIKZIRcQO2t7wzkG8LXHXdGhBQoyJWEkASJQZkgRSQdgyLHSvSCeb3gFiwKHFAEY4Bx8IFebsgpwWuetlaN7cKKloIlAIGpR8YAPzRXyiZ/s7xU6kDHCupytude0UE1QRCCU76/UA/ikWmD3LK4EJgwaQzUCLAUZykFMBP9+Nn+hnjMQJbG+VN1IvH1E9ng3sBVQc2/xkxoAyIIRwRlZSKTgvglMDlvZ+QBMoCSfWGnKb7OpHhkQyoB0QUMQ6VjptWHWoF9UFyomo1MLZYydwAs4BqAcIMnKofQbFgaG+944R8Ryb6s2XH8Fp/7duf4o19RjzPzgTiKN1ABiDT3xGuj7ixNApicLaSE2eDFuch8/wGPwIaOpYCFQE0C5LN9HVaUGLJKoBBlAPADGAOyMHiosFsy44Qu+N52eLxOMzYP1p3gCqC4iXieFdevi1SWjJYKYIJJsmglkxfB0ZUgKgIRUAMlSzKQKCqGZwXtOqgKeprIG2Ls89swPwAymCwMIVAApBMX0dos1ZEDgP90WhuzumnHiyYW4lH4G1lEv0b93fLDgzwIRFKfF/08JFkciAV78hkI7+8Zd0qm+nvRJ1T8RBNBEOkA5cfiMXQtfOR4UHnHObZX81GROkfSLKyrm/UnBW1jSPN1ABxUA8lraJZEOLJKkD4zs0P1SYSmRUzygYGCgsyWVXiwGPLFnNkKmrpiTDTWm/LPfdfWlxcNJT7wnVPdy9eiH79HztD1YoimkBJg2YRUQS6dzaNGqi63t0b70kEPQ84/fIL+h6prm9yLn5DIzD8XWVtPYqxCoPB4hUIElEYyvR3aiw5l6XndL/y2Ja/OvTQxnfNWnnxy12LatouVaUUpgYOETJ3/eiy6BNP1/Yd3Pavhz5xVVT/5qZzUBURo/HguxSIfzxQAZVkM/G6/9l22dUL5/2h+sZ1t8VBfiNCW/heCLJr54YAZAOK+LjtJSFIIcpgpr/THu0lW5DIHPzNc2enHvv1ucVbHl6Xjkb8CTfTcWrZeYTIS7sLr7/7Py97+pnWs14rKhq06f5OUESEOOChDCJqUUP3rkcnBQUsA2pB3qgq3//i3JkH9IU951WDng/0AE+JSJsGXiEEOayuDajxERuJ47agFGBjJXMBOHK4tOzef/vBVWctPPibxhvW7N337Ohtwhu14svWkMmYSLL4WFVRYWbHb7e9K50b3I9RRUQCiWkKRLt3NTNwaFceVOnZ14wEdQlwBS7K+Llith06Wjm0/2C173n+68DvcU7jMmAhcFREekvO+jilZ19D356HARg4tJviWYtQ8MXFpnEg56f78WJJDr/0iXTDp/6rvKOrrOfJZ87u7dv/28klt+DC1WJVZpXP7LcvPvbjHhAqahpAiAJxVFKI2u6dzSeQFG8AzyByOPTVIiYOJFRt74hv4sB7gPMDm9k6kSQrahswoliVhONZhkRUu165mr++9uHEntfmlGdzXieI395yZ37w/FZQvWwNvkpMlfirb1a89ex2j4rahvCdBDAI2M1NzWzdFmNB4yPh2pQAK4EbcYHzA4hsBA6jSvuGxlHqNuY+DbQA/w68BtSr6nXAfBGhur6ZW35wJU9sasZaE75vUKKqQOaTLFm0byibjaSA0olSkxCcALNRUkB/e+t6Ztc2iEBBkJaku3c288x2WP5uqPjI4yXx6NAyoGaEpHrC8SfYfOLB1Tf2QSgp0DhwbihJVbN1//aLOrY8NNNefr6TIIEXBVKo2HjJXBQiCJVAl6ea29t617DkFtStJjDYKMKA8ZXZNY0I4oEYhEw4fTxK5dbfxe8876zf3mqtVwbyqIjZImIGBSkScRcw6tLgYoIr/EbERETMdpCfgnQUFQx87qf3XPDDWaVcCuDMQX2QLEhcBdpa14OQCzQr6TMqDnRZIy5tOQbYfS/cFUo1HqiCHgzsrC+VNG92nn6mtSYOeDLNzGIqJMO8ma4jlae3dc0ryUvZPc3gvLZXUdPgtFHpQykKgoDhcarr1hhgLtBtkazf14GKRkDioKnunc15ZU5+8MlYWfFbn/ett8kzucUCi4DXgaecAwlHnrpa5nIe1RVtPH/fTdGqqza+1xNbBxyxap4U0Yut9Z7v2PSxV8L3K2obg/FUUBnq3tVEdd1aAa0Een2Jpzpbbs+jjAO+ILmO1juxooBEUcKcJE9lxW8BiGf8PmAz8ANcFv05VBtAyxEFtaCWtuZ62prr84uZv7c5UItV6D1WGs/5kRWfX/f5OypnHHwPsAGR+0VsGyDG+KNWSk0Ex5tEgpSKIIQeAAojmnaiD9KZAsegs2xxy+4h5EK3n+dO8lcom17gF8C9gd5/FqURKEdgfn0T80dsGfl7MSAkUJbPKju0+sPLfn7HNR948KL7b/7iBmBv6GnD+UbSwR0PEYnMdAG4SATydZchIK6BRkYYtq2jbfnCjHpOYnLcGkFb4NID5nsDST4HXBiADNSVQ2M0IAEsVZULrPUO3XbjNxM1C3YWivB3/SkOtI2JVCaiXK5HEc0BkYqaxmz3riaCglOIK2uCqpQhyNEC+Xi4lERPOEsAcgRDIch7ceHSZ1AaUJ2FahxYDnxZ4YxMNvbopnUf7a49bee1qnwnl+NXU52ze1cTAY8mlJSoKC7NijqEihe4JwtQeXY9FjxBsmMD4qmAnFySeoNCkcAuhaYbrvzhvo8s37w0m+N2Vf4D+Jkx6ERJ5+QkVkd4a4tFRLKoA2cCgDasHIpqkCXnS3HTpkkkuVngdUQe+OB5W/ZdccHmhZks61XZAtwF+NMDFsADlcD972+9iyCvjDjJCR6KFROIz/MIPNCU1AOCskRAIxkcJUmRIdBjD936aSBVqcoduJDrNmDo7QBzPAY+cJgs4hICEzzQthEBZ/jZ9BaQU4Fky8vjHzqQiu97WpZMJYHvBo/+Aeh7m8DCPFLHxBE23OnN2xl0AvKAryF8DyibCGDOj1BceCxxLMU3gTOArwBdvj+teaZFhqAoNX/Z2tFPphdU+cDdwJnA7WMBtuyAeDSdu/6KH1+vyuXAVwReVQsrlrx95oNIZWzp0LjKoUsfnDu17gXj+7j9beKaUk/fDHK+p6mhwpEjKrAb+MJYgC07oKcP+eE3PrNixbufXqDKNxBeUODCc47P/O9fEbK5iM1kY5MZSeD7Ru3HISYMkEMwGCcrFdHASidU2Vs/d0vhxUuePH3tqu8Vz/3YJqrrm5wTcUuxJwC4MASIQHkZK4Fbd+6tfeDAEbagE9cZQ6qub6K6vplzFqpcuvSJBR97X/Psyd5VEFXn2efVrQYhgtvrMAh+EFUbgK7dGxDwQb1A7KNVYUZXVeXMrpWv7D/zs6hUu6SyiY/fkt8T9wBfDAB+F+UKgX9+bf/CX637yc1/qDhl8r3MgcqPU/L+Nd+9ckbyyKrT5uxdMgk0I/myLBgMwR6XDUUYFkljIz7yGW4vjQZ3ysFXl5zxu1W799Y87Xm5BlX9NFAtInz8lia+fPu9IyW4FOFREZ67q3ntet96EwIbCwq4HLhxb9dpXuXMA9fVLNjzs3F81DQS8GhDo1NXJI4Mg3MP0kBifr4jKn5gc+PARSO5TCya2ROLZp4S0XtxWXgIcn5PXznXfKuJbC76B5QfobzuefxsX9eCIWPsqPEmAwUUgf7EM/7GWCS7IxbNvDWWDy8yU1xWILkgFAulRqiWkfbW9VTXrRkEygJAqqgK4qNEKmobMiMzg/cvHQDeZF79PMRF4c8B23CFnnpV7QGeuu62B9v2NjXe9/xOHikvpae0qLcmXKsJCkt1uLzwTVwN5jCqZLJR/v7ap8ZJevbia/BzPYJgUM1BvlmTANKhJMOibBrwFI1U1a0Nk9Usrpw3LqcD2B9EH/OuehQRGQfSKj3z6jduveHK+9qbt16Na+DIWElNCCpMdyYjsbmwIpcb9pQioEVAb07i7p88amFmUAg62t6yntk1jSJCIZABzY7N68ZSADK8TQQgzwN6RNg6mC4oMcYuipjcL4zxlwWgxpUA20+Q7syuaSSoYRa55on6QV8vClQgdLa3rLd5cAvqVuOLxIDZQKfJqR0cOIA4t5oAHdARdZTjUdVVj2JGgzzXqrf0svduqaqa1VH54H9/cns2F907XVAhuTqqxAGjwuDBl5vC3vxMXOj1VnhgwAAEpbAskEUpsp5wcFcTivqgFiU21YClY+Mqx6hjeghoGUgl7/vo8k1dl73312bJGb9/UISNTFLXPC6w2gZcrqlR0LRYmF+3hqDLWwD0eyMsaORGrbg2cGlvf6F5drtBEEUZQogBXuB+p0TtIUhAVdIfWd7x/dmnpL64483FXb410wLlJBaEWq67lAFs964mPn31s4CU4hLjfM3SvTyCFixfLdZOvZx+PHpxDxw6WgoqFBYMkM4k8EyO4oJB/CBTnGo28I7L6QC+Fb1u1Qu9X/3S4yv+6Z5FyfIlX8WKCStNWYQCQKYiwVmlSDyaKY1GM6ckC7IRI/4MES2JRDCBCkVOOEggMVXBqok7lZQhQKPFVZBZKJ9qeO59N//tJoMyChhjJ2hvWc9Nj2Nf2l0468GN75rj+95AUXJO2MLKOC8lhcBgRW3DuBbWSNq1d0bZ/Zs/8+N0Nl628vzN6za3fvhbhYnU3rWrvne3CN9WpQm450QSU5Mb28LSsIVVtHBjKWjVObUdrxpv/PfjguN9HcgpZamB4sL0YCSam9Xeeqc8/MAmPnDJXlUracDHnUHxwDJR/AlgrUQG0wVzB4aKqnzrJQeGiqoG0wWVIEngdKB8MlCVtQ15GxPrOSm7Hobd+GATX7/pMYaGYsVWNHFqdU9PLgdje3PjJBeSKrHVNzyRNZ4tKf7wRYUlyVz3A99/cWhe7QJVZUicDRYCaVSzFbWNCqM7rDNLe498qO7xa33rRU+t2Lfvqvc174p4uSHP0w7f52ImqDwHbWMsIMPHrXxFUyKiseRcykqJDg7FTrnkwt2zVl78clc04sdVJ84+JwLnq9JjjP/+L13/hB4+kkzuebW846VdkV/GSuaqa/iTFXeqJwESJWj4h7YoYoANPvCq+0MBdo60gNHq5xr+6oIYIxBHRjf8Y8m5gPDi9oozTzv14Iql57w5suHfOwGO8Yhbd4B1LWJTkIBfPnmW3P/QReUDqbivymHAopZM/wGMUbFqIoRntjQ4niFhGiKBJrizH6oWMSOTjeA1dwjF4E4LeUAONO2OTThg7uSUlkSjftnZCzsP3f0vGzMHukEVK4LWLRoPbpzN1S0GERTBH0rjP7bl3FxvX0GXOknNcQwYYiVVWFcEzao7e5JBNIo7k1KIS6EigAkckSBemGkYnNpFgQKEIoQCRC3OaQyBaKykKpAYRlVnAclsNnLgjX2zBzu7gmONI9t7J5LcRPSnOx7lKll/rONRJw+2jQX4F3ckcRTIv8TDpONAvpNjwBI0YcYdAzYZEffqn+UY8IQg/9IOcE8KdrpH74GOPxKgk3SSTtKfj/4XXMo1EkcwmYEAAAAASUVORK5CYII=" alt="Sucesso AI"><span class="sidebar-logo">Gogroup</span></div>
       <div class="sidebar-sub">Central de Tickets</div>
-      <div class="marca-switch" id="marca-switch" style="display:flex;gap:4px;margin-top:10px;margin-left:37px">
-        <button class="marca-btn" id="marca-btn-gobeaute" onclick="switchMarca('gobeaute')" style="padding:4px 10px;border-radius:14px;border:1px solid rgba(255,255,255,.25);background:none;color:rgba(255,255,255,.75);font-size:10px;font-weight:600;font-family:'Poppins',sans-serif;cursor:pointer;text-transform:uppercase;letter-spacing:.03em">Gobeaute</button>
-        <button class="marca-btn" id="marca-btn-gocase" onclick="switchMarca('gocase')" style="padding:4px 10px;border-radius:14px;border:1px solid rgba(255,255,255,.25);background:none;color:rgba(255,255,255,.75);font-size:10px;font-weight:600;font-family:'Poppins',sans-serif;cursor:pointer;text-transform:uppercase;letter-spacing:.03em">Gocase</button>
-      </div>
+      <button type="button" onclick="trocarMarca()" title="Volta pra tela de seleção de marca" style="display:inline-block;margin-top:8px;margin-left:37px;padding:0;border:none;background:none;color:rgba(255,255,255,.55);font-size:10px;font-weight:600;font-family:'Poppins',sans-serif;cursor:pointer;text-transform:uppercase;letter-spacing:.03em;text-decoration:underline">Trocar marca</button>
     </div>
     <nav class="sidebar-nav">
       <button class="nav-item active" id="nav-torre" onclick="setTab('torre')">
@@ -763,7 +771,7 @@ let SB_KEY  = localStorage.getItem('sb_key') || DEFAULT_SB_KEY;
 let AGENT   = localStorage.getItem('agent_name') || 'Agente';
 // Marca ativa na tela (qual tabela do Supabase ler/gravar). Persiste por
 // navegador, nao por usuario - cada agente escolhe ao abrir o app.
-let CURRENT_MARCA = localStorage.getItem('central_marca') || 'gobeaute';
+let CURRENT_MARCA = localStorage.getItem('central_marca') || '';
 function tabelaAtual() { return CURRENT_MARCA === 'gocase' ? 'tickets_gocase' : 'tickets_gobeaute'; }
 
 function atualizarBotoesMarca() {
@@ -6843,29 +6851,67 @@ document.addEventListener('keydown', function(e) { if (e.key === 'Escape') close
 // intervalo minimo de 24h). Agora a tela so atualiza por acao explicita do
 // agente (F5 ou botao "Atualizar") - trocar de aba nao busca mais nada
 // sozinha, mesmo que o dado no Supabase ja tenha mudado ha tempo.
-atualizarBotoesMarca();
-// REDUCAO DE EGRESS (10/08/2026, a pedido da Maria): NAO busca nada do
-// Supabase ao abrir a pagina - so renderiza o estado inicial (barra de
-// status com contadores zerados, filtros, prompt pra escolher uma aba ou
-// pesquisar). renderTickets() e seguro aqui porque so le allTickets (vazio
-// neste ponto), nunca faz fetch sozinho. A carga completa so acontece
-// quando o agente clicar numa aba de status (ver setStatusFilter) ou
-// pesquisar (ver onHeaderSearch/buscarTermoDireto).
-// A tela inicial agora e a Torre (busca por pedido, 24/08/2026, a pedido da
-// Ivna) - renderTorre() nao le allTickets nem faz fetch sozinha, so monta o
-// formulario de busca. Os ramos de status do sidebar (Aguardando
-// transportadora etc) precisam aparecer mesmo sem a fila ter sido aberta
-// ainda, entao a barra e populada aqui direto (contadores zerados, ja que
-// allTickets esta vazio neste ponto) sem tocar no resto do #main-content.
-var barInicial = document.querySelector('.status-filter-bar');
-if (barInicial) barInicial.outerHTML = renderStatusFilterBar(getStatusCounts(allTickets));
-// Badge de "Tickets a Disparar": UMA requisicao leve no boot, so a contagem.
-// Nao contraria a regra de nao buscar nada ao abrir a pagina - essa regra existe
-// pelo peso da fila de tickets (milhares de linhas com corpo de e-mail), e aqui
-// a rota devolve so numeros. Sem isso o badge nao teria como existir, porque o
-// agente precisa ver o numero SEM entrar na aba - que e o ponto dele.
-atualizarBadgeEnderecos();
-renderTorre();
+// TELA INICIAL DE SELECAO DE MARCA (01/09/2026): antes o unico jeito de
+// escolher Gobeaute x Gocase era o toggle no topo da sidebar, que ficava
+// visivel o tempo todo mesmo pra quem so trabalha numa marca. Agora a
+// escolha acontece uma vez, numa tela cheia, ANTES do resto do app
+// aparecer - o toggle no sidebar foi removido; pra trocar de marca depois,
+// o agente usa o link "Trocar marca" (ver trocarMarca()), que limpa a
+// escolha salva e volta pra esta mesma tela.
+function iniciarApp() {
+  atualizarBotoesMarca();
+  // REDUCAO DE EGRESS (10/08/2026, a pedido da Maria): NAO busca nada do
+  // Supabase ao abrir a pagina - so renderiza o estado inicial (barra de
+  // status com contadores zerados, filtros, prompt pra escolher uma aba ou
+  // pesquisar). renderTickets() e seguro aqui porque so le allTickets (vazio
+  // neste ponto), nunca faz fetch sozinho. A carga completa so acontece
+  // quando o agente clicar numa aba de status (ver setStatusFilter) ou
+  // pesquisar (ver onHeaderSearch/buscarTermoDireto).
+  // A tela inicial agora e a Torre (busca por pedido, 24/08/2026, a pedido da
+  // Ivna) - renderTorre() nao le allTickets nem faz fetch sozinha, so monta o
+  // formulario de busca. Os ramos de status do sidebar (Aguardando
+  // transportadora etc) precisam aparecer mesmo sem a fila ter sido aberta
+  // ainda, entao a barra e populada aqui direto (contadores zerados, ja que
+  // allTickets esta vazio neste ponto) sem tocar no resto do #main-content.
+  var barInicial = document.querySelector('.status-filter-bar');
+  if (barInicial) barInicial.outerHTML = renderStatusFilterBar(getStatusCounts(allTickets));
+  // Badge de "Tickets a Disparar": UMA requisicao leve no boot, so a contagem.
+  // Nao contraria a regra de nao buscar nada ao abrir a pagina - essa regra existe
+  // pelo peso da fila de tickets (milhares de linhas com corpo de e-mail), e aqui
+  // a rota devolve so numeros. Sem isso o badge nao teria como existir, porque o
+  // agente precisa ver o numero SEM entrar na aba - que e o ponto dele.
+  atualizarBadgeEnderecos();
+  renderTorre();
+}
+
+// Clique num dos dois botoes da tela inicial - grava a escolha (persiste por
+// navegador, igual o toggle antigo fazia) e so ENTAO monta o resto do app.
+function escolherMarcaInicial(marca) {
+  CURRENT_MARCA = marca;
+  localStorage.setItem('central_marca', marca);
+  var tela = document.getElementById('marca-select-screen');
+  if (tela) tela.style.display = 'none';
+  var shell = document.getElementById('app-shell');
+  if (shell) shell.style.display = '';
+  iniciarApp();
+}
+
+// Link "Trocar marca" na sidebar - limpa a escolha salva neste navegador e
+// recarrega a pagina, que ai cai de novo na tela de selecao (ver o if/else
+// logo abaixo, que decide qual tela mostrar no boot).
+function trocarMarca() {
+  localStorage.removeItem('central_marca');
+  location.reload();
+}
+
+if (CURRENT_MARCA) {
+  iniciarApp();
+} else {
+  var shellInicial = document.getElementById('app-shell');
+  if (shellInicial) shellInicial.style.display = 'none';
+  var telaInicial = document.getElementById('marca-select-screen');
+  if (telaInicial) telaInicial.style.display = 'flex';
+}
 
 
 // ==== Tratativa Insucessos (embutido, sem iframe) ====
