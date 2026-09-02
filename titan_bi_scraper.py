@@ -305,7 +305,7 @@ def abrir_dropdown_filtro(frame, rotulo):
     frame.page.mouse.click(x, y)
 
 
-def marcar_item_da_lista(frame, campo_busca, valor):
+def marcar_item_da_lista(frame, campo_busca, valor, tentativas=3):
     """
     CORRIGIDO (24/08/2026): a causa raiz do filtro nao aplicar era o
     campo.fill() usado antes - ele seta o valor do input direto via JS, sem
@@ -318,11 +318,29 @@ def marcar_item_da_lista(frame, campo_busca, valor):
     lista sao canvas (nao aparecem no HTML/innerText), mas tem role="option"
     com o texto certo na arvore de acessibilidade - por isso da pra usar
     get_by_role em vez de coordenada de pixel.
+
+    CORRIGIDO (02/09/2026, achado real - titan_debug/filtro_nao_encontrado.png):
+    com definir_periodo agora abrindo um periodo bem mais largo (ver
+    PERIODO_AMPLO_INICIAL) antes de buscar por NF, o Power BI as vezes ainda
+    esta reindexando os valores disponiveis deste slicer pro periodo novo
+    (bem maior que o padrao estreito) no instante exato da busca - o popup
+    mostrou "No results found" pra uma NF que existia de verdade (confirmado:
+    ja tinha romaneio/situacao gravados de uma consulta bem-sucedida
+    anterior). Em vez de desistir na primeira, repete a busca (Enter de
+    novo, com mais folga a cada tentativa) ate 'tentativas' vezes antes de
+    propagar o erro de verdade.
     """
-    campo_busca.press("Enter")
-    time.sleep(1)  # deixa a lista filtrar
-    opcao = elemento_visivel(frame.get_by_role("option", name=str(valor), exact=True))
-    opcao.click()
+    ultimo_erro = None
+    for tentativa in range(tentativas):
+        campo_busca.press("Enter")
+        time.sleep(1 + tentativa * 1.5)  # da mais folga a cada nova tentativa
+        try:
+            opcao = elemento_visivel(frame.get_by_role("option", name=str(valor), exact=True), timeout_ms=8000)
+            opcao.click()
+            return
+        except PWTimeout as e:
+            ultimo_erro = e
+    raise ultimo_erro
 
 
 def digitar_busca(campo, valor):
