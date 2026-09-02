@@ -4150,13 +4150,37 @@ export default {
 
         // TICKETS CREATOR (31/08/2026): destino real do ticket - ver
         // chamarTicketsCreator (fica desligado ate TICKETS_CREATOR_URL existir).
-        const ticketCreator = await chamarTicketsCreator(env, {
-          marca: resolverMarcaTicketCreator(body.marca),
-          problema,
-          numeroPedido: body.numero_pedido,
-          enderecoNovo: body.endereco_novo,
-          enderecoNovoPartes: body.endereco_novo_partes,
-        });
+        //
+        // BUG REAL no gate do creator (02/09/2026, achado pelo Diego lendo o
+        // fonte dele): pedido que a Intelipost NUNCA rastreou (sem
+        // tms_unique_id) fica com sentState "unknown" la dentro, e o handler
+        // so barra em "not_sent" - "unknown" passa direto, mesmo essa sendo a
+        // evidencia MAIS forte de que o pedido nao saiu do CD (comprovado com
+        // pedido real, SH1275300KS, "waiting" no Cosmos, que abriu ticket
+        // mesmo assim). Como a Torre chama o creator DIRETO (nao passa pela
+        // fila do Diego, que ja tem o fix equivalente do lado dela), ela
+        // precisa do mesmo cuidado: se a Intelipost nunca viu este pedido
+        // (fontes.intelipost=false, ja calculado no frontend - ver
+        // torreAbrirTicket), nem tenta o creator - trata como se ele tivesse
+        // respondido "ORDER NO SENT" corretamente, o que a logica de fila
+        // logo abaixo ja sabe tratar.
+        const pularCreatorPorGateQuebrado =
+          problema === 'Alterar Endereço' && body.intelipost_conhece_pedido === false;
+        const ticketCreator: { chamado: boolean; status: number | null; resposta: any; motivo?: string; retentativaComSufixoShopify?: boolean } =
+          pularCreatorPorGateQuebrado
+            ? {
+                chamado: false,
+                status: null,
+                resposta: { code: 'ORDER NO SENT', message: 'Intelipost nunca rastreou este pedido - a Torre nao chamou o creator (gate dele tem bug conhecido pra esse caso, ver comentario acima).' },
+                motivo: 'pulado: Intelipost nunca rastreou este pedido (gate do creator tem bug conhecido pra esse caso)',
+              }
+            : await chamarTicketsCreator(env, {
+                marca: resolverMarcaTicketCreator(body.marca),
+                problema,
+                numeroPedido: body.numero_pedido,
+                enderecoNovo: body.endereco_novo,
+                enderecoNovoPartes: body.endereco_novo_partes,
+              });
         // Sucesso real = action:"ticket_created" no corpo - o worker devolve
         // HTTP 200 tambem pra "ja existe"/"nao precisa"/"escalar pra humano",
         // entao status<400 sozinho NAO distingue ticket aberto de rejeitado.

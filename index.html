@@ -2714,6 +2714,16 @@ function torreAbrirTicket() {
     endereco_novo: f.endereco_novo || '', endereco_novo_partes: problema === 'Alterar Endereço' ? enderecoNovo.partes : undefined,
     maps_url: gerarUrlGoogleMaps(f.endereco_novo),
     responsavel: responsavel,
+    // BUG REAL no gate do proprio TicketsCreator (02/09/2026, achado pelo
+    // Diego): pedido que a Intelipost nunca viu (sem microstatus) devolve
+    // sentState "unknown" - e o handler dele so barra em "not_sent",
+    // deixando "unknown" passar. Ou seja, a evidencia MAIS forte de que o
+    // pedido nao saiu (Intelipost nunca rastreou) e justamente o caso que o
+    // gate do creator libera por engano. A Torre ja sabe se a Intelipost
+    // conhece este pedido (ver fontes.intelipost, mostrado na tela como
+    // "Intelipost —"), entao manda esse sinal pro backend usar em vez de
+    // confiar cegamente no gate dele - ver /api/logistica/abrir-ticket.
+    intelipost_conhece_pedido: !!(d.fontes && d.fontes.intelipost),
   };
 
   fetch('/api/logistica/abrir-ticket', {
