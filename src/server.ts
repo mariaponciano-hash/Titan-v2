@@ -4429,6 +4429,12 @@ export default {
         const resultado = await ativarWatch(env, conta);
         return Response.json({ ok: true, conta: conta.id, ...resultado });
       } catch (e: any) {
+        // console.error acrescentado em 02/09/2026. Esta rota e chamada por
+        // cron, e o log de cron guarda so o status HTTP e a duracao - o corpo
+        // da resposta se perde. Sem esta linha, um 500 aqui e invisivel: foi o
+        // que aconteceu com a conta gocase_tickets, que falhou 04:00 e ninguem
+        // soube por que.
+        console.error(`[gmail-watch] ${url.pathname}: ${String((e && e.message) || e)}`);
         return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
       }
     }
@@ -4440,6 +4446,9 @@ export default {
         const resultado = await verificarGmail(env, conta);
         return Response.json(resultado);
       } catch (e: any) {
+        // Mesmo motivo do gmail-watch acima: chamada por cron de minuto em
+        // minuto, e o 500 nao deixava rastro nenhum.
+        console.error(`[verificar-gmail] ${url.pathname}: ${String((e && e.message) || e)}`);
         return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
       }
     }
