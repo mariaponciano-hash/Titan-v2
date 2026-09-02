@@ -2675,6 +2675,14 @@ async function torreBuscarNaMarca(env: any, marca: MarcaLogistica, termo: string
 // caminho de autorizacao nao serve la.
 const DOMINIOS_INTERNOS = ['@gocase.com', '@gobeaute.com'];
 
+// CONFERIDO EM 02/09/2026, porque nao era obvio e eu cheguei a errar aqui.
+// Supus que num app PUBLICO qualquer pessoa mandaria este header na mao e
+// entraria. Testei contra a central de producao (5e8f6af9, que e publica e tem
+// a SB_SERVICE_KEY setada) mandando um x-godeploy-user-email de dominio interno
+// em /api/enderecos-contadores e em /api/enderecos-list: 401 nas duas. O
+// dominio esta na allowlist e o codigo em producao tem este caminho, logo o
+// header nao chegou ao worker - o gateway do GoDeploy nao repassa header de
+// entrada com esse nome, ele injeta o proprio. Confiar nele e seguro.
 function usuarioInterno(request: Request): string | null {
   const email = (request.headers.get('x-godeploy-user-email') || '').trim().toLowerCase();
   if (!email) return null;
@@ -3568,7 +3576,37 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
   const temFonteDeStatus = cosmosConfigurado(env)
     || !!(brandDaLinha && middlewareV1Ids(env)[brandDaLinha]);
   let gateGravado: any = {};
-  if (!mock && temFonteDeStatus) {
+
+  // FECHA O CASO "NAO TENHO COMO SABER" (02/09/2026).
+  //
+  // Antes, sem fonte de status o bloco do gate era inteiro pulado e a linha ia
+  // direto pro creator. Foi assim que o ticket do SH1275300KS nasceu: a central
+  // de PRODUCAO tem a SB_SERVICE_KEY e o TICKET_WEBHOOK_SECRET, mas nenhum
+  // secret COSMOS_*, e Kokeshi nao tem id no Middleware V1 - ou seja, la
+  // temFonteDeStatus e falso e o gate NUNCA rodou, mesmo com o pedido em
+  // `waiting` no Cosmos. Nem os campos gate_* ficavam gravados, e por isso nao
+  // deu pra explicar o caso olhando log.
+  //
+  // A regra da Maria e "so dispara depois que o pedido saiu". Nao saber se saiu
+  // nao e o mesmo que ter saido, entao agora segura.
+  if (!mock && !temFonteDeStatus) {
+    await enderecoAtualizar(env, row.id, {
+      gate_veredito: 'sem_fonte',
+      gate_fonte: 'nenhuma',
+      gate_visto_em: new Date().toISOString(),
+      status: 'aguardando',
+      ultimo_code: 'SEM_FONTE_DE_STATUS',
+      disparado_em: null,
+      proxima_tentativa_em: new Date(Date.now() + ENDERECO_BACKOFF_NAO_ENVIADO_MS).toISOString(),
+      ultimo_erro: `sem fonte de status pra ${row.marca} neste app: Cosmos nao `
+        + `configurado e a marca nao tem id no Middleware V1. `
+        + `Nao disparo sem saber se o pedido saiu.`,
+      ultimo_erro_em: new Date().toISOString(),
+    });
+    return { ...base, acao: 'sem fonte de status - segue na fila', code: 'SEM_FONTE_DE_STATUS' };
+  }
+
+  if (!mock) {
     const g = await pedidoEstaSent(env, row);
     // Persistido em TODOS os caminhos, inclusive quando libera. Antes so o "nao"
     // deixava rastro, e por isso um `criado` indevido ficava sem explicacao.
@@ -3604,11 +3642,41 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
       });
       return { ...base, acao: 'nao se aplica - pedido morto no Cosmos', cosmos: g.detalhe };
     }
-    // 'sim' e 'desconhecido' seguem. 'desconhecido' de proposito: travar a fila
-    // por limitacao nossa (marca sem Cosmos, Cosmos fora) esconderia volume -
-    // nesse caso o creator decide, que era o comportamento anterior.
+    // TAMBEM FECHA (02/09/2026). Este trecho antes seguia pra criacao, e a
+    // justificativa que eu tinha escrito era "nesse caso o creator decide".
+    // Li o fonte do creator (src/ticket/shipment-state.ts) e ele NAO decide: o
+    // gate dele le o microstatus canonico da Intelipost e, quando o pedido nao
+    // esta la (tms_unique_id nulo), o veredito dele tambem e `unknown`; o
+    // handler so barra em `not_sent`, entao `unknown` libera. As duas checagens
+    // abriam exatamente no mesmo caso, que e o pior arranjo possivel: parecia
+    // haver duas linhas de defesa e nao havia nenhuma.
+    //
+    // O medo que me fez abrir antes era esconder volume. Segurar nao esconde: a
+    // linha continua na fila, visivel, com o motivo na tela - e depois de
+    // ENDERECO_MAX_TENTATIVAS vira `precisa_humano`, que obriga alguem a olhar.
     if (g.veredito === 'desconhecido') {
-      console.log(`[enderecos] gate do Cosmos inconclusivo pro pedido ${row.pedido}: ${g.detalhe} - seguindo pra criacao`);
+      const esgotou = tentativas >= ENDERECO_MAX_TENTATIVAS;
+      await enderecoAtualizar(env, row.id, {
+        ...gateGravado,
+        tentativas,
+        status: esgotou ? 'precisa_humano' : 'aguardando',
+        ultimo_code: 'STATUS_DESCONHECIDO',
+        status_visto_em: new Date().toISOString(),
+        disparado_em: null,
+        proxima_tentativa_em: esgotou
+          ? null
+          : new Date(Date.now() + ENDERECO_BACKOFF_NAO_ENVIADO_MS).toISOString(),
+        ultimo_erro: `nao consegui confirmar se o pedido saiu (${g.detalhe})`,
+        ultimo_erro_em: new Date().toISOString(),
+      });
+      return {
+        ...base,
+        acao: esgotou
+          ? 'status indeterminado depois das tentativas - precisa de humano'
+          : 'status indeterminado - segue na fila',
+        code: 'STATUS_DESCONHECIDO',
+        cosmos: g.detalhe,
+      };
     }
   }
 
