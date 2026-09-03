@@ -769,6 +769,20 @@ def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):
     na tela - o Power BI as renderiza de um jeito que nao expoe texto no DOM/
     acessibilidade (provavelmente canvas). Precisaria de OCR pra capturar -
     nao implementado ainda (avaliar se realmente e necessario antes).
+
+    CORRIGIDO (03/09/2026, achado real reportado pela Ivna): o match antigo
+    testava "numero_pedido in texto", onde texto era a linha INTEIRA
+    concatenada (todas as colunas juntas) - um falso positivo real
+    aconteceu com a NF 888537: o "Numero do Pedido" de QUALQUER linha
+    incorpora a NF dela mesma por dentro (ex: "SH...0888537"), entao uma
+    linha de OUTRO pedido/marca completamente diferente, cujo "Numero do
+    Pedido" so por coincidencia continha os digitos "888537" em algum lugar
+    (nao necessariamente no fim), batia como candidata - resultado real:
+    romaneio de um pedido errado gravado pra marca "by samia" nessa NF, que
+    nem existe pra essa marca no Titan. Agora exige bater EXATO (nao
+    substring) contra a coluna "Nota Fiscal" OU "Numero do Pedido"
+    especificamente - os dois continuam validos porque o uso avulso via CLI
+    (--pedido sem --nf) busca pelo "Numero do Pedido" mesmo.
     """
     try:
         painel = localizar_painel(frame, "Informação Pedido")
@@ -792,14 +806,19 @@ def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):
     if not rotulos:
         return None, None
 
+    alvo = _normalizar_espacos(numero_pedido)
     candidatos = []  # lista de (registro, locator)
     for linha in todas:
         texto = linha.inner_text().strip()
-        if not texto or texto == texto_cabecalho or numero_pedido not in texto:
+        if not texto or texto == texto_cabecalho:
             continue
         valores = _celulas_da_linha(linha)
         n = min(len(rotulos), len(valores))
-        candidatos.append((dict(zip(rotulos[:n], valores[:n])), linha))
+        registro = dict(zip(rotulos[:n], valores[:n]))
+        if (_normalizar_espacos(registro.get("Nota Fiscal")) != alvo
+                and _normalizar_espacos(registro.get("Número do Pedido")) != alvo):
+            continue
+        candidatos.append((registro, linha))
 
     if not candidatos:
         return None, None
