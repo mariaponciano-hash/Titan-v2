@@ -3516,6 +3516,19 @@ interface OpcoesBuscaEndereco {
   respeitarBackoff?: boolean;
 }
 
+// Grupo de contexto da tela (Gobeaute x Gocase - mesmo par que a Torre ja usa,
+// ver CURRENT_MARCA no index.html): "gocase" e so a marca gocase, qualquer
+// outra coisa e o grupo Gobeaute (as 6 marcas Cosmos + Apice). A fila e
+// compartilhada entre todas as marcas no banco - sem este filtro, um agente
+// na sessao Gocase via endereco de cliente Kokeshi/Lescent/etc, e vice-versa.
+function linhaEnderecoDoGrupo(marca: string, grupo: string): boolean {
+  // enfileirarEndereco grava marca em MAIUSCULO (ver .toUpperCase() ali) -
+  // comparar contra 'gocase' minusculo nunca batia, entao GOCASE escapava
+  // pelo "!== 'gocase'" tambem no grupo Gobeaute (achado pela Ivna ao vivo).
+  const m = String(marca || '').toUpperCase();
+  return grupo === 'gocase' ? m === 'GOCASE' : m !== 'GOCASE';
+}
+
 async function enderecoBuscar(env: Env, opts: OpcoesBuscaEndereco): Promise<any[]> {
   let url = `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?select=*&order=criado_em.asc`;
   if (opts.status) url += `&status=eq.${encodeURIComponent(opts.status)}`;
@@ -5376,7 +5389,9 @@ export default {
         // de trabalho, nao um historico) e assim os contadores por status saem
         // corretos numa unica ida ao banco. O filtro da tela e client-side.
         const limit = Math.min(parseInt(url.searchParams.get('limit') || '2000', 10) || 2000, 5000);
-        const rows = await enderecoBuscar(env, { limit });
+        const grupo = url.searchParams.get('grupo');
+        let rows = await enderecoBuscar(env, { limit });
+        if (grupo) rows = rows.filter((r: any) => linhaEnderecoDoGrupo(r.marca, grupo));
         const porStatus: Record<string, number> = {};
         rows.forEach((r: any) => { const k = r.status || '(vazio)'; porStatus[k] = (porStatus[k] || 0) + 1; });
         return Response.json({
@@ -5439,7 +5454,7 @@ export default {
       if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
       try {
         const r = await fetchComTimeout(
-          `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?select=status&limit=5000`,
+          `${SB_URL}/rest/v1/${TABELA_ENDERECOS}?select=status,marca&limit=5000`,
           { headers: headersEnderecos(env) },
           ENDERECO_TIMEOUT_MS
         );
@@ -5447,7 +5462,9 @@ export default {
           const t = await r.text().catch(() => '');
           throw new Error(`Supabase HTTP ${r.status}: ${t.slice(0, 200)}`);
         }
-        const rows: any[] = await r.json();
+        const grupo = url.searchParams.get('grupo');
+        let rows: any[] = await r.json();
+        if (grupo) rows = rows.filter((x: any) => linhaEnderecoDoGrupo(x.marca, grupo));
         const porStatus: Record<string, number> = {};
         rows.forEach((x: any) => { const k = x.status || '(vazio)'; porStatus[k] = (porStatus[k] || 0) + 1; });
         // O badge conta o que espera ACAO de pessoa. `aguardando` fica fora: e o

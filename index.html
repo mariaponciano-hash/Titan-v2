@@ -6085,7 +6085,7 @@ async function atualizarBadgeEnderecos() {
   var el = document.getElementById('badge-enderecos');
   if (!el) return;
   try {
-    var r = await fetchComTimeout('/api/enderecos-contadores', { headers: headersEnd() }, 12000);
+    var r = await fetchComTimeout('/api/enderecos-contadores?grupo=' + encodeURIComponent(CURRENT_MARCA), { headers: headersEnd() }, 12000);
     if (!r.ok) return;
     var d = await r.json();
     var n = (d && d.precisamAtencao) || 0;
@@ -6149,7 +6149,9 @@ function renderEnderecos() {
 async function loadEnderecos() {
   var lista = document.getElementById('end-lista');
   try {
-    var r = await fetchComTimeout('/api/enderecos-list', { headers: headersEnd() }, 20000);
+    // grupo=CURRENT_MARCA (03/09/2026, a pedido da Ivna): so mostra a fila da
+    // marca da sessao atual - a tabela e compartilhada entre todas as marcas.
+    var r = await fetchComTimeout('/api/enderecos-list?grupo=' + encodeURIComponent(CURRENT_MARCA), { headers: headersEnd() }, 20000);
     var data = await r.json();
     if (!r.ok) {
       lista.innerHTML = '<div class="alert alert-error">Erro (' + r.status + '): ' + escEnd((data && data.error) || 'falha desconhecida') + '</div>';
