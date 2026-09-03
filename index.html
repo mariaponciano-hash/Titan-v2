@@ -2594,6 +2594,10 @@ function torreIntroProblema(problema, f) {
       return 'Solicitamos a atualização do endereço de entrega do pedido abaixo. O endereço correto, com localização no Google Maps, está detalhado a seguir.';
     case 'Barra Entrega':
       return 'Solicitamos que a entrega do pedido abaixo NÃO seja realizada até nova orientação nossa.';
+    case 'Extravio':
+      return 'O pedido ultrapassou o limite máximo tolerado para atraso na entrega.';
+    case 'Avaria':
+      return 'Notifico que nosso cliente identificou uma avaria no produto referente à entrega efetuada.';
     default:
       return 'Solicitamos posicionamento sobre o pedido abaixo.';
   }
