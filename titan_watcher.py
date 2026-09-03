@@ -69,6 +69,47 @@ def marcar_erro(numero_nf, marca, mensagem):
         print(f"  (nao consegui nem marcar erro no Supabase: {e})", file=sys.stderr)
 
 
+def marcar_nao_encontrado(numero_nf, marca, mensagem):
+    """
+    Igual a marcar_erro, mas ALEM disso limpa os campos operacionais
+    (romaneio, situacao, eventos etc.) - achado real (03/09/2026, NF 888537):
+    um match falso-positivo antigo (ja corrigido em titan_bi_scraper.
+    _achar_linha_pedido - comparava contra o texto da linha inteira, nao a
+    coluna certa) tinha gravado o romaneio de um pedido ERRADO pra marca
+    apice nessa NF. Depois do fix, o recheck passou a corretamente marcar
+    'erro' - mas marcar_erro sozinho so troca status/erro, sem limpar os
+    dados velhos: a linha ficava com status='erro' e AINDA COM o romaneio/
+    situacao/romaneio_link errados de antes, prontos pra enganar quem lesse
+    direto esses campos sem checar o status. So usado no caminho de "pedido
+    genuinamente nao encontrado" (nunca em excecao generica/transitoria,
+    onde os dados anteriores podem continuar validos e nao devem ser
+    apagados).
+    """
+    try:
+        _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{numero_nf}&marca=eq.{marca}", {
+            "status": "erro",
+            "erro": str(mensagem)[:500],
+            "situacao": None,
+            "romaneio": None,
+            "romaneio_link": None,
+            "valor_pedido": None,
+            "volume": None,
+            "observacao": None,
+            "nome_projeto": None,
+            "nome_projeto_antigo": None,
+            "data_importado": None,
+            "data_expedido": None,
+            "data_conferido": None,
+            "depositante": None,
+            "cliente": None,
+            "eventos": None,
+            "itens": None,
+            "atualizado_em": _agora_iso(),
+        })
+    except Exception as e:
+        print(f"  (nao consegui nem marcar erro no Supabase: {e})", file=sys.stderr)
+
+
 def marcar_concluido(numero_nf, marca, pedido_data, eventos, itens):
     _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{numero_nf}&marca=eq.{marca}", {
         "status": "concluido",
@@ -128,7 +169,7 @@ def processar_pedido(page, item):
     pedido_data = scraper.extrair_linha_por_pedido(frame, numero_nf, marca_esperada=marca)
     if pedido_data is None:
         print(f"[NF {numero_nf} / marca {marca}] nao encontrada no Titan (ou a NF existe mas nao pra essa marca).")
-        marcar_erro(numero_nf, marca, f"NF {numero_nf} nao encontrada no Titan BI para a marca {marca}.")
+        marcar_nao_encontrado(numero_nf, marca, f"NF {numero_nf} nao encontrada no Titan BI para a marca {marca}.")
         return
 
     scraper.clicar_na_linha(frame, numero_nf, marca_esperada=marca)
