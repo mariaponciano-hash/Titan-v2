@@ -3785,16 +3785,14 @@ function renderUnilogOcorrenciaCard(d) {
   // Idem pro estado da busca de produto Protheus (04/09/2026): sem isso, um
   // "pediu" selecionado numa consulta anterior sobreviveria pra ocorrencia
   // seguinte, misturando pedido diferente.
-  window._unilogModoProduto = 'falta';
-  window._unilogTroca = { pediu: null, recebeu: null };
   window._unilogProdutosPorSlot = {};
   // Itens do PEDIDO (ja vem com EAN - ver torreBuscarNaMarca em server.ts,
-  // buscarEanPorSku): usados pra "Falta de item" e pro lado "pediu" de "Item
-  // trocado" (05/09/2026, a pedido da Ivna, igual o CX Hub ja fazia) - o
-  // agente clica no item que o pedido realmente tinha, em vez de buscar de
-  // novo algo que a Central ja sabe. So o lado "recebeu" continua com busca
-  // livre no Protheus, porque esse item NAO esta no pedido.
+  // buscarEanPorSku), quais foram marcados como "com problema" (multi-selecao
+  // tipo pill, igual o Cerebro de Trocas) e a resolucao escolhida pra cada um
+  // (05/09/2026, a pedido da Ivna).
   window._unilogProdutosPedido = produtos;
+  window._unilogItensProblema = {};
+  window._unilogResolucoes = {};
 
   return '<div class="bloco" style="margin-bottom:1.25rem">'
     + '<div class="bloco-head">Dados que a Central já sabe</div>'
@@ -3866,96 +3864,109 @@ function unilogCopiarDescricao() {
   }
 }
 
-// Selecao de produto pra Unilog CD (04-05/09/2026, a pedido da Ivna).
-//
-// Dois modos, formato exato que ela pediu pra descricao final:
-// - "falta": um produto so -> "Pedido faltando SKU X – EAN Y"
-// - "troca": dois produtos (o que o cliente pediu e o que recebeu) -> so
-//   monta a frase quando os DOIS estiverem escolhidos: "Cliente recebeu
-//   trocado: pediu SKU A – EAN B e recebeu SKU C – EAN D"
-//
-// "Falta de item" e o lado "pediu" de "Item trocado" usam os ITENS DO PEDIDO
-// (window._unilogProdutosPedido, ja vem com EAN - ver torreBuscarNaMarca em
-// server.ts) - igual o CX Hub ja fazia: o agente clica no item que o pedido
-// realmente tinha, em vez de buscar de novo algo que a Central ja sabe. Cai
-// pra busca livre no Protheus se o pedido nao tiver itens conhecidos. O lado
-// "recebeu" SEMPRE usa busca livre (GET /api/logistica/produto-protheus,
-// server.ts -> Metabase Gobeaute banco "Protheus") porque esse item nao esta
-// no pedido - a Central nao tem como saber qual foi sem o agente procurar.
+// Selecao de produto pra Unilog CD (04-05/09/2026, a pedido da Ivna) - mesmo
+// formato de duas etapas do Cerebro de Trocas ("Quais produtos apresentaram
+// problema?" -> decisao por item): pills com os itens do PEDIDO (multi-
+// selecao, ja vem com EAN - ver torreBuscarNaMarca em server.ts,
+// buscarEanPorSku), e pra CADA item marcado, uma decisao: "Faltou" (insere
+// direto) ou "Veio trocado" (abre busca livre no Protheus so pra achar o
+// produto RECEBIDO, que nao esta no pedido - a Central nao tem como saber
+// qual foi sem o agente procurar). Frases finais, no formato exato que a
+// Ivna pediu:
+// - Faltou: "Pedido faltando SKU X – EAN Y"
+// - Trocado: "Cliente recebeu trocado: pediu SKU A – EAN B e recebeu SKU C – EAN D"
 function renderUnilogBuscaProdutoHtml() {
-  var modo = window._unilogModoProduto || 'falta';
-  var pediu = window._unilogTroca.pediu, recebeu = window._unilogTroca.recebeu;
   var produtosPedido = window._unilogProdutosPedido || [];
+  var problema = window._unilogItensProblema || {};
+  var resolucoes = window._unilogResolucoes || {};
 
-  function pill(id, label) {
-    var ativo = modo === id;
-    return '<button type="button" onclick="unilogSetModoProduto(\'' + id + '\')" style="border:1px solid ' + (ativo ? 'var(--blue)' : 'var(--border-2)')
-      + ';background:' + (ativo ? 'var(--blue-bg)' : 'var(--white)') + ';color:' + (ativo ? 'var(--blue)' : 'var(--ink-3)')
-      + ';border-radius:16px;padding:6px 14px;cursor:pointer;font-family:\'Poppins\',sans-serif;font-size:12px;font-weight:600;margin-right:8px">' + label + '</button>';
+  if (!produtosPedido.length) {
+    return '<div class="torre-alert warn" style="margin:0">Pedido sem itens conhecidos - descreva manualmente na caixa abaixo.</div>';
   }
-  function caixaBusca(slot, placeholder) {
-    return '<div style="display:flex;gap:8px;margin-bottom:6px">'
-      + '<input class="tf-input" id="uf-produto-busca-' + slot + '" style="flex:1" placeholder="' + tEsc(placeholder) + '" onkeydown="if(event.key===\'Enter\'){event.preventDefault();unilogBuscarProduto(\'' + slot + '\');}">'
-      + '<button type="button" class="torre-btn-ghost" onclick="unilogBuscarProduto(\'' + slot + '\')">Buscar</button>'
-      + '</div>'
-      + '<div id="uf-produto-resultados-' + slot + '"></div>';
-  }
-  function linhaProduto(onclick, p) {
-    return '<div class="bloco-row" style="cursor:pointer" onclick="' + onclick + '" title="Clique para usar este produto">'
-      + '<div class="bloco-k">' + tEsc(p.sku || '—') + (p.marca ? ' · ' + tEsc(p.marca) : '') + '</div>'
-      + '<div class="bloco-v">' + tEsc(p.nome || p.descricao || '—') + (p.ean ? ' <span style="color:var(--ink-4)">(EAN ' + tEsc(p.ean) + ')</span>' : '')
-      + (p.quantidade ? ' <span style="color:var(--ink-4)">· qtd ' + tEsc(String(p.quantidade)) + '</span>' : '') + '</div>'
-      + '</div>';
-  }
-  // "falta"/"pediu": lista os itens do proprio pedido (clique direto, sem
-  // input de busca) - so cai pra busca livre se o pedido nao tiver itens.
-  function blocoItensPedido(slot) {
-    if (!produtosPedido.length) {
-      return '<div class="torre-alert warn" style="margin-bottom:8px">Pedido sem itens conhecidos - busque manualmente:</div>' + caixaBusca(slot, 'SKU, EAN ou nome do produto');
+
+  var pills = produtosPedido.map(function(p, i) {
+    var ativo = !!problema[i];
+    return '<button type="button" onclick="unilogToggleItemProblema(' + i + ')" style="display:inline-flex;align-items:center;gap:6px;border:1px solid '
+      + (ativo ? 'var(--red)' : 'var(--border-2)') + ';background:' + (ativo ? 'var(--red-bg)' : 'var(--white)') + ';color:' + (ativo ? 'var(--red)' : 'var(--ink-3)')
+      + ';border-radius:20px;padding:7px 14px;cursor:pointer;font-family:\'Poppins\',sans-serif;font-size:12px;font-weight:600;margin:0 8px 8px 0">'
+      + '<span style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:' + (ativo ? 'var(--red)' : 'var(--border-2)') + '"></span>'
+      + tEsc(p.descricao || p.sku || '—') + '</button>';
+  }).join('');
+
+  var indicesSelecionados = [];
+  produtosPedido.forEach(function(p, i) { if (problema[i]) indicesSelecionados.push(i); });
+
+  var acoes = indicesSelecionados.map(function(i) {
+    var p = produtosPedido[i];
+    var res = resolucoes[i];
+    var corpo;
+    if (res) {
+      corpo = '<div style="color:var(--green);font-size:12px;font-weight:700;margin-top:4px">✓ '
+        + (res.tipo === 'falta' ? 'Marcado como faltando' : ('Trocado - cliente recebeu SKU ' + tEsc(res.recebeu.sku))) + '</div>';
+    } else {
+      corpo = '<div style="display:flex;gap:8px;margin-top:6px">'
+        + '<button type="button" class="torre-btn-ghost" onclick="unilogResolverItemFalta(' + i + ')">Faltou</button>'
+        + '<button type="button" class="torre-btn-ghost" onclick="unilogAbrirTrocaItem(' + i + ')">Veio trocado</button>'
+        + '</div>'
+        + '<div id="uf-troca-busca-' + i + '" style="display:none;margin-top:8px">'
+        +   '<div class="tf-label" style="font-size:11px;margin-bottom:4px">Produto que o cliente recebeu no lugar</div>'
+        +   '<div style="display:flex;gap:8px;margin-bottom:6px">'
+        +     '<input class="tf-input" id="uf-troca-input-' + i + '" style="flex:1" placeholder="SKU, EAN ou nome do produto" onkeydown="if(event.key===\'Enter\'){event.preventDefault();unilogBuscarTrocaItem(' + i + ');}">'
+        +     '<button type="button" class="torre-btn-ghost" onclick="unilogBuscarTrocaItem(' + i + ')">Buscar</button>'
+        +   '</div>'
+        +   '<div id="uf-troca-resultados-' + i + '"></div>'
+        + '</div>';
     }
-    return produtosPedido.map(function(p, i) {
-      return linhaProduto('unilogSelecionarProdutoPedido(\'' + slot + '\', ' + i + ')', p);
-    }).join('');
-  }
+    return '<div class="bloco-row" style="display:block">'
+      + '<div class="bloco-k">' + tEsc(p.sku || '—') + ' · ' + tEsc(p.descricao || '—') + '</div>'
+      + corpo
+      + '</div>';
+  }).join('');
 
-  var html = pill('falta', 'Falta de item') + pill('troca', 'Item trocado') + '<div style="margin-top:10px">';
-  if (modo === 'falta') {
-    html += blocoItensPedido('falta');
-  } else {
-    html += '<div style="margin-bottom:14px">'
-      + '<div class="tf-label" style="font-size:11px;margin-bottom:4px">O cliente pediu (itens do pedido)'
-      + (pediu ? ' <span style="color:var(--green);font-weight:700">✓ SKU ' + tEsc(pediu.sku) + ' – EAN ' + tEsc(pediu.ean) + '</span>' : '')
-      + '</div>' + blocoItensPedido('pediu') + '</div>'
-      + '<div>'
-      + '<div class="tf-label" style="font-size:11px;margin-bottom:4px">O cliente recebeu (busca livre)'
-      + (recebeu ? ' <span style="color:var(--green);font-weight:700">✓ SKU ' + tEsc(recebeu.sku) + ' – EAN ' + tEsc(recebeu.ean) + '</span>' : '')
-      + '</div>' + caixaBusca('recebeu', 'Produto que o cliente recebeu') + '</div>';
-  }
-  return html + '</div>';
+  return '<div class="tf-label" style="font-size:12px;margin-bottom:8px">Quais produtos apresentaram problema? <span style="font-weight:400;color:var(--ink-4);text-transform:none">(selecione um ou mais)</span></div>'
+    + pills
+    + (indicesSelecionados.length ? '<div style="margin-top:10px">' + acoes + '</div>' : '');
 }
 
-function unilogSetModoProduto(modo) {
-  window._unilogModoProduto = modo;
+function unilogToggleItemProblema(i) {
+  window._unilogItensProblema[i] = !window._unilogItensProblema[i];
+  if (!window._unilogItensProblema[i]) delete window._unilogResolucoes[i];
   var wrap = document.getElementById('uf-busca-produto-wrap');
   if (wrap) wrap.innerHTML = renderUnilogBuscaProdutoHtml();
 }
 
-function unilogBuscarProduto(slot) {
-  var campo = document.getElementById('uf-produto-busca-' + slot);
-  var resultados = document.getElementById('uf-produto-resultados-' + slot);
+function unilogResolverItemFalta(i) {
+  var p = (window._unilogProdutosPedido || [])[i];
+  if (!p) return;
+  var linha = 'Pedido faltando SKU ' + (p.sku || '—') + ' – EAN ' + (p.ean || '—');
+  var campo = document.getElementById('uf-descricao');
+  if (campo) campo.value = linha + (campo.value ? '\n' + campo.value : '');
+  window._unilogResolucoes[i] = { tipo: 'falta' };
+  var wrap = document.getElementById('uf-busca-produto-wrap');
+  if (wrap) wrap.innerHTML = renderUnilogBuscaProdutoHtml();
+}
+
+function unilogAbrirTrocaItem(i) {
+  var el = document.getElementById('uf-troca-busca-' + i);
+  if (el) el.style.display = '';
+}
+
+function unilogBuscarTrocaItem(i) {
+  var campo = document.getElementById('uf-troca-input-' + i);
+  var resultados = document.getElementById('uf-troca-resultados-' + i);
   var termo = (campo && campo.value || '').trim();
   if (!resultados) return;
   if (!termo) { resultados.innerHTML = '<div class="torre-alert warn" style="margin:0">Digite um SKU, EAN ou parte do nome.</div>'; return; }
-  resultados.innerHTML = '<div class="state-box" style="padding:10px"><p>Buscando...</p></div>';
+  resultados.innerHTML = '<div class="state-box" style="padding:8px"><p>Buscando...</p></div>';
   fetchComTimeout('/api/logistica/produto-protheus?termo=' + encodeURIComponent(termo), {}, 15000)
     .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); })
     .then(function(res) {
       if (!res.ok) { resultados.innerHTML = '<div class="torre-alert err" style="margin:0">' + tEsc((res.j && res.j.error) || 'falha na busca') + '</div>'; return; }
       var produtos = (res.j && res.j.produtos) || [];
-      window._unilogProdutosPorSlot[slot] = produtos;
-      if (!produtos.length) { resultados.innerHTML = '<div class="state-box" style="padding:10px"><p>Nenhum produto encontrado.</p></div>'; return; }
-      resultados.innerHTML = produtos.map(function(p, i) {
-        return '<div class="bloco-row" style="cursor:pointer" onclick="unilogSelecionarProduto(\'' + slot + '\', ' + i + ')" title="Clique para usar este produto">'
+      window._unilogProdutosPorSlot['troca_' + i] = produtos;
+      if (!produtos.length) { resultados.innerHTML = '<div class="state-box" style="padding:8px"><p>Nenhum produto encontrado.</p></div>'; return; }
+      resultados.innerHTML = produtos.map(function(p, idx) {
+        return '<div class="bloco-row" style="cursor:pointer" onclick="unilogSelecionarTrocaItem(' + i + ', ' + idx + ')" title="Clique para usar este produto">'
           + '<div class="bloco-k">' + tEsc(p.sku || '—') + (p.marca ? ' · ' + tEsc(p.marca) : '') + '</div>'
           + '<div class="bloco-v">' + tEsc(p.nome || '—') + (p.ean ? ' <span style="color:var(--ink-4)">(EAN ' + tEsc(p.ean) + ')</span>' : '') + '</div>'
           + '</div>';
@@ -3966,45 +3977,17 @@ function unilogBuscarProduto(slot) {
     });
 }
 
-// Nucleo comum: "falta" insere a frase na hora. "pediu"/"recebeu" guardam a
-// escolha e so inserem a frase de troca quando os DOIS lados estiverem
-// preenchidos. Compartilhado entre selecionar um item do PEDIDO e um item
-// achado por busca livre (unilogSelecionarProduto/unilogSelecionarProdutoPedido
-// abaixo so resolvem o produto e chamam esta funcao).
-function unilogAplicarProduto(slot, p) {
-  if (!p) return;
+function unilogSelecionarTrocaItem(i, idx) {
+  var pedido = (window._unilogProdutosPedido || [])[i];
+  var recebido = (window._unilogProdutosPorSlot['troca_' + i] || [])[idx];
+  if (!pedido || !recebido) return;
+  var linha = 'Cliente recebeu trocado: pediu SKU ' + (pedido.sku || '—') + ' – EAN ' + (pedido.ean || '—')
+    + ' e recebeu SKU ' + (recebido.sku || '—') + ' – EAN ' + (recebido.ean || '—');
   var campo = document.getElementById('uf-descricao');
-
-  if (slot === 'falta') {
-    var linhaFalta = 'Pedido faltando SKU ' + (p.sku || '—') + ' – EAN ' + (p.ean || '—');
-    if (campo) { campo.value = linhaFalta + (campo.value ? '\n' + campo.value : ''); campo.focus(); }
-    return;
-  }
-
-  window._unilogTroca[slot] = p;
+  if (campo) campo.value = linha + (campo.value ? '\n' + campo.value : '');
+  window._unilogResolucoes[i] = { tipo: 'troca', recebeu: recebido };
   var wrap = document.getElementById('uf-busca-produto-wrap');
   if (wrap) wrap.innerHTML = renderUnilogBuscaProdutoHtml();
-
-  var pediu = window._unilogTroca.pediu, recebeu = window._unilogTroca.recebeu;
-  if (pediu && recebeu) {
-    var linhaTroca = 'Cliente recebeu trocado: pediu SKU ' + (pediu.sku || '—') + ' – EAN ' + (pediu.ean || '—')
-      + ' e recebeu SKU ' + (recebeu.sku || '—') + ' – EAN ' + (recebeu.ean || '—');
-    if (campo) campo.value = linhaTroca + (campo.value ? '\n' + campo.value : '');
-    window._unilogTroca = { pediu: null, recebeu: null };
-    var wrap2 = document.getElementById('uf-busca-produto-wrap');
-    if (wrap2) wrap2.innerHTML = renderUnilogBuscaProdutoHtml();
-  }
-}
-
-// Produto vindo da busca livre no Protheus (so o slot "recebeu" chega aqui
-// hoje, ja que "falta"/"pediu" usam os itens do pedido).
-function unilogSelecionarProduto(slot, indice) {
-  unilogAplicarProduto(slot, (window._unilogProdutosPorSlot[slot] || [])[indice]);
-}
-
-// Produto vindo da lista de itens do PROPRIO pedido ("falta" e "pediu").
-function unilogSelecionarProdutoPedido(slot, indice) {
-  unilogAplicarProduto(slot, (window._unilogProdutosPedido || [])[indice]);
 }
 
 // Mesmo padrao de adicionarAnexos (index.html, usado pela Torre) - le como
