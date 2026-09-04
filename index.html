@@ -3728,6 +3728,15 @@ var UNILOG_TIPO_ESPECIFICACAO = {
   'Outro': ['Atualização BI', 'Integração de NF', 'Faturamento', 'Fretefy', 'Solicitação de documentos', 'Solicitação de imagens', 'Solicitação de retrabalho', 'Quantidade de insumos', 'Outros'],
 };
 
+// RESTRIÇÃO (04/09/2026, a pedido da Ivna): a Unilog CD só abre ocorrência do
+// tipo "Produção", e só com estas duas especificações - as outras 4 combinações
+// documentadas em UNILOG_TIPO_ESPECIFICACAO acima continuam ali como
+// referência do formulário real, mas não aparecem mais nesta tela. E-mail de
+// contato fixo (não é mais o e-mail pessoal do agente).
+var UNILOG_TIPO_FIXO = 'Produção';
+var UNILOG_ESPECIFICACAO_PERMITIDAS = ['Tratativa de avarias logística interna', 'Erro de separação/Falta de item'];
+var UNILOG_EMAIL_FIXO = 'qualidade@gobeaute.com.br';
+
 // Anexos da Unilog CD - array proprio (nao window._anexos, que e da Torre)
 // pra nao colidir entre as duas telas. Mesmo padrao base64 de adicionarAnexos
 // (index.html) - ver unilogAdicionarAnexos abaixo.
@@ -3744,7 +3753,6 @@ window._unilogAnexos = [];
 // existindo como alternativa se o envio automatico falhar.
 function renderUnilogOcorrenciaCard(d) {
   var p = d.pedido || {};
-  var c = d.destinatario || {};
   var cnpj = ((d.remetente && d.remetente.cnpj) || '').replace(/\D/g, '');
   var numeroNf = p.numero_nf || p.numero_pedido || unilogState.termo || '';
   var romaneio = (unilogState.titan && unilogState.titan.romaneio) || '';
@@ -3752,15 +3760,6 @@ function renderUnilogOcorrenciaCard(d) {
   var eans = produtos.length
     ? produtos.map(function(x) { return tEsc(x.ean || x.sku || '—') + (x.descricao ? ' - ' + tEsc(x.descricao) : ''); }).join('<br>')
     : '—';
-
-  // Mesma composicao de endereco de torrePreencherForm (index.html ~2088) -
-  // "e o que a transportadora cola no sistema dela pra localizar a entrega",
-  // aqui serve o mesmo papel pro campo "Endereço de Entrega" da Unilog. So
-  // faz sentido pro tipo "Entrega" (unilogAtualizarEspecificacao esconde o
-  // campo pros outros tipos), mas o valor fica pronto desde o inicio.
-  var enderecoBase = [c.endereco, c.numero].filter(Boolean).join(', ');
-  if (c.complemento) enderecoBase += ' - ' + c.complemento;
-  var enderecoCompleto = [enderecoBase, c.bairro, [c.cidade, c.uf].filter(Boolean).join('/'), c.cep].filter(Boolean).join(' · ');
 
   var linhas = [
     ['Nº do Pedido', tVal(p.numero_pedido), null],
@@ -3775,8 +3774,8 @@ function renderUnilogOcorrenciaCard(d) {
     return '<div class="bloco-row"><div class="bloco-k">' + l[0] + '</div><div class="bloco-v"' + (l[2] ? ' id="' + l[2] + '"' : '') + '>' + l[1] + '</div></div>';
   }).join('');
 
-  var tipoOpcoes = ['<option value="">Selecione...</option>'].concat(Object.keys(UNILOG_TIPO_ESPECIFICACAO).map(function(t) {
-    return '<option value="' + tEsc(t) + '">' + tEsc(t) + '</option>';
+  var especOpcoes = ['<option value="">Selecione...</option>'].concat(UNILOG_ESPECIFICACAO_PERMITIDAS.map(function(o) {
+    return '<option value="' + tEsc(o) + '">' + tEsc(o) + '</option>';
   })).join('');
 
   // Reseta os anexos toda vez que o cartao e desenhado do zero (novo
@@ -3800,16 +3799,12 @@ function renderUnilogOcorrenciaCard(d) {
     +       '<input class="tf-input" id="uf-nf" value="' + safeAttr(numeroNf) + '">'
     +     '</div>'
     +     '<div class="tf-field">'
-    +       '<label class="tf-label">Tipo de ocorrência <span class="req">*</span></label>'
-    +       '<select class="tf-select" id="uf-tipo" onchange="unilogAtualizarEspecificacao()">' + tipoOpcoes + '</select>'
+    +       '<label class="tf-label">Tipo de ocorrência</label>'
+    +       '<select class="tf-select" id="uf-tipo" disabled><option value="' + tEsc(UNILOG_TIPO_FIXO) + '" selected>' + tEsc(UNILOG_TIPO_FIXO) + '</option></select>'
     +     '</div>'
     +     '<div class="tf-field">'
     +       '<label class="tf-label">Especifique sua solicitação <span class="req">*</span></label>'
-    +       '<select class="tf-select" id="uf-especificacao"><option value="">Selecione o Tipo primeiro...</option></select>'
-    +     '</div>'
-    +     '<div class="tf-field" id="uf-endereco-wrap" style="display:none">'
-    +       '<label class="tf-label">Endereço de Entrega</label>'
-    +       '<input class="tf-input" id="uf-endereco" value="' + safeAttr(enderecoCompleto) + '" placeholder="Rua, número, cidade/UF">'
+    +       '<select class="tf-select" id="uf-especificacao">' + especOpcoes + '</select>'
     +     '</div>'
     +     '<div class="tf-field">'
     +       '<label class="tf-label">Seu nome</label>'
@@ -3821,8 +3816,16 @@ function renderUnilogOcorrenciaCard(d) {
     +     '</div>'
     +     '<div class="tf-field">'
     +       '<label class="tf-label">E-mail</label>'
-    +       '<input class="tf-input" id="uf-email" value="' + safeAttr(localStorage.getItem('unilog_agente_email') || '') + '">'
+    +       '<input class="tf-input" id="uf-email" value="' + safeAttr(UNILOG_EMAIL_FIXO) + '" readonly>'
     +     '</div>'
+    +   '</div>'
+    +   '<div class="bloco-body" style="padding-top:0">'
+    +     '<label class="tf-label" style="margin-bottom:6px">Buscar produto no Protheus <span style="font-weight:400;color:var(--ink-4);text-transform:none;font-size:11px">(SKU, EAN ou nome - confirma o produto antes de descrever a ocorrência)</span></label>'
+    +     '<div style="display:flex;gap:8px;margin-bottom:8px">'
+    +       '<input class="tf-input" id="uf-produto-busca" style="flex:1" placeholder="Ex.: RT01020, 7908407004412 ou parte do nome" onkeydown="if(event.key===\'Enter\'){event.preventDefault();unilogBuscarProduto();}">'
+    +       '<button type="button" class="torre-btn-ghost" onclick="unilogBuscarProduto()">Buscar</button>'
+    +     '</div>'
+    +     '<div id="uf-produto-resultados"></div>'
     +   '</div>'
     +   '<div class="bloco-body" style="padding-top:0">'
     +     '<label class="tf-label" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">'
@@ -3854,21 +3857,47 @@ function unilogCopiarDescricao() {
   }
 }
 
-// Repopula "Especifique sua solicitação" conforme o Tipo escolhido, e so
-// mostra "Endereço de Entrega" pro tipo "Entrega" (mesmo comportamento
-// condicional do formulario real) - atualiza via DOM direto, sem
-// re-renderizar o cartao inteiro (apagaria o que a agente ja tivesse
-// digitado nos outros campos).
-function unilogAtualizarEspecificacao() {
-  var tipoSel = document.getElementById('uf-tipo');
-  var espSel = document.getElementById('uf-especificacao');
-  if (!tipoSel || !espSel) return;
-  var opcoes = UNILOG_TIPO_ESPECIFICACAO[tipoSel.value] || [];
-  espSel.innerHTML = ['<option value="">Selecione...</option>'].concat(opcoes.map(function(o) {
-    return '<option value="' + tEsc(o) + '">' + tEsc(o) + '</option>';
-  })).join('');
-  var enderecoWrap = document.getElementById('uf-endereco-wrap');
-  if (enderecoWrap) enderecoWrap.style.display = (tipoSel.value === 'Entrega') ? '' : 'none';
+// Busca produto no cadastro oficial Protheus (04/09/2026, a pedido da Ivna) -
+// GET /api/logistica/produto-protheus (server.ts -> Metabase Gobeaute, banco
+// "Protheus"). Confirma SKU/EAN/nome oficial antes de descrever a ocorrencia,
+// sem depender so do que a Intelipost trouxe no pedido (que pode faltar ou
+// estar incompleto pro item exato que teve avaria/falta).
+function unilogBuscarProduto() {
+  var campo = document.getElementById('uf-produto-busca');
+  var resultados = document.getElementById('uf-produto-resultados');
+  var termo = (campo && campo.value || '').trim();
+  if (!resultados) return;
+  if (!termo) { resultados.innerHTML = '<div class="torre-alert warn" style="margin:0">Digite um SKU, EAN ou parte do nome.</div>'; return; }
+  resultados.innerHTML = '<div class="state-box" style="padding:10px"><p>Buscando...</p></div>';
+  fetchComTimeout('/api/logistica/produto-protheus?termo=' + encodeURIComponent(termo), {}, 15000)
+    .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); })
+    .then(function(res) {
+      if (!res.ok) { resultados.innerHTML = '<div class="torre-alert err" style="margin:0">' + tEsc((res.j && res.j.error) || 'falha na busca') + '</div>'; return; }
+      var produtos = (res.j && res.j.produtos) || [];
+      if (!produtos.length) { resultados.innerHTML = '<div class="state-box" style="padding:10px"><p>Nenhum produto encontrado.</p></div>'; return; }
+      resultados.innerHTML = produtos.map(function(p, i) {
+        return '<div class="bloco-row" style="cursor:pointer" onclick="unilogSelecionarProduto(' + i + ')" title="Clique para adicionar na descrição">'
+          + '<div class="bloco-k">' + tEsc(p.sku || '—') + (p.marca ? ' · ' + tEsc(p.marca) : '') + '</div>'
+          + '<div class="bloco-v">' + tEsc(p.nome || '—') + (p.ean ? ' <span style="color:var(--ink-4)">(EAN ' + tEsc(p.ean) + ')</span>' : '') + '</div>'
+          + '</div>';
+      }).join('');
+      window._unilogProdutosEncontrados = produtos;
+    })
+    .catch(function(e) {
+      resultados.innerHTML = '<div class="torre-alert err" style="margin:0">Erro de conexão: ' + tEsc((e && e.message) || e) + '</div>';
+    });
+}
+
+// Adiciona o produto escolhido como uma linha no topo da descricao - nao
+// substitui o que a agente ja tiver escrito, so insere antes.
+function unilogSelecionarProduto(indice) {
+  var p = (window._unilogProdutosEncontrados || [])[indice];
+  if (!p) return;
+  var linha = 'Produto: ' + (p.nome || '—') + ' | SKU: ' + (p.sku || '—') + ' | EAN: ' + (p.ean || '—');
+  var campo = document.getElementById('uf-descricao');
+  if (campo) campo.value = linha + (campo.value ? '\n' + campo.value : '');
+  var resultados = document.getElementById('uf-produto-resultados');
+  if (resultados) resultados.innerHTML = '<div class="torre-alert ok" style="margin:0">Produto adicionado na descrição.</div>';
 }
 
 // Mesmo padrao de adicionarAnexos (index.html, usado pela Torre) - le como

@@ -2163,11 +2163,18 @@ async function buscarPedidoGocase(env: any, termo: string, tipo: string): Promis
 // precisar de nenhuma consulta ao Titan.
 const METABASE_URL_GOBEAUTE = 'https://metabase.gobeaute.com.br';
 const METABASE_DB_COSMOS = 38;
+// "Protheus" no Metabase Gobeaute (04/09/2026, a pedido da Ivna) - mesma
+// instancia/chave que o Cosmos acima, banco diferente (id 47, confirmado via
+// MCP get_database: engine postgres). Cadastro oficial de produto (SB1010 =
+// tabela mestre de produto do Protheus/TOTVS, SB5010 = dimensoes/embalagem) -
+// usado pra confirmar SKU/EAN/nome antes de abrir ocorrencia na Unilog CD, em
+// vez de depender so do que a Intelipost devolveu no pedido (pode faltar).
+const METABASE_DB_PROTHEUS = 47;
 
-async function metabaseQueryCosmos(env: any, sql: string): Promise<any[] | null> {
+async function metabaseQuery(env: any, database: number, sql: string): Promise<any[] | null> {
   const key = (env as any).METABASE_KEY_GOBEAUTE;
   if (!key) return null;
-  const body = { type: 'native', native: { query: sql }, database: METABASE_DB_COSMOS };
+  const body = { type: 'native', native: { query: sql }, database };
   try {
     const r = await fetchComTimeout(`${METABASE_URL_GOBEAUTE}/api/dataset`, {
       method: 'POST',
@@ -2186,6 +2193,51 @@ async function metabaseQueryCosmos(env: any, sql: string): Promise<any[] | null>
   } catch {
     return null;
   }
+}
+
+async function metabaseQueryCosmos(env: any, sql: string): Promise<any[] | null> {
+  return metabaseQuery(env, METABASE_DB_COSMOS, sql);
+}
+
+// Termo de busca livre (SKU/EAN/parte da descricao, digitado pelo agente) -
+// charset restrito de proposito (sem aspas/ponto-e-virgula) antes de colar no
+// SQL nativo do Metabase; a troca de aspas simples logo abaixo e uma segunda
+// camada, redundante de proposito.
+function termoBuscaProdutoSeguro(termo: string): boolean {
+  return /^[A-Za-zÀ-ÿ0-9 _.\-\/]{1,60}$/.test(termo);
+}
+
+async function buscarProdutosProtheus(env: any, termo: string): Promise<any[]> {
+  const t = termo.trim();
+  if (!t || !termoBuscaProdutoSeguro(t)) return [];
+  const esc = t.replace(/'/g, "''");
+  const sql = `
+    SELECT SB1.B1_COD AS sku, SB1.B1_CODGTIN AS ean, SB1.B1_DESC AS nome,
+      CASE
+        WHEN SB1.B1_GRUPO = '1006' THEN 'By Samia'
+        WHEN SB1.B1_GRUPO = '1007' THEN 'Auá'
+        WHEN SB1.B1_GRUPO = '1003' THEN 'Lescent'
+        WHEN SB1.B1_GRUPO = '1004' THEN 'Kokeshi'
+        WHEN SB1.B1_GRUPO = '1002' THEN 'Barbours'
+        WHEN SB1.B1_GRUPO = '1005' THEN 'Rituária'
+        WHEN SB1.B1_GRUPO = '1001' THEN 'Ápice'
+        WHEN SB1.B1_GRUPO = '1008' THEN 'Yenzah'
+        ELSE SB1.B1_GRUPO
+      END AS marca
+    FROM SB1010 SB1
+    WHERE SB1.D_E_L_E_T_ = ''
+      AND SB1.B1_TIPO NOT IN ('SM','SV','AI','MC','EM')
+      AND (SB1.B1_COD ILIKE '%${esc}%' OR SB1.B1_DESC ILIKE '%${esc}%' OR SB1.B1_CODGTIN ILIKE '%${esc}%')
+    ORDER BY SB1.B1_COD
+    LIMIT 20`;
+  const linhas = await metabaseQuery(env, METABASE_DB_PROTHEUS, sql);
+  // .trim() em tudo: campos do Protheus (SB1010/SB5010) sao CHAR de tamanho
+  // fixo no banco - vem com espaco em branco a direita ate completar o
+  // tamanho da coluna (confirmado ao vivo: "KAP99001       " com 7 espacos).
+  return (linhas || []).map((r: any) => ({
+    sku: String(r.sku || '').trim(), ean: String(r.ean || '').trim(),
+    nome: String(r.nome || '').trim(), marca: String(r.marca || '').trim(),
+  }));
 }
 
 // SKUs vem de dados JA estruturados da Intelipost, nunca digitados livre pelo
@@ -4337,6 +4389,22 @@ export default {
           LOG_TIMEOUT_MS
         );
         return Response.json({ candidatos: Array.isArray(linhas) ? linhas : [] });
+      } catch (e: any) {
+        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
+      }
+    }
+
+    // Busca produto no cadastro oficial Protheus (04/09/2026, a pedido da
+    // Ivna) - ver buscarProdutosProtheus acima. Usado na Unilog CD antes de
+    // abrir ocorrencia, pra confirmar SKU/EAN/nome sem depender so do que a
+    // Intelipost trouxe no pedido.
+    if (url.pathname === '/api/logistica/produto-protheus' && request.method === 'GET') {
+      try {
+        const termo = (url.searchParams.get('termo') || '').trim();
+        if (!termo) return Response.json({ error: 'informe um termo de busca' }, { status: 400 });
+        if (termo.length > 60) return Response.json({ error: 'termo muito longo' }, { status: 400 });
+        const produtos = await buscarProdutosProtheus(env, termo);
+        return Response.json({ produtos, temChaveMetabase: !!env.METABASE_KEY_GOBEAUTE });
       } catch (e: any) {
         return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
       }
