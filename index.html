@@ -2010,7 +2010,7 @@ function renderCardAtrasoTransportadora(kpi) {
   var at = kpi.atraso_transportadora;
   if (!at) return '';
   var restantes = at.dias_restantes;
-  var nDias = function(n) { var a = Math.abs(n); return a + (a === 1 ? ' dia útil' : ' dias úteis'); };
+  var nDias = function(n) { return Math.abs(n) + ' DU'; };
   var classe, valor, rotulo;
   if (restantes < 0) {
     classe = 'is-late';
@@ -2028,7 +2028,7 @@ function renderCardAtrasoTransportadora(kpi) {
   return '<div class="kpi-card kpi-hero ' + classe + '">'
     + '<div class="kpi-label">' + rotulo + '</div>'
     + '<div class="kpi-value">' + valor + '</div>'
-    + '<div class="kpi-sub">' + at.dias_uteis_decorridos + ' de ' + at.prazo_dias + ' dias úteis desde o despacho</div></div>';
+    + '<div class="kpi-sub">' + at.dias_uteis_decorridos + ' de ' + at.prazo_dias + ' DU desde o despacho</div></div>';
 }
 
 function renderTorreKpis(d) {
