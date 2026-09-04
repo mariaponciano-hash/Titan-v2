@@ -758,6 +758,34 @@ def _bate_marca(registro, marca_esperada):
     return projeto == esperado
 
 
+def extrair_numero_pedido_torre(registro):
+    """
+    Deriva o numero de e-commerce da Torre (ex: "SH1099815RT") a partir do
+    "Numero do Pedido" do Titan (confirmado pela Ivna, 04/09/2026): pra toda
+    marca Gobeaute EXCETO apice, o "Numero do Pedido" do Titan e sempre o
+    numero da Torre com a NF colada no final, sem separador (ex: NF 1196008
+    -> Titan mostra "SH38497BS001196008"). Apice fica de fora (e a marca com
+    "Nome Projeto" vazio - ver _bate_marca -, padrao nao confirmado pra ela).
+    Gocase tambem fica de fora - o Titan/Unilog e exclusivo de Gobeaute
+    (Gocase nem chega a ter linha aqui, ver bloqueio em
+    torreSolicitarTitan/index.html - checagem so por seguranca).
+
+    So corta o sufixo IGUAL a "Nota Fiscal" dessa mesma linha - devolve None
+    se o "Numero do Pedido" nao terminar exatamente com a NF (mais seguro que
+    arriscar gravar um valor cortado errado)."""
+    projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper().replace(" ", "")
+    if not projeto:
+        return None  # apice
+    if projeto == "GOCASE":
+        return None
+    nf = _normalizar_espacos(registro.get("Nota Fiscal"))
+    numero_pedido_titan = _normalizar_espacos(registro.get("Número do Pedido"))
+    if not nf or not numero_pedido_titan or not numero_pedido_titan.endswith(nf):
+        return None
+    resto = numero_pedido_titan[:-len(nf)]
+    return resto or None
+
+
 def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):
     """
     Acha, dentro de 'Informacao Pedido', a linha (registro + locator) cujo
