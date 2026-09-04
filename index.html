@@ -3788,6 +3788,13 @@ function renderUnilogOcorrenciaCard(d) {
   window._unilogModoProduto = 'falta';
   window._unilogTroca = { pediu: null, recebeu: null };
   window._unilogProdutosPorSlot = {};
+  // Itens do PEDIDO (ja vem com EAN - ver torreBuscarNaMarca em server.ts,
+  // buscarEanPorSku): usados pra "Falta de item" e pro lado "pediu" de "Item
+  // trocado" (05/09/2026, a pedido da Ivna, igual o CX Hub ja fazia) - o
+  // agente clica no item que o pedido realmente tinha, em vez de buscar de
+  // novo algo que a Central ja sabe. So o lado "recebeu" continua com busca
+  // livre no Protheus, porque esse item NAO esta no pedido.
+  window._unilogProdutosPedido = produtos;
 
   return '<div class="bloco" style="margin-bottom:1.25rem">'
     + '<div class="bloco-head">Dados que a Central já sabe</div>'
@@ -3859,23 +3866,27 @@ function unilogCopiarDescricao() {
   }
 }
 
-// Busca produto no cadastro oficial Protheus (04/09/2026, a pedido da Ivna) -
-// GET /api/logistica/produto-protheus (server.ts -> Metabase Gobeaute, banco
-// "Protheus"). Confirma SKU/EAN/nome oficial antes de descrever a ocorrencia,
-// sem depender so do que a Intelipost trouxe no pedido (que pode faltar ou
-// estar incompleto pro item exato que teve avaria/falta).
+// Selecao de produto pra Unilog CD (04-05/09/2026, a pedido da Ivna).
 //
-// Dois modos (04/09/2026, a pedido da Ivna, no formato exato que ela pediu
-// pra descricao final):
+// Dois modos, formato exato que ela pediu pra descricao final:
 // - "falta": um produto so -> "Pedido faltando SKU X – EAN Y"
 // - "troca": dois produtos (o que o cliente pediu e o que recebeu) -> so
 //   monta a frase quando os DOIS estiverem escolhidos: "Cliente recebeu
 //   trocado: pediu SKU A – EAN B e recebeu SKU C – EAN D"
-// Cada modo/slot tem seu proprio input+resultados (uf-produto-busca-<slot>,
-// uf-produto-resultados-<slot>) pra buscas em paralelo nao se atropelarem.
+//
+// "Falta de item" e o lado "pediu" de "Item trocado" usam os ITENS DO PEDIDO
+// (window._unilogProdutosPedido, ja vem com EAN - ver torreBuscarNaMarca em
+// server.ts) - igual o CX Hub ja fazia: o agente clica no item que o pedido
+// realmente tinha, em vez de buscar de novo algo que a Central ja sabe. Cai
+// pra busca livre no Protheus se o pedido nao tiver itens conhecidos. O lado
+// "recebeu" SEMPRE usa busca livre (GET /api/logistica/produto-protheus,
+// server.ts -> Metabase Gobeaute banco "Protheus") porque esse item nao esta
+// no pedido - a Central nao tem como saber qual foi sem o agente procurar.
 function renderUnilogBuscaProdutoHtml() {
   var modo = window._unilogModoProduto || 'falta';
   var pediu = window._unilogTroca.pediu, recebeu = window._unilogTroca.recebeu;
+  var produtosPedido = window._unilogProdutosPedido || [];
+
   function pill(id, label) {
     var ativo = modo === id;
     return '<button type="button" onclick="unilogSetModoProduto(\'' + id + '\')" style="border:1px solid ' + (ativo ? 'var(--blue)' : 'var(--border-2)')
@@ -3889,16 +3900,34 @@ function renderUnilogBuscaProdutoHtml() {
       + '</div>'
       + '<div id="uf-produto-resultados-' + slot + '"></div>';
   }
+  function linhaProduto(onclick, p) {
+    return '<div class="bloco-row" style="cursor:pointer" onclick="' + onclick + '" title="Clique para usar este produto">'
+      + '<div class="bloco-k">' + tEsc(p.sku || '—') + (p.marca ? ' · ' + tEsc(p.marca) : '') + '</div>'
+      + '<div class="bloco-v">' + tEsc(p.nome || p.descricao || '—') + (p.ean ? ' <span style="color:var(--ink-4)">(EAN ' + tEsc(p.ean) + ')</span>' : '')
+      + (p.quantidade ? ' <span style="color:var(--ink-4)">· qtd ' + tEsc(String(p.quantidade)) + '</span>' : '') + '</div>'
+      + '</div>';
+  }
+  // "falta"/"pediu": lista os itens do proprio pedido (clique direto, sem
+  // input de busca) - so cai pra busca livre se o pedido nao tiver itens.
+  function blocoItensPedido(slot) {
+    if (!produtosPedido.length) {
+      return '<div class="torre-alert warn" style="margin-bottom:8px">Pedido sem itens conhecidos - busque manualmente:</div>' + caixaBusca(slot, 'SKU, EAN ou nome do produto');
+    }
+    return produtosPedido.map(function(p, i) {
+      return linhaProduto('unilogSelecionarProdutoPedido(\'' + slot + '\', ' + i + ')', p);
+    }).join('');
+  }
+
   var html = pill('falta', 'Falta de item') + pill('troca', 'Item trocado') + '<div style="margin-top:10px">';
   if (modo === 'falta') {
-    html += caixaBusca('falta', 'Ex.: RT01020, 7908407004412 ou parte do nome');
+    html += blocoItensPedido('falta');
   } else {
     html += '<div style="margin-bottom:14px">'
-      + '<div class="tf-label" style="font-size:11px;margin-bottom:4px">O cliente pediu'
+      + '<div class="tf-label" style="font-size:11px;margin-bottom:4px">O cliente pediu (itens do pedido)'
       + (pediu ? ' <span style="color:var(--green);font-weight:700">✓ SKU ' + tEsc(pediu.sku) + ' – EAN ' + tEsc(pediu.ean) + '</span>' : '')
-      + '</div>' + caixaBusca('pediu', 'Produto que o cliente pediu') + '</div>'
+      + '</div>' + blocoItensPedido('pediu') + '</div>'
       + '<div>'
-      + '<div class="tf-label" style="font-size:11px;margin-bottom:4px">O cliente recebeu'
+      + '<div class="tf-label" style="font-size:11px;margin-bottom:4px">O cliente recebeu (busca livre)'
       + (recebeu ? ' <span style="color:var(--green);font-weight:700">✓ SKU ' + tEsc(recebeu.sku) + ' – EAN ' + tEsc(recebeu.ean) + '</span>' : '')
       + '</div>' + caixaBusca('recebeu', 'Produto que o cliente recebeu') + '</div>';
   }
@@ -3937,18 +3966,18 @@ function unilogBuscarProduto(slot) {
     });
 }
 
-// "falta": insere a frase na hora. "pediu"/"recebeu": guarda a escolha e so
-// insere a frase de troca quando os DOIS lados estiverem preenchidos.
-function unilogSelecionarProduto(slot, indice) {
-  var p = (window._unilogProdutosPorSlot[slot] || [])[indice];
+// Nucleo comum: "falta" insere a frase na hora. "pediu"/"recebeu" guardam a
+// escolha e so inserem a frase de troca quando os DOIS lados estiverem
+// preenchidos. Compartilhado entre selecionar um item do PEDIDO e um item
+// achado por busca livre (unilogSelecionarProduto/unilogSelecionarProdutoPedido
+// abaixo so resolvem o produto e chamam esta funcao).
+function unilogAplicarProduto(slot, p) {
   if (!p) return;
   var campo = document.getElementById('uf-descricao');
 
   if (slot === 'falta') {
     var linhaFalta = 'Pedido faltando SKU ' + (p.sku || '—') + ' – EAN ' + (p.ean || '—');
-    if (campo) campo.value = linhaFalta + (campo.value ? '\n' + campo.value : '');
-    var resFalta = document.getElementById('uf-produto-resultados-falta');
-    if (resFalta) resFalta.innerHTML = '<div class="torre-alert ok" style="margin:0">Adicionado na descrição.</div>';
+    if (campo) { campo.value = linhaFalta + (campo.value ? '\n' + campo.value : ''); campo.focus(); }
     return;
   }
 
@@ -3965,6 +3994,17 @@ function unilogSelecionarProduto(slot, indice) {
     var wrap2 = document.getElementById('uf-busca-produto-wrap');
     if (wrap2) wrap2.innerHTML = renderUnilogBuscaProdutoHtml();
   }
+}
+
+// Produto vindo da busca livre no Protheus (so o slot "recebeu" chega aqui
+// hoje, ja que "falta"/"pediu" usam os itens do pedido).
+function unilogSelecionarProduto(slot, indice) {
+  unilogAplicarProduto(slot, (window._unilogProdutosPorSlot[slot] || [])[indice]);
+}
+
+// Produto vindo da lista de itens do PROPRIO pedido ("falta" e "pediu").
+function unilogSelecionarProdutoPedido(slot, indice) {
+  unilogAplicarProduto(slot, (window._unilogProdutosPedido || [])[indice]);
 }
 
 // Mesmo padrao de adicionarAnexos (index.html, usado pela Torre) - le como
