@@ -55,9 +55,8 @@
 /* minmax(0,...) em vez de 1fr: com "1fr" puro a coluna nunca encolhe abaixo do
    min-content do card, e um nome longo de transportadora/status empurrava a
    pagina inteira pra fora, criando rolagem horizontal. */
-.torre-kpis{display:grid;grid-template-columns:1.4fr repeat(3,minmax(0,1fr));gap:12px;margin-bottom:1.25rem}
+.torre-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-bottom:1.25rem}
 .torre-kpis.torre-kpis-3{grid-template-columns:repeat(3,minmax(0,1fr))}
-@media(max-width:1400px){.torre-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .kpi-card{background:var(--white);border:1px solid var(--border);border-radius:var(--radius-lg);padding:1rem 1.1rem;display:flex;flex-direction:column;gap:4px;position:relative;overflow:hidden;min-width:0}
 .kpi-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--border-2)}
 .kpi-card.kpi-hero{padding:1.15rem 1.25rem}
@@ -1998,6 +1997,40 @@ function renderCardAtraso(kpi, pedido) {
     + '<div class="kpi-sub">' + sub + '</div></div>';
 }
 
+// Card novo (04/09/2026, a pedido da Ivna): o card "Dias de atraso" acima
+// compara com a previsao original da Intelipost, que NAO e recalculada se o
+// pedido demorou pra sair do CD - entao um pedido pode aparecer com dezenas
+// de dias "atrasados" ali mesmo estando dentro do prazo real, que so comeca a
+// contar depois que a transportadora de fato coleta o pedido (kpi.atraso_transportadora,
+// calculado no backend a partir de pedido.data_envio + transportadora.prazo_dias -
+// ver diasUteisAposDespacho em server.ts). Sem calendario de feriados (nao
+// temos essa base) - conta so dias uteis seg-sex, entao pode subestimar
+// levemente o atraso real em semanas com feriado.
+function renderCardAtrasoTransportadora(kpi) {
+  var at = kpi.atraso_transportadora;
+  if (!at) return '';
+  var restantes = at.dias_restantes;
+  var nDias = function(n) { var a = Math.abs(n); return a + (a === 1 ? ' dia útil' : ' dias úteis'); };
+  var classe, valor, rotulo;
+  if (restantes < 0) {
+    classe = 'is-late';
+    rotulo = 'Atraso (transportadora)';
+    valor = nDias(restantes);
+  } else if (restantes === 0) {
+    classe = 'is-late';
+    rotulo = 'Prazo da transportadora';
+    valor = 'Vence hoje';
+  } else {
+    classe = 'is-ontime';
+    rotulo = 'Prazo da transportadora';
+    valor = nDias(restantes) + ' restantes';
+  }
+  return '<div class="kpi-card kpi-hero ' + classe + '">'
+    + '<div class="kpi-label">' + rotulo + '</div>'
+    + '<div class="kpi-value">' + valor + '</div>'
+    + '<div class="kpi-sub">' + at.dias_uteis_decorridos + ' de ' + at.prazo_dias + ' dias úteis desde o despacho</div></div>';
+}
+
 function renderTorreKpis(d) {
   var kpi = d.kpi || {}, pedido = d.pedido || {}, transp = d.transportadora || {};
   var ultimo = kpi.ultimo_evento;
@@ -2012,6 +2045,7 @@ function renderTorreKpis(d) {
   }
   return '<div class="torre-kpis' + (entregue ? ' torre-kpis-3' : '') + '">'
     + (entregue ? '' : renderCardAtraso(kpi, pedido))
+    + (entregue ? '' : renderCardAtrasoTransportadora(kpi))
     + '<div class="kpi-card' + (entregue ? ' is-ontime' : '') + '">'
     +   '<div class="kpi-label">Status atual</div>'
     +   '<div class="kpi-value-sm" style="margin-top:4px">' + tVal(pedido.status || kpi.status) + '</div>'

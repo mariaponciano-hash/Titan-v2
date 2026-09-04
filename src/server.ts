@@ -1883,6 +1883,29 @@ function calcularAtraso(previsaoIso: any, entregue: boolean, dataEntregaIso: any
   return { dias: Math.round((ref - prev) / 86400000), base: entregue ? 'entrega' : 'hoje' };
 }
 
+// Conta dias uteis (seg-sex) estritamente APOS a data de despacho ate a data
+// de referencia (inclusive) - o proprio dia da coleta nao conta como dia de
+// transito. Sem calendario de feriados (nao temos essa base neste app) - e
+// uma aproximacao, mas mais fiel ao prazo real da transportadora do que dia
+// corrido (04/09/2026, a pedido da Ivna: "Dias de atraso" compara com a
+// previsao original da Intelipost, que fica obsoleta quando o pedido demora
+// pra sair do CD e nao e recalculada a partir da data real de despacho).
+function diasUteisAposDespacho(despachoIso: any, refIso: any): number | null {
+  const d0 = soData(despachoIso);
+  const d1 = soData(refIso);
+  if (!d0 || !d1) return null;
+  const inicio = Date.parse(d0 + 'T00:00:00Z');
+  const fim = Date.parse(d1 + 'T00:00:00Z');
+  if (isNaN(inicio) || isNaN(fim)) return null;
+  if (fim <= inicio) return 0;
+  let count = 0;
+  for (let t = inicio + 86400000; t <= fim; t += 86400000) {
+    const dow = new Date(t).getUTCDay(); // 0=domingo, 6=sabado
+    if (dow !== 0 && dow !== 6) count++;
+  }
+  return count;
+}
+
 // Transforma o JSON gigante da Intelipost (35 KB, 26 eventos aninhados) nos 4
 // blocos + timeline que a tela desenha. Tudo defensivo: cada endpoint da
 // Intelipost devolve um subconjunto levemente diferente dos campos.
@@ -1896,6 +1919,24 @@ function normalizarIntelipost(node: any): any {
   const entregue = !!vol.delivered;
   const previsao = vol.estimated_delivery_date_iso || node.estimated_delivery_date_iso || vol.estimated_delivery_date_lp_iso || node.estimated_delivery_date_lp_iso;
   const atraso = calcularAtraso(previsao, entregue, vol.delivered_date_iso || vol.delivered_date);
+
+  // Atraso "de verdade" segundo a transportadora: dias uteis desde a coleta
+  // (data_envio) contra o prazo contratado (prazo_dias) - ver
+  // diasUteisAposDespacho acima. Diferente do `atraso` logo acima (que
+  // compara com a previsao original da Intelipost desde a COMPRA, nao desde o
+  // despacho) - os dois podem discordar quando o pedido demorou pra sair do
+  // CD: a previsao original ja estourou, mas a transportadora, que so conta o
+  // prazo dela a partir de quando pegou o pedido, ainda esta dentro.
+  const dataEnvio = node.shipped_date_iso || vol.shipped_date_iso || '';
+  const prazoTransportadoraDias = node.estimated_delivery_days_lp != null ? node.estimated_delivery_days_lp : vol.estimated_delivery_days_lp;
+  let atrasoTransportadora: { dias_uteis_decorridos: number; prazo_dias: number; dias_restantes: number } | null = null;
+  if (dataEnvio && prazoTransportadoraDias != null) {
+    const refIso = entregue ? soData(vol.delivered_date_iso || vol.delivered_date) : new Date().toISOString().slice(0, 10);
+    const decorridos = diasUteisAposDespacho(dataEnvio, refIso);
+    if (decorridos !== null) {
+      atrasoTransportadora = { dias_uteis_decorridos: decorridos, prazo_dias: prazoTransportadoraDias, dias_restantes: prazoTransportadoraDias - decorridos };
+    }
+  }
 
   const timeline = hist
     .map((e: any) => {
@@ -2043,6 +2084,7 @@ function normalizarIntelipost(node: any): any {
       status: traduzirStatus(vol.shipment_order_volume_state_localized),
       total_eventos: timeline.length,
       ultimo_evento: timeline.length ? timeline[0] : null,
+      atraso_transportadora: atrasoTransportadora,
     },
     timeline,
   };
