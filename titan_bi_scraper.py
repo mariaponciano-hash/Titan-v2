@@ -738,11 +738,21 @@ def _bate_marca(registro, marca_esperada):
     esse campo). Por isso celula vazia e tratada como sinal confiavel de
     "essa linha e da apice", nao como "nao bate com marca nenhuma" - sem
     isso, toda NF de apice era descartada como "nao encontrada" mesmo
-    existindo certinha na tabela (lote real de NFs em 31/08/2026)."""
+    existindo certinha na tabela (lote real de NFs em 31/08/2026).
+
+    Compara ignorando espaco por completo (nao so colapsando), nao so
+    normalizando (04/09/2026, NF 1196008): o id canonico da Torre pra essa
+    marca e "bysamia" (sem espaco - ver MARCAS em index.html/server.ts),
+    mas o "Nome Projeto" do Titan pra essa mesma marca vem "BY SAMIA" (com
+    espaco) - com normalizacao de espaco (colapsar, nao remover), as duas
+    strings NUNCA batiam, e todo pedido novo de "bysamia" solicitado pela
+    Torre virava "nao encontrado" pra sempre, mesmo existindo certinho no
+    Titan. Sem risco de colisao entre marcas diferentes ao ignorar espaco -
+    sao codigos curtos e distintos mesmo concatenados."""
     if not marca_esperada:
         return True
-    projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper()
-    esperado = _normalizar_espacos(marca_esperada).upper()
+    projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper().replace(" ", "")
+    esperado = _normalizar_espacos(marca_esperada).upper().replace(" ", "")
     if not projeto:
         return esperado == "APICE"
     return projeto == esperado
