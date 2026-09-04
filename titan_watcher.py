@@ -6,6 +6,7 @@ import sys
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from playwright.sync_api import sync_playwright
@@ -60,7 +61,15 @@ def buscar_pendentes():
 
 def marcar_erro(numero_nf, marca, mensagem):
     try:
-        _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{numero_nf}&marca=eq.{marca}", {
+        # urllib.parse.quote() na marca: achado real (04/09/2026, NF 888537/
+        # by samia) - marca com espaco no nome ("by samia") vira URL invalida
+        # sem encoding ("URL can't contain control characters"), o
+        # urllib.request.urlopen JOGA EXCECAO na hora de montar a request -
+        # cai direto no except abaixo, que so imprime e engole. Resultado:
+        # a linha nunca sai de 'pendente', reprocessada a cada 30min pra
+        # sempre falhar do mesmo jeito, silenciosamente. titan_romaneio_links.
+        # py ja fazia esse quote corretamente - so faltava aqui.
+        _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{urllib.parse.quote(numero_nf)}&marca=eq.{urllib.parse.quote(marca)}", {
             "status": "erro",
             "erro": str(mensagem)[:500],
             "atualizado_em": _agora_iso(),
@@ -86,7 +95,7 @@ def marcar_nao_encontrado(numero_nf, marca, mensagem):
     apagados).
     """
     try:
-        _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{numero_nf}&marca=eq.{marca}", {
+        _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{urllib.parse.quote(numero_nf)}&marca=eq.{urllib.parse.quote(marca)}", {
             "status": "erro",
             "erro": str(mensagem)[:500],
             "situacao": None,
@@ -111,7 +120,7 @@ def marcar_nao_encontrado(numero_nf, marca, mensagem):
 
 
 def marcar_concluido(numero_nf, marca, pedido_data, eventos, itens):
-    _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{numero_nf}&marca=eq.{marca}", {
+    _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{urllib.parse.quote(numero_nf)}&marca=eq.{urllib.parse.quote(marca)}", {
         "status": "concluido",
         "erro": None,
         # Depositante/Cliente ficam de fora de proposito - confirmado (JSON
