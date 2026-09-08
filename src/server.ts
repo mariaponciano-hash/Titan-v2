@@ -3880,16 +3880,33 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
       return { ...base, acao: 'pedido ainda nao enviado - segue na fila', code: 'COSMOS_NAO_ENVIADO', cosmos: g.detalhe };
     }
     if (g.veredito === 'morto') {
+      // TEXTO DERIVADO DA FONTE E DO MOTIVO (08/09/2026). Antes era fixo em
+      // "pedido cancelado/estornado no Cosmos", escrito quando o Cosmos era a
+      // unica fonte e cancelamento o unico motivo. Com o fallback da Intelipost
+      // e a checagem de entrega, a frase passou a mentir duas vezes de uma vez:
+      // a tela mostrou "cancelado/estornado no Cosmos (intelipost=DELIVERED)"
+      // num caso em que quem respondeu foi a INTELIPOST e o motivo era ENTREGA,
+      // nao cancelamento.
+      //
+      // Isso importa mais do que parece: rotulo errado manda quem le investigar
+      // o lugar errado. Hoje mesmo eu perdi tempo procurando problema no Cosmos
+      // por causa de uma mensagem que dizia "Cosmos" sem ser dele.
+      const pista = `${g.statusOrigem || ''} ${g.detalhe || ''}`.toLowerCase();
+      const motivo = /deliver|entregue/.test(pista) ? 'pedido ja entregue'
+        : /cancel/.test(pista) ? 'pedido cancelado'
+        : /refund|estorn/.test(pista) ? 'pedido estornado'
+        : 'pedido nao segue mais';
+      const fonte = g.fonte || 'origem';
       await enderecoAtualizar(env, row.id, {
         ...gateGravado,
         status: 'nao_se_aplica',
         ultimo_code: 'COSMOS_PEDIDO_MORTO',
         status_visto_em: new Date().toISOString(),
         disparado_em: null, proxima_tentativa_em: null,
-        ultimo_erro: `pedido cancelado/estornado no Cosmos (${g.detalhe})`,
+        ultimo_erro: `${motivo} - nao ha endereco a alterar (${fonte}: ${g.detalhe})`,
         ultimo_erro_em: new Date().toISOString(),
       });
-      return { ...base, acao: 'nao se aplica - pedido morto no Cosmos', cosmos: g.detalhe };
+      return { ...base, acao: `nao se aplica - ${motivo}`, fonte, cosmos: g.detalhe };
     }
     // TAMBEM FECHA (02/09/2026). Este trecho antes seguia pra criacao, e a
     // justificativa que eu tinha escrito era "nesse caso o creator decide".
