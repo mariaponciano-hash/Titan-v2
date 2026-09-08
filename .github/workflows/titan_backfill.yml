@@ -18,13 +18,14 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # 50min (era 40) - 01/09/2026: agora tambem completa Eventos/Itens de
-    # pedidos que o backfill deixou concluidos sem essa informacao (ver
-    # rechecar_concluidos_sem_eventos em titan_backfill.py), mais 10min de
-    # orcamento proprio pra essa etapa - soma com os 10min do recheck de
-    # situacao presa (28/08/2026), da margem extra sem depender so do
-    # orcamento interno do script.
-    timeout-minutes: 50
+    # 90min (era 50) - 08/09/2026: EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS
+    # subiu de 10 pra 30min (backlog real de 1000+ pedidos EMBARCADO sem
+    # Eventos/Itens, reportado pela Ivna - ver comentario grande no topo de
+    # titan_backfill.py) - exportacao principal + 10min do recheck de
+    # situacao presa + 30min deste recheck ja somam 40min so de orcamento
+    # interno; 90min de teto deixa margem real pra login/export variarem
+    # sem estourar o timeout do job antes mesmo do script terminar sozinho.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
