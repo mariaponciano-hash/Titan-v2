@@ -772,7 +772,15 @@ def extrair_numero_pedido_torre(registro):
 
     So corta o sufixo IGUAL a "Nota Fiscal" dessa mesma linha - devolve None
     se o "Numero do Pedido" nao terminar exatamente com a NF (mais seguro que
-    arriscar gravar um valor cortado errado)."""
+    arriscar gravar um valor cortado errado).
+
+    LOG DE DIAGNOSTICO (08/09/2026, investigando "maioria continua null" pos-
+    fix): pra marca que DEVERIA dar pra derivar (nao apice/gocase), imprime
+    os valores brutos quando mesmo assim devolve None - sem isso nao da pra
+    saber se e um problema de dado real no Titan (campo "Numero do Pedido"
+    veio vazio pra aquele pedido especifico) ou um problema de leitura do
+    scraper (celula nao terminou de renderizar/rolar a tempo) - ver conversa
+    com a Ivna, 08/09/2026."""
     projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper().replace(" ", "")
     if not projeto:
         return None  # apice
@@ -781,9 +789,36 @@ def extrair_numero_pedido_torre(registro):
     nf = _normalizar_espacos(registro.get("Nota Fiscal"))
     numero_pedido_titan = _normalizar_espacos(registro.get("Número do Pedido"))
     if not nf or not numero_pedido_titan or not numero_pedido_titan.endswith(nf):
+        print(f"  (numero_pedido nao derivado pra marca {projeto}: "
+              f"Nota Fiscal={nf!r} Numero do Pedido={numero_pedido_titan!r})", file=sys.stderr)
         return None
     resto = numero_pedido_titan[:-len(nf)]
     return resto or None
+
+
+def _recompletar_se_numero_pedido_vazio(registro, linha, rotulos, tentativas=4, intervalo=0.4):
+    """
+    Investigando (08/09/2026, com a Ivna) por que "numero_pedido" continua
+    None mesmo pra pedidos de marca elegivel (nao apice/gocase) que acabaram
+    de ser processados com sucesso (romaneio/situacao vieram certinhos): uma
+    hipotese ainda NAO confirmada com print real e a celula "Número do
+    Pedido" (ou a linha inteira) nao ter terminado de re-renderizar no
+    instante exato em que _celulas_da_linha le o texto (a tabela e
+    virtualizada - ver docstring de exportar_dados_do_painel). Re-ler a
+    MESMA linha de novo e uma tentativa barata e sem risco (nunca troca um
+    valor ja lido por um pior - so tenta de novo enquanto vier vazio) antes
+    de aceitar "vazio" como definitivo. Se ainda assim vier vazio apos as
+    tentativas, extrair_numero_pedido_torre loga os valores brutos (ver seu
+    docstring) pra confirmar se o campo e realmente vazio no Titan.
+    """
+    for _ in range(tentativas):
+        if _normalizar_espacos(registro.get("Número do Pedido")):
+            return registro
+        time.sleep(intervalo)
+        valores = _celulas_da_linha(linha)
+        n = min(len(rotulos), len(valores))
+        registro = dict(zip(rotulos[:n], valores[:n]))
+    return registro
 
 
 def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):
@@ -864,7 +899,9 @@ def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):
     if marca_esperada:
         batem = [c for c in candidatos if _bate_marca(c[0], marca_esperada)]
         if batem:
-            return batem[0]
+            registro, linha = batem[0]
+            registro = _recompletar_se_numero_pedido_vazio(registro, linha, rotulos)
+            return registro, linha
         # Achou a NF, mas NENHUMA linha e da marca esperada - mais seguro
         # devolver "nao achado" do que arriscar o romaneio de outra marca.
         return None, None
@@ -873,7 +910,9 @@ def _achar_linha_pedido(frame, numero_pedido, marca_esperada=None):
         print(f"  (aviso: '{numero_pedido}' bateu em {len(candidatos)} linhas diferentes - sem marca pra "
               f"desambiguar, usando a primeira. Nomes de projeto encontrados: "
               f"{[c[0].get('Nome Projeto') for c in candidatos]})", file=sys.stderr)
-    return candidatos[0]
+    registro, linha = candidatos[0]
+    registro = _recompletar_se_numero_pedido_vazio(registro, linha, rotulos)
+    return registro, linha
 
 
 def extrair_linha_por_pedido(frame, numero_pedido, marca_esperada=None):
