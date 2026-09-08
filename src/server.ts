@@ -2815,7 +2815,14 @@ function autorizadoEnderecos(request: Request, env: Env): boolean {
 // por falta de configuracao nossa deixaria ~26% do volume (a Apice e a segunda
 // maior marca em ticket de endereco) parado sem que ninguem visse.
 
-const COSMOS_TIMEOUT_MS = 15000;
+// 25s desde 08/09/2026, era 15s. O app do Cosmos responde em ~13ms (medido no
+// X-Runtime da propria resposta), mas ele fica atras do Cloudflare e o caminho
+// Worker -> zona do Cosmos vem sendo atrasado ou barrado: em 02/09 o gate
+// inteiro levou 8,7s, e depois passou a estourar. Subir o teto nao conserta a
+// causa - quem conserta e liberar o trafego de Workers na zona - mas evita
+// perder a consulta quando o atraso e so grande. O fallback pela Intelipost
+// (ver pedidoSaiuPelaIntelipost) e que garante o gate quando isso nao basta.
+const COSMOS_TIMEOUT_MS = 25000;
 
 // Candidatos de nome do campo de status, na ordem. So sao usados quando
 // COSMOS_CAMPO_STATUS nao esta configurado - ver /api/enderecos-cosmos-debug
@@ -3080,7 +3087,7 @@ type StatusPedido = 'sim' | 'nao' | 'morto' | 'desconhecido';
 interface VereditoGate {
   veredito: StatusPedido;
   detalhe: string;
-  fonte?: string;        // cosmos | middleware_v1 | nenhuma
+  fonte?: string;        // cosmos | middleware_v1 | intelipost | nenhuma
   statusOrigem?: string; // o valor cru: waiting, sent, in_transit...
   carrier?: string;      // transportadora, quando a origem informa
 }
@@ -3092,13 +3099,93 @@ interface VereditoGate {
 //                   Cosmos fora, campo de status nao identificado). Segue pra
 //                   criacao e deixa o creator decidir - a alternativa seria
 //                   travar a fila por limitacao nossa.
+// ============ FONTE 3: INTELIPOST (fallback do gate) ============
+//
+// POR QUE EXISTE (08/09/2026): o Cosmos e a fonte preferida, mas o caminho ate
+// ele nao e confiavel de dentro do Worker. Medido: a origem do Cosmos responde
+// em ~13ms (X-Runtime da propria resposta), o host fica atras do Cloudflare, e
+// a chamada Worker -> Cosmos foi de 8,7s em 02/09 a timeout completo em 08/09,
+// gravando `cosmos indisponivel: The operation was aborted` nas linhas das duas
+// apps. Sem uma segunda fonte, a fila simplesmente para quando isso acontece.
+//
+// A Intelipost, por outro lado, a Central JA consulta todo dia - e o que a
+// Torre faz - com chave por marca que ja esta nos secrets. Entao ela vira a
+// rede de seguranca.
+//
+// A INVERSAO IMPORTANTE: pedido que a Intelipost NAO conhece conta como NAO
+// ENVIADO aqui. E o oposto do que o cx-ticketcreator faz - o gate dele lê o
+// mesmo microstatus e, quando o pedido nao esta lá, o veredito fica `unknown` e
+// o handler LIBERA, porque so barra em `not_sent`. Foi assim que o SH1275300KS
+// (waiting no Cosmos) virou ticket em 01/09. Um pedido que a Intelipost nunca
+// viu e a evidencia mais forte de que ele nao saiu do CD, e nao a mais fraca.
+const IP_ESTADOS_ANTES_DE_SAIR = [
+  'NEW', 'LABEL_CREATED', 'READY_FOR_SHIPPING',
+  'PRE_SHIPMENT_LIST_SUCCEEDED', 'CREATED_AT_LOGISTIC_PROVIDER',
+];
+// Estados em que trocar endereco perdeu o sentido - mesma regra do Cosmos.
+const IP_ESTADOS_MORTOS = ['DELIVERED', 'RETURNED', 'CANCELLED', 'CANCELED'];
+// Saiu e ainda esta em jogo. CLARIFY_* entra por prefixo (a Intelipost tem
+// varias variantes: CLARIFY_DELIVERY_DELAYED, CLARIFY_DELIVERY_FAILED...).
+const IP_ESTADOS_JA_SAIU = [
+  'SHIPPED', 'IN_TRANSIT', 'TO_BE_DELIVERED', 'DELIVERY_FAILED', 'RETURNING',
+];
+
+async function pedidoSaiuPelaIntelipost(env: Env, row: any): Promise<VereditoGate> {
+  const alvo = String(row.marca || '').trim().toUpperCase();
+  const marca = MARCAS_LOGISTICA.find((m) => m.marcaSupabase === alvo);
+  if (!marca || !marca.envIntelipost || !(env as any)[marca.envIntelipost]) {
+    return {
+      veredito: 'desconhecido', fonte: 'nenhuma',
+      detalhe: `marca ${row.marca} sem chave da Intelipost pra servir de fallback`,
+    };
+  }
+
+  let node: any;
+  try {
+    node = await buscarIntelipost(env as any, marca, String(row.pedido));
+  } catch (e: any) {
+    return {
+      veredito: 'desconhecido', fonte: 'intelipost',
+      detalhe: `intelipost indisponivel: ${String((e && e.message) || e)}`,
+    };
+  }
+
+  // NAO ENCONTRADO = NAO SAIU. Ver a inversao explicada acima.
+  if (!node) {
+    return {
+      veredito: 'nao', fonte: 'intelipost', statusOrigem: 'ausente_na_intelipost',
+      detalhe: 'a Intelipost nunca rastreou este pedido - tratando como ainda no CD',
+    };
+  }
+
+  const vol = (node.shipment_order_volume_array && node.shipment_order_volume_array[0]) || {};
+  const estado = String(vol.shipment_order_volume_state || '').trim().toUpperCase();
+  const carrier = String(
+    node.logistic_provider_name || vol.logistic_provider_name || ''
+  ).trim() || undefined;
+  const base: VereditoGate = { veredito: 'desconhecido', fonte: 'intelipost', carrier } as any;
+
+  if (vol.delivered === true || IP_ESTADOS_MORTOS.indexOf(estado) !== -1) {
+    return { ...base, veredito: 'morto', statusOrigem: estado || 'entregue', detalhe: `intelipost=${estado || 'delivered'}` };
+  }
+  if (IP_ESTADOS_ANTES_DE_SAIR.indexOf(estado) !== -1) {
+    return { ...base, veredito: 'nao', statusOrigem: estado, detalhe: `intelipost=${estado}` };
+  }
+  if (IP_ESTADOS_JA_SAIU.indexOf(estado) !== -1 || estado.indexOf('CLARIFY') === 0) {
+    return { ...base, veredito: 'sim', statusOrigem: estado, detalhe: `intelipost=${estado}` };
+  }
+  // Estado que nao conhecemos: NAO chuta. O gate fecha em cima de
+  // 'desconhecido', entao a linha e retida e alguem olha.
+  return { ...base, statusOrigem: estado || '(vazio)', detalhe: `intelipost=${estado || '(vazio)'} - estado nao mapeado` };
+}
+
 async function pedidoEstaSent(env: Env, row: any): Promise<VereditoGate> {
   const brandPre = marcaParaBrand(row.marca);
   // Marca que vai pelo Middleware V1 nao depende do Cosmos estar configurado.
   if (!cosmosConfigurado(env)) {
     const ecomIdPre = brandPre ? middlewareV1Ids(env)[brandPre] : null;
     if (ecomIdPre) return pedidoSaiuPeloMiddlewareV1(env, ecomIdPre, row);
-    return { veredito: 'desconhecido', detalhe: 'Cosmos nao configurado (COSMOS_BASE_URL/EMAIL/PASSWORD)' };
+    return pedidoSaiuPelaIntelipost(env, row);
   }
   const brand = marcaParaBrand(row.marca);
   const orgId = brand ? cosmosOrgIds(env)[brand] : null;
@@ -3108,16 +3195,28 @@ async function pedidoEstaSent(env: Env, row: any): Promise<VereditoGate> {
     // inconclusivo e o creator decide.
     const ecomId = brand ? middlewareV1Ids(env)[brand] : null;
     if (ecomId) return pedidoSaiuPeloMiddlewareV1(env, ecomId, row);
-    return { veredito: 'desconhecido', fonte: 'nenhuma', detalhe: `marca ${row.marca} sem fonte de status configurada (nem Cosmos nem Middleware V1)` };
+    return pedidoSaiuPelaIntelipost(env, row);
   }
   let pedido: any;
   try {
     pedido = await cosmosBuscarPedido(env, orgId, row.pedido);
   } catch (e: any) {
-    return { veredito: 'desconhecido', detalhe: `cosmos indisponivel: ${String((e && e.message) || e)}` };
+    // Nao desiste: tenta a Intelipost antes de devolver inconclusivo. Foi por
+    // aqui que a fila parou em 08/09.
+    const ip = await pedidoSaiuPelaIntelipost(env, row);
+    if (ip.veredito !== 'desconhecido') return ip;
+    return {
+      veredito: 'desconhecido',
+      detalhe: `cosmos indisponivel: ${String((e && e.message) || e)}; intelipost tambem nao resolveu: ${ip.detalhe}`,
+    };
   }
   if (!pedido) {
-    return { veredito: 'desconhecido', detalhe: `pedido ${row.pedido} nao encontrado no Cosmos (org ${orgId})` };
+    const ip = await pedidoSaiuPelaIntelipost(env, row);
+    if (ip.veredito !== 'desconhecido') return ip;
+    return {
+      veredito: 'desconhecido',
+      detalhe: `pedido ${row.pedido} nao encontrado no Cosmos (org ${orgId}); intelipost tambem nao resolveu: ${ip.detalhe}`,
+    };
   }
 
   // transportadora: o pedido do Cosmos traz carrier.name (ex. "J&T"), que e a
@@ -3130,6 +3229,8 @@ async function pedidoEstaSent(env: Env, row: any): Promise<VereditoGate> {
 
   const { campo, valor } = cosmosLerStatus(env, pedido);
   if (!valor) {
+    const ipSemCampo = await pedidoSaiuPelaIntelipost(env, row);
+    if (ipSemCampo.veredito !== 'desconhecido') return { ...ipSemCampo, carrier: ipSemCampo.carrier || carrierCosmos };
     return { ...baseCosmos, veredito: 'desconhecido', detalhe: 'nao achei campo de status no pedido do Cosmos - use /api/enderecos-cosmos-debug e fixe COSMOS_CAMPO_STATUS' };
   }
   if (COSMOS_ESTADOS_MORTOS.indexOf(valor) !== -1) {
@@ -5695,13 +5796,35 @@ export default {
         const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
         if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
         const row = rows[0];
-        if (!cosmosConfigurado(env)) return Response.json({ error: 'Cosmos nao configurado (COSMOS_BASE_URL / COSMOS_EMAIL / COSMOS_PASSWORD)' }, { status: 400 });
+        // O que o gate decidiria pra esta linha, agora. Somente leitura.
+        const veredito = await pedidoEstaSent(env, row);
         const brand = marcaParaBrand(row.marca);
+        if (!cosmosConfigurado(env)) {
+          return Response.json({
+            pedido: row.pedido, brand, veredito,
+            aviso: 'Cosmos nao configurado (COSMOS_BASE_URL / COSMOS_EMAIL / COSMOS_PASSWORD) - o veredito acima veio do fallback',
+          });
+        }
         const orgId = brand ? cosmosOrgIds(env)[brand] : null;
-        if (!orgId) return Response.json({ error: `marca ${row.marca} (brand ${brand}) sem organization_id em COSMOS_ORG_IDS` }, { status: 400 });
+        if (!orgId) {
+          return Response.json({
+            pedido: row.pedido, brand, veredito,
+            aviso: `marca ${row.marca} (brand ${brand}) sem organization_id em COSMOS_ORG_IDS - o veredito acima veio do fallback`,
+          });
+        }
 
-        const pedido = await cosmosBuscarPedido(env, orgId, row.pedido);
-        if (!pedido) return Response.json({ pedido: row.pedido, brand, orgId, encontrado: false });
+        let pedido: any = null;
+        let erroCosmos: string | null = null;
+        try {
+          pedido = await cosmosBuscarPedido(env, orgId, row.pedido);
+        } catch (e: any) {
+          // Nao propaga: o objetivo desta rota e DIAGNOSTICAR. Cosmos fora e
+          // justamente um dos resultados que interessa ver, junto do veredito
+          // que o fallback produziu.
+          erroCosmos = String((e && e.message) || e);
+        }
+        if (erroCosmos) return Response.json({ pedido: row.pedido, brand, orgId, cosmosFalhou: erroCosmos, veredito });
+        if (!pedido) return Response.json({ pedido: row.pedido, brand, orgId, encontrado: false, veredito });
 
         const chaves = Object.keys(pedido);
         const pareceStatus = /state|status|situa|sent|ship|envi|fulfil|deliver/i;
@@ -5712,7 +5835,7 @@ export default {
           if (v === null || ['string', 'number', 'boolean'].indexOf(typeof v) !== -1) candidatos[k] = v;
         });
         return Response.json({
-          pedido: row.pedido, brand, orgId, encontrado: true,
+          pedido: row.pedido, brand, orgId, encontrado: true, veredito,
           chavesDoPedido: chaves,
           camposQueParecemStatus: candidatos,
           lidoPeloGate: cosmosLerStatus(env, pedido),
