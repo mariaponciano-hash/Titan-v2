@@ -110,6 +110,8 @@ export interface Env {
   // necessaria porque enderecos_para_ticket guarda endereco de cliente e por
   // isso NAO tem policy de RLS pra role anon - ver sql/001_*.sql.
   TICKET_WEBHOOK_SECRET?: string;
+  // Destino do cx-ticketcreator para a fila de enderecos. Ver ticketApiUrl.
+  TICKET_API_URL?: string;
   // Chave dedicada da porta de entrada da fila. Ver autorizadoEnfileirar.
   ENDERECOS_INGEST_KEY?: string;
   SB_SERVICE_KEY?: string;
@@ -194,7 +196,30 @@ const TEXTO_AVARIA_AUTOMATICO = 'O procedimento ideal é que a transportadora at
 // transformar. Se o formato estiver errado o sintoma NAO e erro: a consulta
 // devolve exists:false pra sempre (armadilha (b) do doc). Por isso
 // reconciliarEnderecos() trata divergencia como alerta, nao como silencio.
-const TICKET_API_URL = 'https://cx-ticketcreator-prod.rpa-ia.workers.dev';
+// Destino de PRODUCAO do cx-ticketcreator. Usado quando o secret
+// TICKET_API_URL nao esta configurado, para o comportamento nao mudar em quem
+// ja estava rodando.
+const TICKET_API_URL_PADRAO = 'https://cx-ticketcreator-prod.rpa-ia.workers.dev';
+
+// CONFIGURAVEL DESDE 08/09/2026, e nao por gosto de configuracao.
+//
+// Antes o destino era fixo no codigo, apontando para a producao do creator.
+// Consequencia pratica: NAO havia como exercitar o disparo sem abrir ticket de
+// verdade com uma transportadora, para a entrega de uma cliente real. Todo
+// teste do caminho `sim -> POST` era ou perigoso ou impossivel, e por isso esse
+// trecho seguiu sem teste de ponta a ponta.
+//
+// Com o secret, a staging aponta para o creator de staging e o caminho inteiro
+// pode ser exercitado com pedido real ja despachado, sem consequencia externa.
+// Sem o secret, nada muda: cai no padrao de producao.
+//
+// Isso tambem encerra uma divergencia que eu mesma criei: a Torre ja usava o
+// secret TICKETS_CREATOR_URL para a mesma coisa, e a fila usava constante. Dois
+// jeitos de dizer o mesmo endereco e um convite a apontarem para lugares
+// diferentes sem ninguem perceber.
+function ticketApiUrl(env: Env): string {
+  return String(env.TICKET_API_URL || TICKET_API_URL_PADRAO).replace(/\/+$/, '');
+}
 
 // Case-sensitive e com acento, de proposito. O doc avisa que typo aqui nao da
 // erro: devolve exists:false silencioso. Fica como constante justamente pra
@@ -2807,8 +2832,32 @@ function usuarioInterno(request: Request): string | null {
 // quem a tiver grava linha na fila, e a linha ainda passa pelo gate.
 function autorizadoEnfileirar(request: Request, env: Env): boolean {
   if (autorizadoEnderecos(request, env)) return true;
-  const chave = request.headers.get('x-trigger-key');
-  return !!chave && !!env.ENDERECOS_INGEST_KEY && chave === env.ENDERECOS_INGEST_KEY;
+
+  // COMPARACAO COM trim() NOS DOIS LADOS (08/09/2026). Espaco ou quebra de
+  // linha em segredo nunca e intencional, e cola de admin web e de terminal
+  // trazem os dois com facilidade - hoje mesmo o COSMOS_BASE_URL entrou com um
+  // trecho de JSON grudado. Sem o trim, o sintoma e um 401 sem explicacao, que
+  // e caro de diagnosticar: nao da pra ver o valor de nenhum dos lados.
+  const enviada = String(request.headers.get('x-trigger-key') || '').trim();
+  const esperada = String(env.ENDERECOS_INGEST_KEY || '').trim();
+  if (enviada && esperada && enviada === esperada) return true;
+
+  // DIAGNOSTICO SEM VAZAR VALOR: so tamanhos e um veredito. Com isso um 401
+  // vira uma linha de log que diz o que fazer, em vez de deixar quem integra
+  // adivinhando entre "chave errada", "chave nao cadastrada" e "espaco na
+  // cola". NUNCA logar o valor: iria pro log da plataforma, que muita gente le.
+  if (esperada || enviada) {
+    console.error(
+      `[enderecos-enfileirar] chave recusada: header ${enviada ? enviada.length + ' chars' : 'AUSENTE'}`
+      + `, secret ${esperada ? esperada.length + ' chars' : 'NAO CADASTRADO'}`
+      + (enviada && esperada
+        ? (enviada.length === esperada.length
+            ? ' - mesmo tamanho, entao o conteudo difere: chave trocada'
+            : ' - tamanhos diferentes: valor incompleto ou de outra chave')
+        : '')
+    );
+  }
+  return false;
 }
 
 function autorizadoEnderecos(request: Request, env: Env): boolean {
@@ -3554,7 +3603,7 @@ interface ConsultaTicket {
 async function enderecoConsultarTicket(env: Env, reference: string): Promise<ConsultaTicket> {
   const secret = env.TICKET_WEBHOOK_SECRET;
   if (!secret) throw new Error('TICKET_WEBHOOK_SECRET nao configurada (no Infisical: WEBHOOK_SECRET)');
-  const url = `${TICKET_API_URL}/tickets?reference=${encodeURIComponent(reference)}&issue_type=${encodeURIComponent(TICKET_ISSUE_TYPE_ENDERECO)}`;
+  const url = `${ticketApiUrl(env)}/tickets?reference=${encodeURIComponent(reference)}&issue_type=${encodeURIComponent(TICKET_ISSUE_TYPE_ENDERECO)}`;
   const r = await fetchComTimeout(url, { headers: { 'x-webhook-secret': secret } }, ENDERECO_TIMEOUT_MS);
   const texto = await r.text();
   let data: any = null;
@@ -3760,7 +3809,7 @@ async function enderecoCriarTicket(env: Env, row: any, mock?: string | null): Pr
   }
 
   const r = await fetchComTimeout(
-    `${TICKET_API_URL}/gogroup-tickets-clind`,
+    `${ticketApiUrl(env)}/gogroup-tickets-clind`,
     {
       method: 'POST',
       headers: { 'x-webhook-secret': env.TICKET_WEBHOOK_SECRET as string, 'Content-Type': 'application/json' },
@@ -5908,7 +5957,7 @@ export default {
         const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
         if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
         return Response.json({
-          destino: TICKET_API_URL + '/gogroup-tickets-clind',
+          destino: ticketApiUrl(env) + '/gogroup-tickets-clind',
           metodo: 'POST',
           headers: { 'x-webhook-secret': '<TICKET_WEBHOOK_SECRET>', 'Content-Type': 'application/json' },
           payload: montarPayloadCriacaoEndereco(rows[0]),
