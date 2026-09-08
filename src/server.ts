@@ -110,6 +110,8 @@ export interface Env {
   // necessaria porque enderecos_para_ticket guarda endereco de cliente e por
   // isso NAO tem policy de RLS pra role anon - ver sql/001_*.sql.
   TICKET_WEBHOOK_SECRET?: string;
+  // Chave dedicada da porta de entrada da fila. Ver autorizadoEnfileirar.
+  ENDERECOS_INGEST_KEY?: string;
   SB_SERVICE_KEY?: string;
   // Gate do "sent" via Cosmos - ver o bloco GATE DO "SENT" VIA COSMOS.
   // COSMOS_ORG_IDS e um JSON marca->organization_id (um secret em vez de sete).
@@ -2785,6 +2787,30 @@ function usuarioInterno(request: Request): string | null {
 
 // Autorizacao das rotas /api/enderecos-*: SSO do gateway, OU trigger key
 // (mantida pra chamada de fora do navegador), OU cron do GoDeploy.
+// Autorizacao da PORTA DE ENTRADA da fila, so dela.
+//
+// Aceita tudo que as outras rotas /api/enderecos-* aceitam (SSO do gateway,
+// CLASSIFY_TRIGGER_KEY, cron assinado) e TAMBEM uma chave dedicada,
+// ENDERECOS_INGEST_KEY, no mesmo header x-trigger-key.
+//
+// POR QUE UMA CHAVE SO PRA ISSO (08/09/2026): quem escreve na fila de fora
+// deste worker e o bot, e chamada servidor-a-servidor nao tem navegador nem
+// sessao - o SSO nao serve (medido: o gateway responde 302 pra /auth/login).
+// Sobra chave compartilhada.
+//
+// Mas a chave que ja existia, CLASSIFY_TRIGGER_KEY, autoriza TODAS as rotas
+// protegidas do app: processar a fila inteira, criar ticket manual, disparar a
+// classificacao de Gmail. Entregar ela a um sistema externo daria a ele muito
+// mais poder do que enfileirar - e como e a mesma chave que autoriza agente na
+// producao (que e app publico e nao tem SSO), rotacionar por causa do bot
+// tiraria o acesso de todo mundo junto. Esta aqui so enfileira: no pior caso,
+// quem a tiver grava linha na fila, e a linha ainda passa pelo gate.
+function autorizadoEnfileirar(request: Request, env: Env): boolean {
+  if (autorizadoEnderecos(request, env)) return true;
+  const chave = request.headers.get('x-trigger-key');
+  return !!chave && !!env.ENDERECOS_INGEST_KEY && chave === env.ENDERECOS_INGEST_KEY;
+}
+
 function autorizadoEnderecos(request: Request, env: Env): boolean {
   if (usuarioInterno(request)) return true;
   return autorizado(request, env);
@@ -5744,7 +5770,10 @@ export default {
     // aqui dentro e chama enfileirarEndereco() direto - sem HTTP, sem URL, sem
     // secret. Esta rota existe pro caso de o bot ou o n8n quererem usar.
     if (url.pathname === '/api/enderecos-enfileirar' && request.method === 'POST') {
-      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      // autorizadoEnfileirar, e nao autorizadoEnderecos: esta e a unica rota que
+      // aceita a chave dedicada do bot. As outras seguem exigindo SSO, a trigger
+      // key do app ou o cron.
+      if (!autorizadoEnfileirar(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
       try {
         const b: any = await request.json().catch(() => ({}));
         const res = await enfileirarEndereco(env, { ...b, origem: b.origem || 'externo' });
