@@ -3904,9 +3904,9 @@ function renderUnilogBuscaProdutoHtml() {
       corpo = '<div style="color:var(--green);font-size:12px;font-weight:700;margin-top:4px">✓ '
         + (res.tipo === 'falta' ? 'Marcado como faltando' : ('Trocado - cliente recebeu SKU ' + tEsc(res.recebeu.sku))) + '</div>';
     } else {
-      corpo = '<div style="display:flex;gap:8px;margin-top:6px">'
-        + '<button type="button" class="torre-btn-ghost" onclick="unilogResolverItemFalta(' + i + ')">Faltou</button>'
-        + '<button type="button" class="torre-btn-ghost" onclick="unilogAbrirTrocaItem(' + i + ')">Veio trocado</button>'
+      corpo = '<div style="display:flex;gap:10px;margin-top:8px">'
+        + '<button type="button" onclick="unilogResolverItemFalta(' + i + ')" style="display:inline-flex;align-items:center;gap:6px;border:1.5px solid var(--orange);background:var(--orange-bg);color:var(--orange);border-radius:20px;padding:8px 16px;cursor:pointer;font-family:\'Poppins\',sans-serif;font-size:12.5px;font-weight:700">⚠ Item faltante</button>'
+        + '<button type="button" onclick="unilogAbrirTrocaItem(' + i + ')" style="display:inline-flex;align-items:center;gap:6px;border:1.5px solid var(--purple);background:var(--purple-bg);color:var(--purple);border-radius:20px;padding:8px 16px;cursor:pointer;font-family:\'Poppins\',sans-serif;font-size:12.5px;font-weight:700">⇄ Item trocado</button>'
         + '</div>'
         + '<div id="uf-troca-busca-' + i + '" style="display:none;margin-top:8px">'
         +   '<div class="tf-label" style="font-size:11px;margin-bottom:4px">Produto que o cliente recebeu no lugar</div>'
