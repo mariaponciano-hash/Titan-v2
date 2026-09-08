@@ -3272,16 +3272,65 @@ async function vereditoPeloPedidoCosmos(env: Env, row: any, pedido: any): Promis
   if (!valor) {
     const ipSemCampo = await pedidoSaiuPelaIntelipost(env, row);
     if (ipSemCampo.veredito !== 'desconhecido') return { ...ipSemCampo, carrier: ipSemCampo.carrier || carrierCosmos };
-    return { ...baseCosmos, veredito: 'desconhecido', detalhe: 'nao achei campo de status no pedido do Cosmos - use /api/enderecos-cosmos-debug e fixe COSMOS_CAMPO_STATUS' };
+    return { ...baseCosmos, veredito: 'desconhecido', detalhe: 'nao achei campo de status no pedido do Cosmos - use /api/enderecos-cosmos-debug pra ver as chaves' };
   }
+  // Segunda leitura de morte, agora no campo de fase: cobre o caso de o
+  // carimbo canceled_at nao ter sido preenchido mas o estado dizer cancelado.
   if (COSMOS_ESTADOS_MORTOS.indexOf(valor) !== -1) {
     return { ...baseCosmos, veredito: 'morto', statusOrigem: valor, detalhe: `${campo}=${valor}` };
   }
+
+  // DESPACHO EXIGE EVIDENCIA POSITIVA (08/09/2026). Reescrito depois de a Maria
+  // testar com pedido real e o gate responder "pode disparar" para pedido que
+  // estava no CD.
+  //
+  // O QUE ESTAVA ERRADO: LISTA INVERTIDA. Eu enumerava o que significa "nao
+  // enviado" (waiting/aguardando/pending/created) e tratava TODO o resto como
+  // enviado, apostando que o creator seguraria o resto. Duas falhas:
+  //   1. o creator NAO segura - o gate dele le microstatus da Intelipost e
+  //      libera quando o veredito e `unknown`;
+  //   2. `integrated` e o estado NORMAL de pre-envio no Cosmos, e nao estava na
+  //      lista. Medido em dois pedidos reais de marcas diferentes
+  //      (SH1324791KS/kokeshi, LABEL_CREATED; SH1242272RT/rituaria,
+  //      READY_FOR_SHIPPING): ambos deram `sim`. O gate estava aberto no caso
+  //      COMUM, nao num canto raro.
+  //
+  // O QUE VALE AGORA: so dispara quando o Cosmos AFIRMA o despacho, via
+  // `sent_at`. Ancorado em medicao - num pedido despachado (SH1304207KS) o
+  // sent_at do Cosmos e o dispatched_at da Intelipost batem ao segundo:
+  //     sent_at       2026-09-08T09:51:30.374-03:00
+  //     dispatched_at 2026-09-08T12:51:30+00:00
+  // E e timestamp, nao string: um estado novo no Cosmos nao reabre o gate
+  // sozinho, que era o defeito estrutural da lista invertida.
+  //
+  // ARMADILHAS DESCARTADAS, todas medidas nesse mesmo pedido:
+  //   - `distribution_center_status: "sent"` - "sent" ali e enviado AO CD, nao
+  //     despachado. Gate em "qualquer campo com sent no nome" erraria.
+  //   - `sent_tms_at` e `sent_to_distribution_center_at` estavam preenchidos de
+  //     06/09, DOIS DIAS antes do despacho real de 08/09.
+  //   - `erp_status: "invoiced"` e faturamento, nao despacho.
+  const despachadoEm = String((pedido && pedido.sent_at) || '').trim();
+  if (!despachadoEm) {
+    return {
+      ...baseCosmos, veredito: 'nao', statusOrigem: valor,
+      detalhe: `sent_at vazio (${campo}=${valor}) - ainda no CD`,
+    };
+  }
+
+  // O Cosmos afirma o despacho. A lista de "nao enviado" fica como segunda
+  // tranca: se o estado ainda diz que nao saiu, a contradicao segura a linha em
+  // vez de disparar. Nao deveria acontecer - se acontecer, quero ver na tela.
   const naoEnviado = (env.COSMOS_ESTADOS_NAO_ENVIADO
     ? String(env.COSMOS_ESTADOS_NAO_ENVIADO).split(',')
     : COSMOS_ESTADOS_NAO_ENVIADO_PADRAO).map((x) => x.trim().toLowerCase()).filter(Boolean);
-  if (naoEnviado.indexOf(valor) !== -1) return { ...baseCosmos, veredito: 'nao', statusOrigem: valor, detalhe: `${campo}=${valor}` };
-  return { ...baseCosmos, veredito: 'sim', statusOrigem: valor, detalhe: `${campo}=${valor}` };
+  if (naoEnviado.indexOf(valor) !== -1) {
+    return {
+      ...baseCosmos, veredito: 'nao', statusOrigem: valor,
+      detalhe: `contradicao: sent_at=${despachadoEm} mas ${campo}=${valor} - seguro`,
+    };
+  }
+
+  return { ...baseCosmos, veredito: 'sim', statusOrigem: valor, detalhe: `sent_at=${despachadoEm} (${campo}=${valor})` };
 }
 
 
