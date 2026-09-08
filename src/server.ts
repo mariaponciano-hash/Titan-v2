@@ -4386,82 +4386,17 @@ export default {
       }
     }
 
-    // ---- Torre de Controle: pede pro Titan BI consultar o romaneio de um
-    // pedido (fila - ver comentario grande em TITAN_SB_URL acima). A CHAVE E
-    // (NOTA FISCAL, MARCA) - migrado de so-NF em 24/08/2026 depois de achar,
-    // com print real da tela do Titan, que a MESMA NF aparece em mais de uma
-    // linha (uma por marca), CADA UMA com romaneio diferente (ex: NF 940380:
-    // Kokeshi 169114, Rituaria 173827) - o risco que tinhamos combinado como
-    // "raro, pode arriscar" aconteceu de verdade. "marca" aqui e o id da
-    // Torre (ex: "rituaria") - o scraper compara sem diferenciar caixa contra
-    // o "Nome Projeto" do Titan (ex: "RITUARIA"). So insere se ainda nao
-    // existir NENHUMA linha pra essa combinacao, pra nao voltar um
-    // "concluido" antigo (ou um resultado ja trazido pelo backfill) pra
-    // 'pendente' de novo a cada clique repetido.
-    if (url.pathname === '/api/logistica/titan-solicitar' && request.method === 'POST') {
-      try {
-        const body: any = await request.json().catch(() => ({}));
-        const numeroNf = String(body.numero_nf || '').trim();
-        const numeroPedido = String(body.numero_pedido || '').trim();
-        const marca = String(body.marca || '').trim();
-        if (!numeroNf) return Response.json({ error: 'numero_nf obrigatorio (Titan BI so e buscavel por Nota Fiscal)' }, { status: 400 });
-        if (!marca) return Response.json({ error: 'marca obrigatoria (NF sozinha pode ser de mais de uma marca - ver comentario acima)' }, { status: 400 });
-
-        const jaExiste = await fetchJsonComTimeout(
-          `${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}&select=numero_nf,status,eventos`,
-          { headers: titanHeaders() },
-          LOG_TIMEOUT_MS
-        );
-        if (Array.isArray(jaExiste) && jaExiste.length) {
-          const statusAtual = jaExiste[0].status;
-          // Bug real achado pela Ivna, 27/08/2026: um pedido que so passou
-          // pelo titan_backfill.py (que de proposito nao coleta Eventos/Itens,
-          // so os campos da tabela principal, pra ser rapido - ver docstring
-          // grande em titan_backfill.py) fica com status='concluido' mas
-          // eventos/itens NULL pra sempre - a Unilog CD (que precisa desses
-          // dois campos) nunca teria como resolver isso, porque 'concluido'
-          // sozinho era tratado como "ja resolvido, nao mexe". Agora tambem
-          // reenfileira quando concluido mas sem eventos - o processamento
-          // avulso (titan_cf_worker) sempre clica no pedido e extrai
-          // Eventos/Itens, entao isso completa o que o backfill deixou de
-          // fora, sem reprocessar quem ja tem tudo.
-          const concluidoSemEventos = statusAtual === 'concluido' && jaExiste[0].eventos == null;
-          // 'erro' vale re-enfileirar (ex: falha transitoria na primeira
-          // tentativa) - 'pendente' fica como esta (nao interrompe um
-          // processamento em andamento).
-          if (statusAtual === 'erro' || concluidoSemEventos) {
-            await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}`, {
-              method: 'PATCH',
-              headers: { ...titanHeaders(), Prefer: 'return=minimal' },
-              body: JSON.stringify({ status: 'pendente', erro: null, numero_pedido: numeroPedido || undefined }),
-            }, LOG_TIMEOUT_MS);
-            return Response.json({ ok: true, ja_existia: true, status: 'pendente' });
-          }
-          return Response.json({ ok: true, ja_existia: true, status: statusAtual });
-        }
-
-        const r = await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/infos_titan`, {
-          method: 'POST',
-          headers: { ...titanHeaders(), Prefer: 'return=minimal' },
-          body: JSON.stringify({
-            numero_nf: numeroNf,
-            numero_pedido: numeroPedido || null,
-            marca,
-            status: 'pendente',
-          }),
-        }, LOG_TIMEOUT_MS);
-        if (!r.ok) {
-          const t = await r.text().catch(() => '');
-          return Response.json({ error: `Supabase respondeu ${r.status}: ${t.slice(0, 300)}` }, { status: 502 });
-        }
-        return Response.json({ ok: true, ja_existia: false, status: 'pendente' });
-      } catch (e: any) {
-        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
-      }
-    }
-
-    // ---- Torre de Controle: consulta o status/resultado da fila do Titan
-    // (chave = NF+marca, mesmo motivo do endpoint acima) ----
+    // ---- Torre de Controle: consulta o que o Titan BI ja tem pra um pedido
+    // (chave = NOTA FISCAL, MARCA - migrado de so-NF em 24/08/2026 depois de
+    // achar, com print real da tela do Titan, que a MESMA NF aparece em mais
+    // de uma linha, uma por marca, CADA UMA com romaneio diferente: ex NF
+    // 940380, Kokeshi 169114 x Rituaria 173827). SO LEITURA (08/09/2026, a
+    // pedido da Ivna - existia um POST /api/logistica/titan-solicitar aqui
+    // que cadastrava/reenfileirava linha em infos_titan a cada busca da
+    // Torre/Unilog CD; removido de proposito - infos_titan agora e povoada
+    // EXCLUSIVAMENTE pelo que o titan_backfill.py/titan-watcher-worker
+    // trazem sozinhos do Titan, 2x/dia e a cada 5min respectivamente, nunca
+    // por uma busca avulsa daqui). ----
     if (url.pathname === '/api/logistica/titan-status' && request.method === 'GET') {
       try {
         const numeroNf = (url.searchParams.get('nf') || '').trim();
