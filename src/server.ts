@@ -3219,6 +3219,13 @@ async function pedidoEstaSent(env: Env, row: any): Promise<VereditoGate> {
     };
   }
 
+  return vereditoPeloPedidoCosmos(env, row, pedido);
+}
+
+// Interpreta um pedido JA BUSCADO do Cosmos e devolve o veredito. Separada de
+// pedidoEstaSent (08/09/2026) pra que a rota de diagnostico use exatamente esta
+// logica sem buscar o pedido uma segunda vez.
+async function vereditoPeloPedidoCosmos(env: Env, row: any, pedido: any): Promise<VereditoGate> {
   // transportadora: o pedido do Cosmos traz carrier.name (ex. "J&T"), que e a
   // informacao que decide se a Regra 1 vai aceitar a alteracao.
   const carrierCosmos = String(
@@ -5791,24 +5798,43 @@ export default {
     if (url.pathname === '/api/enderecos-cosmos-debug' && request.method === 'GET') {
       if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
       try {
+        // DUAS FORMAS DE CHAMAR, de proposito:
+        //   ?id=15                              -> uma linha da fila
+        //   ?pedido=SH1275300KS&marca=KOKESHI   -> um pedido qualquer
+        // A segunda existe porque investigar um pedido nao deveria exigir
+        // enfileirar ele primeiro: em 08/09 a gente precisou olhar um pedido
+        // CANCELADO tres vezes e sempre dependeu de haver linha na tabela, o
+        // que suja a fila e, pior, deixa a linha elegivel pra disparo.
         const id = url.searchParams.get('id');
-        if (!id) return Response.json({ error: 'id obrigatorio (id da linha em enderecos_para_ticket)' }, { status: 400 });
-        const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
-        if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
-        const row = rows[0];
-        // O que o gate decidiria pra esta linha, agora. Somente leitura.
-        const veredito = await pedidoEstaSent(env, row);
+        const pedidoQS = (url.searchParams.get('pedido') || '').trim();
+        const marcaQS = (url.searchParams.get('marca') || '').trim().toUpperCase();
+        let row: any;
+        if (id) {
+          const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
+          if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
+          row = rows[0];
+        } else if (pedidoQS && marcaQS) {
+          // Linha sintetica: nao existe na tabela e nao e gravada em lugar
+          // nenhum. So o gate le, e ele so precisa de pedido + marca.
+          row = { id: null, pedido: pedidoQS, marca: marcaQS };
+        } else {
+          return Response.json({
+            error: 'informe ?id=<id da linha> ou ?pedido=<numero>&marca=<MARCA>',
+          }, { status: 400 });
+        }
         const brand = marcaParaBrand(row.marca);
         if (!cosmosConfigurado(env)) {
           return Response.json({
-            pedido: row.pedido, brand, veredito,
+            pedido: row.pedido, brand,
+            veredito: await pedidoEstaSent(env, row),
             aviso: 'Cosmos nao configurado (COSMOS_BASE_URL / COSMOS_EMAIL / COSMOS_PASSWORD) - o veredito acima veio do fallback',
           });
         }
         const orgId = brand ? cosmosOrgIds(env)[brand] : null;
         if (!orgId) {
           return Response.json({
-            pedido: row.pedido, brand, veredito,
+            pedido: row.pedido, brand,
+            veredito: await pedidoEstaSent(env, row),
             aviso: `marca ${row.marca} (brand ${brand}) sem organization_id em COSMOS_ORG_IDS - o veredito acima veio do fallback`,
           });
         }
@@ -5823,8 +5849,18 @@ export default {
           // que o fallback produziu.
           erroCosmos = String((e && e.message) || e);
         }
-        if (erroCosmos) return Response.json({ pedido: row.pedido, brand, orgId, cosmosFalhou: erroCosmos, veredito });
-        if (!pedido) return Response.json({ pedido: row.pedido, brand, orgId, encontrado: false, veredito });
+        if (erroCosmos) {
+          return Response.json({
+            pedido: row.pedido, brand, orgId, cosmosFalhou: erroCosmos,
+            veredito: await pedidoSaiuPelaIntelipost(env, row),
+          });
+        }
+        if (!pedido) {
+          return Response.json({
+            pedido: row.pedido, brand, orgId, encontrado: false,
+            veredito: await pedidoSaiuPelaIntelipost(env, row),
+          });
+        }
 
         const chaves = Object.keys(pedido);
         const pareceStatus = /state|status|situa|sent|ship|envi|fulfil|deliver/i;
@@ -5835,7 +5871,9 @@ export default {
           if (v === null || ['string', 'number', 'boolean'].indexOf(typeof v) !== -1) candidatos[k] = v;
         });
         return Response.json({
-          pedido: row.pedido, brand, orgId, encontrado: true, veredito,
+          pedido: row.pedido, brand, orgId, encontrado: true,
+          // mesmo objeto, mesma logica do gate, UMA consulta
+          veredito: await vereditoPeloPedidoCosmos(env, row, pedido),
           chavesDoPedido: chaves,
           camposQueParecemStatus: candidatos,
           lidoPeloGate: cosmosLerStatus(env, pedido),
