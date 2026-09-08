@@ -4125,7 +4125,7 @@ export default {
         if (!marca) return Response.json({ error: 'marca obrigatoria (NF sozinha pode ser de mais de uma marca - ver comentario acima)' }, { status: 400 });
 
         const jaExiste = await fetchJsonComTimeout(
-          `${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}&select=numero_nf,status,eventos`,
+          `${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}&select=numero_nf,status,eventos,numero_pedido`,
           { headers: titanHeaders() },
           LOG_TIMEOUT_MS
         );
@@ -4153,6 +4153,24 @@ export default {
               body: JSON.stringify({ status: 'pendente', erro: null, numero_pedido: numeroPedido || undefined }),
             }, LOG_TIMEOUT_MS);
             return Response.json({ ok: true, ja_existia: true, status: 'pendente' });
+          }
+          // BUG CORRIGIDO (08/09/2026): linha criada pelo titan_backfill.py fica
+          // com numero_pedido NULL pra sempre de proposito (ver registro_para_
+          // supabase) - a unica forma de completar esse campo e uma chamada
+          // futura deste endpoint, feita pela Torre, que ja sabe o numero de
+          // e-commerce certo. Mas esse retorno antecipado ("ja_existia") nunca
+          // chegava a gravar nada quando a linha ja estava 'pendente' ou
+          // 'concluido' com eventos - por isso a infos_titan tinha centenas de
+          // milhares de linhas com numero_pedido NULL mesmo depois de
+          // resolvidas. Agora, sempre que a linha existente ainda nao tem
+          // numero_pedido e a requisicao trouxe um valor, completa so essa
+          // coluna (sem tocar em status/erro/demais campos).
+          if (!jaExiste[0].numero_pedido && numeroPedido) {
+            await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}`, {
+              method: 'PATCH',
+              headers: { ...titanHeaders(), Prefer: 'return=minimal' },
+              body: JSON.stringify({ numero_pedido: numeroPedido }),
+            }, LOG_TIMEOUT_MS);
           }
           return Response.json({ ok: true, ja_existia: true, status: statusAtual });
         }
