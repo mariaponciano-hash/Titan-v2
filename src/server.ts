@@ -3234,6 +3234,40 @@ async function vereditoPeloPedidoCosmos(env: Env, row: any, pedido: any): Promis
   ).trim() || undefined;
   const baseCosmos = { fonte: 'cosmos', carrier: carrierCosmos };
 
+  // MORTE ANTES DE TUDO (08/09/2026). Achado pela Maria olhando o pedido no
+  // Cosmos: o SH1275300KS estava CANCELADO, e o gate nao via.
+  //
+  // O motivo: o gate lia so o campo configurado em COSMOS_CAMPO_STATUS
+  // (logistic_status), e num pedido cancelado os campos de FASE ficam em
+  // `waiting` para sempre - logistic_status, erp_status e
+  // distribution_center_status descrevem a etapa, nao a existencia do pedido.
+  // O cancelamento vive no `status` do pedido, mais o carimbo `canceled_at`.
+  //
+  // Consequencia real: a linha ficou presa na fila sendo reconsultada de 2 em 2
+  // horas para um pedido que nunca vai sair, com um botao "Criar ticket" do
+  // lado. E o caso pior: se o campo logistico de um pedido cancelado algum dia
+  // avancasse, a Central abriria ticket com a transportadora para um pedido que
+  // nao existe mais. A protecao (COSMOS_ESTADOS_MORTOS) existia desde 01/09,
+  // mas era aplicada apenas ao unico campo lido, e por isso nunca alcancada.
+  //
+  // Checo campos NOMEADOS de proposito, em vez de varrer tudo que "parece
+  // status": o proprio diagnostico devolveu `shipping_cost: '3.5'` naquela
+  // lista (falso positivo do "ship" no nome), e um estorno PARCIAL marcaria
+  // como morto um pedido que ainda vai sair - descartando em silencio a troca
+  // de endereco que a cliente pediu.
+  const carimboCancelado = String((pedido && pedido.canceled_at) || '').trim();
+  const carimboEntregue = String((pedido && pedido.delivered_at) || '').trim();
+  const statusDoPedido = String((pedido && pedido.status) || '').trim().toLowerCase();
+  if (carimboCancelado) {
+    return { ...baseCosmos, veredito: 'morto', statusOrigem: statusDoPedido || 'cancelled', detalhe: `canceled_at=${carimboCancelado}` };
+  }
+  if (carimboEntregue) {
+    return { ...baseCosmos, veredito: 'morto', statusOrigem: statusDoPedido || 'delivered', detalhe: `delivered_at=${carimboEntregue}` };
+  }
+  if (COSMOS_ESTADOS_MORTOS.indexOf(statusDoPedido) !== -1) {
+    return { ...baseCosmos, veredito: 'morto', statusOrigem: statusDoPedido, detalhe: `status=${statusDoPedido}` };
+  }
+
   const { campo, valor } = cosmosLerStatus(env, pedido);
   if (!valor) {
     const ipSemCampo = await pedidoSaiuPelaIntelipost(env, row);
