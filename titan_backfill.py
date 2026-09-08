@@ -244,8 +244,19 @@ def _supabase_upsert_lote(registros):
     req.add_header("Authorization", f"Bearer {SUPABASE_KEY}")
     req.add_header("Content-Type", "application/json")
     req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        # Achado real (08/09/2026): um HTTPError sozinho so mostra "HTTP Error
+        # 400: Bad Request", sem o motivo de verdade que o PostgREST/Postgres
+        # devolve no corpo da resposta (ex: qual coluna/valor violou o que) -
+        # sem ler esse corpo, um lote ruim vira um "Bad Request" mudo e a
+        # unica pista sobra ser adivinhar. Le e inclui na excecao antes de
+        # repropagar, pra quem chamar (o loop principal) conseguir logar o
+        # motivo real e (com o fix ao lado) isolar so o lote problematico.
+        corpo = e.read().decode("utf-8", errors="replace")[:1000]
+        raise RuntimeError(f"Supabase respondeu {e.code} no upsert em lote: {corpo}") from e
 
 
 def registro_para_supabase(r):
@@ -355,15 +366,31 @@ def main():
             # extra so com este aviso no lugar de um pedido de verdade. Sem
             # essa checagem, um periodo grande demais perderia pedidos SEM
             # nenhum sinal de que algo ficou de fora.
-            if any("Exported data exceeded the allowed volume" in str(r.get("Depositante") or "") for r in registros):
+            LINHA_TRUNCAMENTO = "Exported data exceeded the allowed volume"
+            truncou = any(LINHA_TRUNCAMENTO in str(v) for r in registros for v in r.values())
+            if truncou:
                 print(f"\n  AVISO: o Titan/Power BI truncou esta exportacao (limite de volume excedido) - "
                       f"o periodo {args.data_inicial} a {args.data_final} tem mais dados do que a exportacao "
                       f"trouxe de uma vez so. Pedidos podem estar faltando. Rode de novo quebrando esse "
                       f"periodo em blocos menores (ex: mes a mes) pra cobrir tudo.", file=sys.stderr)
+                # NAO so avisa - filtra a linha sintetica antes de processar
+                # (08/09/2026, achado real: o backfill so CHECAVA essa mensagem
+                # na coluna "Depositante", mas nunca excluia a linha de
+                # registros - ela seguia pro loop normal como se fosse um
+                # pedido de verdade. Se o Power BI colocar o aviso em outra
+                # coluna dessa vez, ela pode passar pelas checagens de nf/
+                # marca de registro_para_supabase com lixo em vez de um valor
+                # de verdade, envenenando o lote inteiro no upsert). Confere
+                # QUALQUER coluna, nao so Depositante, pra nao depender de
+                # onde o Power BI decidir colocar o aviso.
+                antes = len(registros)
+                registros = [r for r in registros if not any(LINHA_TRUNCAMENTO in str(v) for v in r.values())]
+                print(f"  ({antes - len(registros)} linha(s) de aviso de truncamento removida(s) antes de gravar)", file=sys.stderr)
 
             lote = []
             gravados = 0
             ignorados = 0
+            lotes_com_erro = 0
             for r in registros:
                 payload = registro_para_supabase(r)
                 if payload is None:
@@ -371,15 +398,31 @@ def main():
                     continue
                 lote.append(payload)
                 if len(lote) >= TAMANHO_LOTE:
-                    _supabase_upsert_lote(lote)
-                    gravados += len(lote)
-                    print(f"  {gravados} gravados...")
+                    try:
+                        _supabase_upsert_lote(lote)
+                        gravados += len(lote)
+                        print(f"  {gravados} gravados...")
+                    except Exception as e:
+                        # Isola o lote ruim (08/09/2026, achado real: um HTTP
+                        # 400 num unico lote de 200 derrubava o script inteiro
+                        # com sys.exit(1), descartando os ~750 lotes restantes
+                        # de uma exportacao de 150 mil linhas - lote ruim vira
+                        # log e o resto continua, em vez de tudo ou nada).
+                        lotes_com_erro += 1
+                        print(f"  ERRO no lote (linhas {gravados + 1}-{gravados + len(lote)}), pulando: {e}", file=sys.stderr)
                     lote = []
             if lote:
-                _supabase_upsert_lote(lote)
-                gravados += len(lote)
+                try:
+                    _supabase_upsert_lote(lote)
+                    gravados += len(lote)
+                except Exception as e:
+                    lotes_com_erro += 1
+                    print(f"  ERRO no ultimo lote ({len(lote)} linha(s)), pulando: {e}", file=sys.stderr)
 
             print(f"\nConcluido - {gravados} pedido(s) gravados no Supabase.")
+            if lotes_com_erro:
+                print(f"{lotes_com_erro} lote(s) falharam e foram pulados (ver ERRO acima pro motivo real) - "
+                      f"esses pedidos ficam pra proxima rodada do backfill.", file=sys.stderr)
             if ignorados:
                 print(f"{ignorados} linha(s) ignoradas por falta de Nota Fiscal ou de \"Nome Projeto\" "
                       f"(marca) - sem os dois, nao da pra identificar com seguranca.")
