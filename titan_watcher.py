@@ -120,7 +120,7 @@ def marcar_nao_encontrado(numero_nf, marca, mensagem):
 
 
 def marcar_concluido(numero_nf, marca, pedido_data, eventos, itens):
-    _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{urllib.parse.quote(numero_nf)}&marca=eq.{urllib.parse.quote(marca)}", {
+    corpo = {
         "status": "concluido",
         "erro": None,
         # Depositante/Cliente ficam de fora de proposito - confirmado (JSON
@@ -139,7 +139,17 @@ def marcar_concluido(numero_nf, marca, pedido_data, eventos, itens):
         "eventos": eventos or [],
         "itens": itens or [],
         "atualizado_em": _agora_iso(),
-    })
+    }
+    # numero_pedido: so pra Gobeaute exceto apice (confirmado pela Ivna,
+    # 04/09/2026 - ver docstring de scraper.extrair_numero_pedido_torre). So
+    # inclui a chave quando conseguimos derivar - omitir (em vez de gravar
+    # None) preserva um numero_pedido ja existente (ex: vindo de uma
+    # solicitacao real pela Torre) se por algum motivo nao der pra derivar
+    # dessa vez.
+    numero_pedido_derivado = scraper.extrair_numero_pedido_torre(pedido_data)
+    if numero_pedido_derivado:
+        corpo["numero_pedido"] = numero_pedido_derivado
+    _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{urllib.parse.quote(numero_nf)}&marca=eq.{urllib.parse.quote(marca)}", corpo)
 
 
 def processar_pedido(page, item):

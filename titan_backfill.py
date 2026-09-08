@@ -55,8 +55,10 @@ Kokeshi com romaneio 169114 E pra Rituaria com romaneio 173827 - o risco que
 parecia raro aconteceu de verdade). A marca de cada linha vem de "Nome
 Projeto" (ex: "RITUARIA"), normalizada pra minuscula - linha sem "Nome
 Projeto" visivel e ignorada (sem isso, nao da pra saber se colide com outra
-marca da mesma NF). O "Numero do Pedido" continua sem correspondencia com o
-numero de e-commerce da Torre - nunca usado como chave.
+marca da mesma NF). O "Numero do Pedido" continua nunca usado como CHAVE -
+mas, ao contrario do que a gente achava antes, ele TEM correspondencia com o
+numero de e-commerce da Torre pras marcas Gobeaute exceto apice (corrigido
+04/09/2026 - ver registro_para_supabase/scraper.extrair_numero_pedido_torre).
 """
 import argparse
 import datetime
@@ -102,7 +104,16 @@ RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - deixa margem dentro do timeout do jo
 # dispara se alguem repetir a solicitacao daquela NF pela Torre - nao roda
 # sozinho. Confirmado >=1000 pedidos reais nesse estado via query direta no
 # Supabase (bateu o teto de 1000 da API, o numero real pode ser maior).
-EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - mesmo padrao do recheck de situacao presa acima
+#
+# ORCAMENTO AUMENTADO de 600 pra 1800 (08/09/2026, pedido real da Ivna -
+# "muitos pedidos ja embarcados sem eventos"): com 10min (a ~15-20s por
+# pedido, por causa da navegacao real via Playwright) so dava pra reconferir
+# ~30-40 pedidos por rodada, 2x/dia - contra um backlog de 1000+, levaria
+# semanas pra zerar. 30min da ~3x mais throughput por rodada. Aumentado
+# junto com timeout-minutes do job em titan_backfill.yml (50 -> 90) pra
+# sobrar margem real (exportacao principal + recheck de situacao presa +
+# este recheck, todos dentro do mesmo job).
+EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 1800  # 30min
 
 
 def _agora_iso():
@@ -117,6 +128,14 @@ def buscar_situacao_presa(limite=500):
     situacao NULL tambem - "not.in" sozinho nunca bate NULL (semantica de
     NULL do Postgres).
     """
+    # order=atualizado_em.asc (08/09/2026, mesmo achado real ja corrigido em
+    # titan_watcher.buscar_pendentes - NF 1295282 ficou 3 dias parada porque,
+    # sem ordenacao explicita, o Postgres/PostgREST nao garante nenhuma ordem
+    # nas linhas devolvidas: um subconjunto podia ficar "escondido" atras de
+    # outro indefinidamente entre rodadas. Mais antigo primeiro garante que
+    # cada rodada avanca a fila de verdade (a linha processada tem
+    # atualizado_em bumped, indo pro fim), em vez de arriscar reprocessar
+    # sempre o mesmo bloco.
     lista_finais = ",".join(STATUS_FINAIS)
     cutoff = (
         datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
@@ -126,7 +145,7 @@ def buscar_situacao_presa(limite=500):
         f"{TABELA}?status=eq.concluido"
         f"&atualizado_em=lt.{urllib.parse.quote(cutoff)}"
         f"&or=(situacao.is.null,situacao.not.in.({lista_finais}))"
-        f"&select=numero_nf,marca&limit={limite}"
+        f"&select=numero_nf,marca&order=atualizado_em.asc&limit={limite}"
     )
     return titan_watcher._supabase_request("GET", path) or []
 
@@ -164,10 +183,14 @@ def rechecar_situacoes_presas(page):
 
 def buscar_concluidos_sem_eventos(limite=500):
     """Pedidos status='concluido' mas eventos ainda NULL (ver
-    EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS acima pro porque)."""
+    EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS acima pro porque).
+
+    order=atualizado_em.asc (08/09/2026, mesmo motivo de buscar_situacao_
+    presa acima - sem isso a fila de ate 500 nao tem garantia nenhuma de
+    avancar rodada apos rodada)."""
     path = (
         f"{TABELA}?status=eq.concluido&eventos=is.null"
-        f"&select=numero_nf,marca&limit={limite}"
+        f"&select=numero_nf,marca&order=atualizado_em.asc&limit={limite}"
     )
     return titan_watcher._supabase_request("GET", path) or []
 
@@ -237,12 +260,12 @@ def registro_para_supabase(r):
     NF, e gravar sem marca arriscaria sobrescrever ou ser sobrescrita por
     engano depois.
 
-    NAO mapeia "Numero do Pedido" pra dentro da coluna numero_pedido de
-    proposito: essa coluna e escrita por /api/logistica/titan-solicitar com o
-    numero de e-commerce da Torre (ex: "SH1099815RT"), enquanto o "Numero do
-    Pedido" do Titan e um numero interno do armazem sem correspondencia com
-    aquele (ver comentario grande no topo do arquivo e em titan_watcher.py) -
-    escrever aqui sobrescreveria o valor certo pelo errado.
+    numero_pedido: deriva o numero de e-commerce da Torre a partir do
+    "Numero do Pedido" do Titan pra marcas Gobeaute exceto apice (corrigido
+    04/09/2026 - achado real da Ivna: ao contrario do que a gente achava
+    antes, o "Numero do Pedido" do Titan E o numero da Torre + a NF colada no
+    final, sem separador - ver scraper.extrair_numero_pedido_torre pro
+    detalhe). Fica de fora quando nao der pra confirmar o sufixo.
     """
     nf = (r.get("Nota Fiscal") or "").strip()
     marca = (r.get("Nome Projeto") or "").strip().lower()
@@ -259,7 +282,7 @@ def registro_para_supabase(r):
             marca = "apice"
     if not nf or not marca:
         return None
-    return {
+    registro = {
         "numero_nf": nf,
         "marca": marca,
         "status": "concluido",
@@ -280,6 +303,14 @@ def registro_para_supabase(r):
         "cliente": r.get("Cliente"),
         "atualizado_em": _agora_iso(),
     }
+    # So inclui a chave quando conseguimos derivar (ver docstring acima) -
+    # omitir em vez de gravar None preserva, no upsert com merge-duplicates,
+    # um numero_pedido ja existente (ex: vindo de uma solicitacao real pela
+    # Torre) quando essa linha em particular nao permite confirmar o sufixo.
+    numero_pedido_derivado = scraper.extrair_numero_pedido_torre(r)
+    if numero_pedido_derivado:
+        registro["numero_pedido"] = numero_pedido_derivado
+    return registro
 
 
 def main():

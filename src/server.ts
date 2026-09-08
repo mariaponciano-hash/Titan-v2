@@ -110,6 +110,10 @@ export interface Env {
   // necessaria porque enderecos_para_ticket guarda endereco de cliente e por
   // isso NAO tem policy de RLS pra role anon - ver sql/001_*.sql.
   TICKET_WEBHOOK_SECRET?: string;
+  // Destino do cx-ticketcreator para a fila de enderecos. Ver ticketApiUrl.
+  TICKET_API_URL?: string;
+  // Chave dedicada da porta de entrada da fila. Ver autorizadoEnfileirar.
+  ENDERECOS_INGEST_KEY?: string;
   SB_SERVICE_KEY?: string;
   // Gate do "sent" via Cosmos - ver o bloco GATE DO "SENT" VIA COSMOS.
   // COSMOS_ORG_IDS e um JSON marca->organization_id (um secret em vez de sete).
@@ -192,7 +196,30 @@ const TEXTO_AVARIA_AUTOMATICO = 'O procedimento ideal é que a transportadora at
 // transformar. Se o formato estiver errado o sintoma NAO e erro: a consulta
 // devolve exists:false pra sempre (armadilha (b) do doc). Por isso
 // reconciliarEnderecos() trata divergencia como alerta, nao como silencio.
-const TICKET_API_URL = 'https://cx-ticketcreator-prod.rpa-ia.workers.dev';
+// Destino de PRODUCAO do cx-ticketcreator. Usado quando o secret
+// TICKET_API_URL nao esta configurado, para o comportamento nao mudar em quem
+// ja estava rodando.
+const TICKET_API_URL_PADRAO = 'https://cx-ticketcreator-prod.rpa-ia.workers.dev';
+
+// CONFIGURAVEL DESDE 08/09/2026, e nao por gosto de configuracao.
+//
+// Antes o destino era fixo no codigo, apontando para a producao do creator.
+// Consequencia pratica: NAO havia como exercitar o disparo sem abrir ticket de
+// verdade com uma transportadora, para a entrega de uma cliente real. Todo
+// teste do caminho `sim -> POST` era ou perigoso ou impossivel, e por isso esse
+// trecho seguiu sem teste de ponta a ponta.
+//
+// Com o secret, a staging aponta para o creator de staging e o caminho inteiro
+// pode ser exercitado com pedido real ja despachado, sem consequencia externa.
+// Sem o secret, nada muda: cai no padrao de producao.
+//
+// Isso tambem encerra uma divergencia que eu mesma criei: a Torre ja usava o
+// secret TICKETS_CREATOR_URL para a mesma coisa, e a fila usava constante. Dois
+// jeitos de dizer o mesmo endereco e um convite a apontarem para lugares
+// diferentes sem ninguem perceber.
+function ticketApiUrl(env: Env): string {
+  return String(env.TICKET_API_URL || TICKET_API_URL_PADRAO).replace(/\/+$/, '');
+}
 
 // Case-sensitive e com acento, de proposito. O doc avisa que typo aqui nao da
 // erro: devolve exists:false silencioso. Fica como constante justamente pra
@@ -2785,6 +2812,54 @@ function usuarioInterno(request: Request): string | null {
 
 // Autorizacao das rotas /api/enderecos-*: SSO do gateway, OU trigger key
 // (mantida pra chamada de fora do navegador), OU cron do GoDeploy.
+// Autorizacao da PORTA DE ENTRADA da fila, so dela.
+//
+// Aceita tudo que as outras rotas /api/enderecos-* aceitam (SSO do gateway,
+// CLASSIFY_TRIGGER_KEY, cron assinado) e TAMBEM uma chave dedicada,
+// ENDERECOS_INGEST_KEY, no mesmo header x-trigger-key.
+//
+// POR QUE UMA CHAVE SO PRA ISSO (08/09/2026): quem escreve na fila de fora
+// deste worker e o bot, e chamada servidor-a-servidor nao tem navegador nem
+// sessao - o SSO nao serve (medido: o gateway responde 302 pra /auth/login).
+// Sobra chave compartilhada.
+//
+// Mas a chave que ja existia, CLASSIFY_TRIGGER_KEY, autoriza TODAS as rotas
+// protegidas do app: processar a fila inteira, criar ticket manual, disparar a
+// classificacao de Gmail. Entregar ela a um sistema externo daria a ele muito
+// mais poder do que enfileirar - e como e a mesma chave que autoriza agente na
+// producao (que e app publico e nao tem SSO), rotacionar por causa do bot
+// tiraria o acesso de todo mundo junto. Esta aqui so enfileira: no pior caso,
+// quem a tiver grava linha na fila, e a linha ainda passa pelo gate.
+function autorizadoEnfileirar(request: Request, env: Env): boolean {
+  if (autorizadoEnderecos(request, env)) return true;
+
+  // COMPARACAO COM trim() NOS DOIS LADOS (08/09/2026). Espaco ou quebra de
+  // linha em segredo nunca e intencional, e cola de admin web e de terminal
+  // trazem os dois com facilidade - hoje mesmo o COSMOS_BASE_URL entrou com um
+  // trecho de JSON grudado. Sem o trim, o sintoma e um 401 sem explicacao, que
+  // e caro de diagnosticar: nao da pra ver o valor de nenhum dos lados.
+  const enviada = String(request.headers.get('x-trigger-key') || '').trim();
+  const esperada = String(env.ENDERECOS_INGEST_KEY || '').trim();
+  if (enviada && esperada && enviada === esperada) return true;
+
+  // DIAGNOSTICO SEM VAZAR VALOR: so tamanhos e um veredito. Com isso um 401
+  // vira uma linha de log que diz o que fazer, em vez de deixar quem integra
+  // adivinhando entre "chave errada", "chave nao cadastrada" e "espaco na
+  // cola". NUNCA logar o valor: iria pro log da plataforma, que muita gente le.
+  if (esperada || enviada) {
+    console.error(
+      `[enderecos-enfileirar] chave recusada: header ${enviada ? enviada.length + ' chars' : 'AUSENTE'}`
+      + `, secret ${esperada ? esperada.length + ' chars' : 'NAO CADASTRADO'}`
+      + (enviada && esperada
+        ? (enviada.length === esperada.length
+            ? ' - mesmo tamanho, entao o conteudo difere: chave trocada'
+            : ' - tamanhos diferentes: valor incompleto ou de outra chave')
+        : '')
+    );
+  }
+  return false;
+}
+
 function autorizadoEnderecos(request: Request, env: Env): boolean {
   if (usuarioInterno(request)) return true;
   return autorizado(request, env);
@@ -2815,7 +2890,14 @@ function autorizadoEnderecos(request: Request, env: Env): boolean {
 // por falta de configuracao nossa deixaria ~26% do volume (a Apice e a segunda
 // maior marca em ticket de endereco) parado sem que ninguem visse.
 
-const COSMOS_TIMEOUT_MS = 15000;
+// 25s desde 08/09/2026, era 15s. O app do Cosmos responde em ~13ms (medido no
+// X-Runtime da propria resposta), mas ele fica atras do Cloudflare e o caminho
+// Worker -> zona do Cosmos vem sendo atrasado ou barrado: em 02/09 o gate
+// inteiro levou 8,7s, e depois passou a estourar. Subir o teto nao conserta a
+// causa - quem conserta e liberar o trafego de Workers na zona - mas evita
+// perder a consulta quando o atraso e so grande. O fallback pela Intelipost
+// (ver pedidoSaiuPelaIntelipost) e que garante o gate quando isso nao basta.
+const COSMOS_TIMEOUT_MS = 25000;
 
 // Candidatos de nome do campo de status, na ordem. So sao usados quando
 // COSMOS_CAMPO_STATUS nao esta configurado - ver /api/enderecos-cosmos-debug
@@ -3080,7 +3162,7 @@ type StatusPedido = 'sim' | 'nao' | 'morto' | 'desconhecido';
 interface VereditoGate {
   veredito: StatusPedido;
   detalhe: string;
-  fonte?: string;        // cosmos | middleware_v1 | nenhuma
+  fonte?: string;        // cosmos | middleware_v1 | intelipost | nenhuma
   statusOrigem?: string; // o valor cru: waiting, sent, in_transit...
   carrier?: string;      // transportadora, quando a origem informa
 }
@@ -3092,13 +3174,93 @@ interface VereditoGate {
 //                   Cosmos fora, campo de status nao identificado). Segue pra
 //                   criacao e deixa o creator decidir - a alternativa seria
 //                   travar a fila por limitacao nossa.
+// ============ FONTE 3: INTELIPOST (fallback do gate) ============
+//
+// POR QUE EXISTE (08/09/2026): o Cosmos e a fonte preferida, mas o caminho ate
+// ele nao e confiavel de dentro do Worker. Medido: a origem do Cosmos responde
+// em ~13ms (X-Runtime da propria resposta), o host fica atras do Cloudflare, e
+// a chamada Worker -> Cosmos foi de 8,7s em 02/09 a timeout completo em 08/09,
+// gravando `cosmos indisponivel: The operation was aborted` nas linhas das duas
+// apps. Sem uma segunda fonte, a fila simplesmente para quando isso acontece.
+//
+// A Intelipost, por outro lado, a Central JA consulta todo dia - e o que a
+// Torre faz - com chave por marca que ja esta nos secrets. Entao ela vira a
+// rede de seguranca.
+//
+// A INVERSAO IMPORTANTE: pedido que a Intelipost NAO conhece conta como NAO
+// ENVIADO aqui. E o oposto do que o cx-ticketcreator faz - o gate dele lê o
+// mesmo microstatus e, quando o pedido nao esta lá, o veredito fica `unknown` e
+// o handler LIBERA, porque so barra em `not_sent`. Foi assim que o SH1275300KS
+// (waiting no Cosmos) virou ticket em 01/09. Um pedido que a Intelipost nunca
+// viu e a evidencia mais forte de que ele nao saiu do CD, e nao a mais fraca.
+const IP_ESTADOS_ANTES_DE_SAIR = [
+  'NEW', 'LABEL_CREATED', 'READY_FOR_SHIPPING',
+  'PRE_SHIPMENT_LIST_SUCCEEDED', 'CREATED_AT_LOGISTIC_PROVIDER',
+];
+// Estados em que trocar endereco perdeu o sentido - mesma regra do Cosmos.
+const IP_ESTADOS_MORTOS = ['DELIVERED', 'RETURNED', 'CANCELLED', 'CANCELED'];
+// Saiu e ainda esta em jogo. CLARIFY_* entra por prefixo (a Intelipost tem
+// varias variantes: CLARIFY_DELIVERY_DELAYED, CLARIFY_DELIVERY_FAILED...).
+const IP_ESTADOS_JA_SAIU = [
+  'SHIPPED', 'IN_TRANSIT', 'TO_BE_DELIVERED', 'DELIVERY_FAILED', 'RETURNING',
+];
+
+async function pedidoSaiuPelaIntelipost(env: Env, row: any): Promise<VereditoGate> {
+  const alvo = String(row.marca || '').trim().toUpperCase();
+  const marca = MARCAS_LOGISTICA.find((m) => m.marcaSupabase === alvo);
+  if (!marca || !marca.envIntelipost || !(env as any)[marca.envIntelipost]) {
+    return {
+      veredito: 'desconhecido', fonte: 'nenhuma',
+      detalhe: `marca ${row.marca} sem chave da Intelipost pra servir de fallback`,
+    };
+  }
+
+  let node: any;
+  try {
+    node = await buscarIntelipost(env as any, marca, String(row.pedido));
+  } catch (e: any) {
+    return {
+      veredito: 'desconhecido', fonte: 'intelipost',
+      detalhe: `intelipost indisponivel: ${String((e && e.message) || e)}`,
+    };
+  }
+
+  // NAO ENCONTRADO = NAO SAIU. Ver a inversao explicada acima.
+  if (!node) {
+    return {
+      veredito: 'nao', fonte: 'intelipost', statusOrigem: 'ausente_na_intelipost',
+      detalhe: 'a Intelipost nunca rastreou este pedido - tratando como ainda no CD',
+    };
+  }
+
+  const vol = (node.shipment_order_volume_array && node.shipment_order_volume_array[0]) || {};
+  const estado = String(vol.shipment_order_volume_state || '').trim().toUpperCase();
+  const carrier = String(
+    node.logistic_provider_name || vol.logistic_provider_name || ''
+  ).trim() || undefined;
+  const base: VereditoGate = { veredito: 'desconhecido', fonte: 'intelipost', carrier } as any;
+
+  if (vol.delivered === true || IP_ESTADOS_MORTOS.indexOf(estado) !== -1) {
+    return { ...base, veredito: 'morto', statusOrigem: estado || 'entregue', detalhe: `intelipost=${estado || 'delivered'}` };
+  }
+  if (IP_ESTADOS_ANTES_DE_SAIR.indexOf(estado) !== -1) {
+    return { ...base, veredito: 'nao', statusOrigem: estado, detalhe: `intelipost=${estado}` };
+  }
+  if (IP_ESTADOS_JA_SAIU.indexOf(estado) !== -1 || estado.indexOf('CLARIFY') === 0) {
+    return { ...base, veredito: 'sim', statusOrigem: estado, detalhe: `intelipost=${estado}` };
+  }
+  // Estado que nao conhecemos: NAO chuta. O gate fecha em cima de
+  // 'desconhecido', entao a linha e retida e alguem olha.
+  return { ...base, statusOrigem: estado || '(vazio)', detalhe: `intelipost=${estado || '(vazio)'} - estado nao mapeado` };
+}
+
 async function pedidoEstaSent(env: Env, row: any): Promise<VereditoGate> {
   const brandPre = marcaParaBrand(row.marca);
   // Marca que vai pelo Middleware V1 nao depende do Cosmos estar configurado.
   if (!cosmosConfigurado(env)) {
     const ecomIdPre = brandPre ? middlewareV1Ids(env)[brandPre] : null;
     if (ecomIdPre) return pedidoSaiuPeloMiddlewareV1(env, ecomIdPre, row);
-    return { veredito: 'desconhecido', detalhe: 'Cosmos nao configurado (COSMOS_BASE_URL/EMAIL/PASSWORD)' };
+    return pedidoSaiuPelaIntelipost(env, row);
   }
   const brand = marcaParaBrand(row.marca);
   const orgId = brand ? cosmosOrgIds(env)[brand] : null;
@@ -3108,18 +3270,37 @@ async function pedidoEstaSent(env: Env, row: any): Promise<VereditoGate> {
     // inconclusivo e o creator decide.
     const ecomId = brand ? middlewareV1Ids(env)[brand] : null;
     if (ecomId) return pedidoSaiuPeloMiddlewareV1(env, ecomId, row);
-    return { veredito: 'desconhecido', fonte: 'nenhuma', detalhe: `marca ${row.marca} sem fonte de status configurada (nem Cosmos nem Middleware V1)` };
+    return pedidoSaiuPelaIntelipost(env, row);
   }
   let pedido: any;
   try {
     pedido = await cosmosBuscarPedido(env, orgId, row.pedido);
   } catch (e: any) {
-    return { veredito: 'desconhecido', detalhe: `cosmos indisponivel: ${String((e && e.message) || e)}` };
+    // Nao desiste: tenta a Intelipost antes de devolver inconclusivo. Foi por
+    // aqui que a fila parou em 08/09.
+    const ip = await pedidoSaiuPelaIntelipost(env, row);
+    if (ip.veredito !== 'desconhecido') return ip;
+    return {
+      veredito: 'desconhecido',
+      detalhe: `cosmos indisponivel: ${String((e && e.message) || e)}; intelipost tambem nao resolveu: ${ip.detalhe}`,
+    };
   }
   if (!pedido) {
-    return { veredito: 'desconhecido', detalhe: `pedido ${row.pedido} nao encontrado no Cosmos (org ${orgId})` };
+    const ip = await pedidoSaiuPelaIntelipost(env, row);
+    if (ip.veredito !== 'desconhecido') return ip;
+    return {
+      veredito: 'desconhecido',
+      detalhe: `pedido ${row.pedido} nao encontrado no Cosmos (org ${orgId}); intelipost tambem nao resolveu: ${ip.detalhe}`,
+    };
   }
 
+  return vereditoPeloPedidoCosmos(env, row, pedido);
+}
+
+// Interpreta um pedido JA BUSCADO do Cosmos e devolve o veredito. Separada de
+// pedidoEstaSent (08/09/2026) pra que a rota de diagnostico use exatamente esta
+// logica sem buscar o pedido uma segunda vez.
+async function vereditoPeloPedidoCosmos(env: Env, row: any, pedido: any): Promise<VereditoGate> {
   // transportadora: o pedido do Cosmos traz carrier.name (ex. "J&T"), que e a
   // informacao que decide se a Regra 1 vai aceitar a alteracao.
   const carrierCosmos = String(
@@ -3128,18 +3309,103 @@ async function pedidoEstaSent(env: Env, row: any): Promise<VereditoGate> {
   ).trim() || undefined;
   const baseCosmos = { fonte: 'cosmos', carrier: carrierCosmos };
 
+  // MORTE ANTES DE TUDO (08/09/2026). Achado pela Maria olhando o pedido no
+  // Cosmos: o SH1275300KS estava CANCELADO, e o gate nao via.
+  //
+  // O motivo: o gate lia so o campo configurado em COSMOS_CAMPO_STATUS
+  // (logistic_status), e num pedido cancelado os campos de FASE ficam em
+  // `waiting` para sempre - logistic_status, erp_status e
+  // distribution_center_status descrevem a etapa, nao a existencia do pedido.
+  // O cancelamento vive no `status` do pedido, mais o carimbo `canceled_at`.
+  //
+  // Consequencia real: a linha ficou presa na fila sendo reconsultada de 2 em 2
+  // horas para um pedido que nunca vai sair, com um botao "Criar ticket" do
+  // lado. E o caso pior: se o campo logistico de um pedido cancelado algum dia
+  // avancasse, a Central abriria ticket com a transportadora para um pedido que
+  // nao existe mais. A protecao (COSMOS_ESTADOS_MORTOS) existia desde 01/09,
+  // mas era aplicada apenas ao unico campo lido, e por isso nunca alcancada.
+  //
+  // Checo campos NOMEADOS de proposito, em vez de varrer tudo que "parece
+  // status": o proprio diagnostico devolveu `shipping_cost: '3.5'` naquela
+  // lista (falso positivo do "ship" no nome), e um estorno PARCIAL marcaria
+  // como morto um pedido que ainda vai sair - descartando em silencio a troca
+  // de endereco que a cliente pediu.
+  const carimboCancelado = String((pedido && pedido.canceled_at) || '').trim();
+  const carimboEntregue = String((pedido && pedido.delivered_at) || '').trim();
+  const statusDoPedido = String((pedido && pedido.status) || '').trim().toLowerCase();
+  if (carimboCancelado) {
+    return { ...baseCosmos, veredito: 'morto', statusOrigem: statusDoPedido || 'cancelled', detalhe: `canceled_at=${carimboCancelado}` };
+  }
+  if (carimboEntregue) {
+    return { ...baseCosmos, veredito: 'morto', statusOrigem: statusDoPedido || 'delivered', detalhe: `delivered_at=${carimboEntregue}` };
+  }
+  if (COSMOS_ESTADOS_MORTOS.indexOf(statusDoPedido) !== -1) {
+    return { ...baseCosmos, veredito: 'morto', statusOrigem: statusDoPedido, detalhe: `status=${statusDoPedido}` };
+  }
+
   const { campo, valor } = cosmosLerStatus(env, pedido);
   if (!valor) {
-    return { ...baseCosmos, veredito: 'desconhecido', detalhe: 'nao achei campo de status no pedido do Cosmos - use /api/enderecos-cosmos-debug e fixe COSMOS_CAMPO_STATUS' };
+    const ipSemCampo = await pedidoSaiuPelaIntelipost(env, row);
+    if (ipSemCampo.veredito !== 'desconhecido') return { ...ipSemCampo, carrier: ipSemCampo.carrier || carrierCosmos };
+    return { ...baseCosmos, veredito: 'desconhecido', detalhe: 'nao achei campo de status no pedido do Cosmos - use /api/enderecos-cosmos-debug pra ver as chaves' };
   }
+  // Segunda leitura de morte, agora no campo de fase: cobre o caso de o
+  // carimbo canceled_at nao ter sido preenchido mas o estado dizer cancelado.
   if (COSMOS_ESTADOS_MORTOS.indexOf(valor) !== -1) {
     return { ...baseCosmos, veredito: 'morto', statusOrigem: valor, detalhe: `${campo}=${valor}` };
   }
+
+  // DESPACHO EXIGE EVIDENCIA POSITIVA (08/09/2026). Reescrito depois de a Maria
+  // testar com pedido real e o gate responder "pode disparar" para pedido que
+  // estava no CD.
+  //
+  // O QUE ESTAVA ERRADO: LISTA INVERTIDA. Eu enumerava o que significa "nao
+  // enviado" (waiting/aguardando/pending/created) e tratava TODO o resto como
+  // enviado, apostando que o creator seguraria o resto. Duas falhas:
+  //   1. o creator NAO segura - o gate dele le microstatus da Intelipost e
+  //      libera quando o veredito e `unknown`;
+  //   2. `integrated` e o estado NORMAL de pre-envio no Cosmos, e nao estava na
+  //      lista. Medido em dois pedidos reais de marcas diferentes
+  //      (SH1324791KS/kokeshi, LABEL_CREATED; SH1242272RT/rituaria,
+  //      READY_FOR_SHIPPING): ambos deram `sim`. O gate estava aberto no caso
+  //      COMUM, nao num canto raro.
+  //
+  // O QUE VALE AGORA: so dispara quando o Cosmos AFIRMA o despacho, via
+  // `sent_at`. Ancorado em medicao - num pedido despachado (SH1304207KS) o
+  // sent_at do Cosmos e o dispatched_at da Intelipost batem ao segundo:
+  //     sent_at       2026-09-08T09:51:30.374-03:00
+  //     dispatched_at 2026-09-08T12:51:30+00:00
+  // E e timestamp, nao string: um estado novo no Cosmos nao reabre o gate
+  // sozinho, que era o defeito estrutural da lista invertida.
+  //
+  // ARMADILHAS DESCARTADAS, todas medidas nesse mesmo pedido:
+  //   - `distribution_center_status: "sent"` - "sent" ali e enviado AO CD, nao
+  //     despachado. Gate em "qualquer campo com sent no nome" erraria.
+  //   - `sent_tms_at` e `sent_to_distribution_center_at` estavam preenchidos de
+  //     06/09, DOIS DIAS antes do despacho real de 08/09.
+  //   - `erp_status: "invoiced"` e faturamento, nao despacho.
+  const despachadoEm = String((pedido && pedido.sent_at) || '').trim();
+  if (!despachadoEm) {
+    return {
+      ...baseCosmos, veredito: 'nao', statusOrigem: valor,
+      detalhe: `sent_at vazio (${campo}=${valor}) - ainda no CD`,
+    };
+  }
+
+  // O Cosmos afirma o despacho. A lista de "nao enviado" fica como segunda
+  // tranca: se o estado ainda diz que nao saiu, a contradicao segura a linha em
+  // vez de disparar. Nao deveria acontecer - se acontecer, quero ver na tela.
   const naoEnviado = (env.COSMOS_ESTADOS_NAO_ENVIADO
     ? String(env.COSMOS_ESTADOS_NAO_ENVIADO).split(',')
     : COSMOS_ESTADOS_NAO_ENVIADO_PADRAO).map((x) => x.trim().toLowerCase()).filter(Boolean);
-  if (naoEnviado.indexOf(valor) !== -1) return { ...baseCosmos, veredito: 'nao', statusOrigem: valor, detalhe: `${campo}=${valor}` };
-  return { ...baseCosmos, veredito: 'sim', statusOrigem: valor, detalhe: `${campo}=${valor}` };
+  if (naoEnviado.indexOf(valor) !== -1) {
+    return {
+      ...baseCosmos, veredito: 'nao', statusOrigem: valor,
+      detalhe: `contradicao: sent_at=${despachadoEm} mas ${campo}=${valor} - seguro`,
+    };
+  }
+
+  return { ...baseCosmos, veredito: 'sim', statusOrigem: valor, detalhe: `sent_at=${despachadoEm} (${campo}=${valor})` };
 }
 
 
@@ -3337,7 +3603,7 @@ interface ConsultaTicket {
 async function enderecoConsultarTicket(env: Env, reference: string): Promise<ConsultaTicket> {
   const secret = env.TICKET_WEBHOOK_SECRET;
   if (!secret) throw new Error('TICKET_WEBHOOK_SECRET nao configurada (no Infisical: WEBHOOK_SECRET)');
-  const url = `${TICKET_API_URL}/tickets?reference=${encodeURIComponent(reference)}&issue_type=${encodeURIComponent(TICKET_ISSUE_TYPE_ENDERECO)}`;
+  const url = `${ticketApiUrl(env)}/tickets?reference=${encodeURIComponent(reference)}&issue_type=${encodeURIComponent(TICKET_ISSUE_TYPE_ENDERECO)}`;
   const r = await fetchComTimeout(url, { headers: { 'x-webhook-secret': secret } }, ENDERECO_TIMEOUT_MS);
   const texto = await r.text();
   let data: any = null;
@@ -3543,7 +3809,7 @@ async function enderecoCriarTicket(env: Env, row: any, mock?: string | null): Pr
   }
 
   const r = await fetchComTimeout(
-    `${TICKET_API_URL}/gogroup-tickets-clind`,
+    `${ticketApiUrl(env)}/gogroup-tickets-clind`,
     {
       method: 'POST',
       headers: { 'x-webhook-secret': env.TICKET_WEBHOOK_SECRET as string, 'Content-Type': 'application/json' },
@@ -3738,16 +4004,33 @@ async function enderecoProcessarLinha(env: Env, row: any, mock?: string | null):
       return { ...base, acao: 'pedido ainda nao enviado - segue na fila', code: 'COSMOS_NAO_ENVIADO', cosmos: g.detalhe };
     }
     if (g.veredito === 'morto') {
+      // TEXTO DERIVADO DA FONTE E DO MOTIVO (08/09/2026). Antes era fixo em
+      // "pedido cancelado/estornado no Cosmos", escrito quando o Cosmos era a
+      // unica fonte e cancelamento o unico motivo. Com o fallback da Intelipost
+      // e a checagem de entrega, a frase passou a mentir duas vezes de uma vez:
+      // a tela mostrou "cancelado/estornado no Cosmos (intelipost=DELIVERED)"
+      // num caso em que quem respondeu foi a INTELIPOST e o motivo era ENTREGA,
+      // nao cancelamento.
+      //
+      // Isso importa mais do que parece: rotulo errado manda quem le investigar
+      // o lugar errado. Hoje mesmo eu perdi tempo procurando problema no Cosmos
+      // por causa de uma mensagem que dizia "Cosmos" sem ser dele.
+      const pista = `${g.statusOrigem || ''} ${g.detalhe || ''}`.toLowerCase();
+      const motivo = /deliver|entregue/.test(pista) ? 'pedido ja entregue'
+        : /cancel/.test(pista) ? 'pedido cancelado'
+        : /refund|estorn/.test(pista) ? 'pedido estornado'
+        : 'pedido nao segue mais';
+      const fonte = g.fonte || 'origem';
       await enderecoAtualizar(env, row.id, {
         ...gateGravado,
         status: 'nao_se_aplica',
         ultimo_code: 'COSMOS_PEDIDO_MORTO',
         status_visto_em: new Date().toISOString(),
         disparado_em: null, proxima_tentativa_em: null,
-        ultimo_erro: `pedido cancelado/estornado no Cosmos (${g.detalhe})`,
+        ultimo_erro: `${motivo} - nao ha endereco a alterar (${fonte}: ${g.detalhe})`,
         ultimo_erro_em: new Date().toISOString(),
       });
-      return { ...base, acao: 'nao se aplica - pedido morto no Cosmos', cosmos: g.detalhe };
+      return { ...base, acao: `nao se aplica - ${motivo}`, fonte, cosmos: g.detalhe };
     }
     // TAMBEM FECHA (02/09/2026). Este trecho antes seguia pra criacao, e a
     // justificativa que eu tinha escrito era "nesse caso o creator decide".
@@ -4103,100 +4386,17 @@ export default {
       }
     }
 
-    // ---- Torre de Controle: pede pro Titan BI consultar o romaneio de um
-    // pedido (fila - ver comentario grande em TITAN_SB_URL acima). A CHAVE E
-    // (NOTA FISCAL, MARCA) - migrado de so-NF em 24/08/2026 depois de achar,
-    // com print real da tela do Titan, que a MESMA NF aparece em mais de uma
-    // linha (uma por marca), CADA UMA com romaneio diferente (ex: NF 940380:
-    // Kokeshi 169114, Rituaria 173827) - o risco que tinhamos combinado como
-    // "raro, pode arriscar" aconteceu de verdade. "marca" aqui e o id da
-    // Torre (ex: "rituaria") - o scraper compara sem diferenciar caixa contra
-    // o "Nome Projeto" do Titan (ex: "RITUARIA"). So insere se ainda nao
-    // existir NENHUMA linha pra essa combinacao, pra nao voltar um
-    // "concluido" antigo (ou um resultado ja trazido pelo backfill) pra
-    // 'pendente' de novo a cada clique repetido.
-    if (url.pathname === '/api/logistica/titan-solicitar' && request.method === 'POST') {
-      try {
-        const body: any = await request.json().catch(() => ({}));
-        const numeroNf = String(body.numero_nf || '').trim();
-        const numeroPedido = String(body.numero_pedido || '').trim();
-        const marca = String(body.marca || '').trim();
-        if (!numeroNf) return Response.json({ error: 'numero_nf obrigatorio (Titan BI so e buscavel por Nota Fiscal)' }, { status: 400 });
-        if (!marca) return Response.json({ error: 'marca obrigatoria (NF sozinha pode ser de mais de uma marca - ver comentario acima)' }, { status: 400 });
-
-        const jaExiste = await fetchJsonComTimeout(
-          `${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}&select=numero_nf,status,eventos,numero_pedido`,
-          { headers: titanHeaders() },
-          LOG_TIMEOUT_MS
-        );
-        if (Array.isArray(jaExiste) && jaExiste.length) {
-          const statusAtual = jaExiste[0].status;
-          // Bug real achado pela Ivna, 27/08/2026: um pedido que so passou
-          // pelo titan_backfill.py (que de proposito nao coleta Eventos/Itens,
-          // so os campos da tabela principal, pra ser rapido - ver docstring
-          // grande em titan_backfill.py) fica com status='concluido' mas
-          // eventos/itens NULL pra sempre - a Unilog CD (que precisa desses
-          // dois campos) nunca teria como resolver isso, porque 'concluido'
-          // sozinho era tratado como "ja resolvido, nao mexe". Agora tambem
-          // reenfileira quando concluido mas sem eventos - o processamento
-          // avulso (titan_cf_worker) sempre clica no pedido e extrai
-          // Eventos/Itens, entao isso completa o que o backfill deixou de
-          // fora, sem reprocessar quem ja tem tudo.
-          const concluidoSemEventos = statusAtual === 'concluido' && jaExiste[0].eventos == null;
-          // 'erro' vale re-enfileirar (ex: falha transitoria na primeira
-          // tentativa) - 'pendente' fica como esta (nao interrompe um
-          // processamento em andamento).
-          if (statusAtual === 'erro' || concluidoSemEventos) {
-            await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}`, {
-              method: 'PATCH',
-              headers: { ...titanHeaders(), Prefer: 'return=minimal' },
-              body: JSON.stringify({ status: 'pendente', erro: null, numero_pedido: numeroPedido || undefined }),
-            }, LOG_TIMEOUT_MS);
-            return Response.json({ ok: true, ja_existia: true, status: 'pendente' });
-          }
-          // BUG CORRIGIDO (08/09/2026): linha criada pelo titan_backfill.py fica
-          // com numero_pedido NULL pra sempre de proposito (ver registro_para_
-          // supabase) - a unica forma de completar esse campo e uma chamada
-          // futura deste endpoint, feita pela Torre, que ja sabe o numero de
-          // e-commerce certo. Mas esse retorno antecipado ("ja_existia") nunca
-          // chegava a gravar nada quando a linha ja estava 'pendente' ou
-          // 'concluido' com eventos - por isso a infos_titan tinha centenas de
-          // milhares de linhas com numero_pedido NULL mesmo depois de
-          // resolvidas. Agora, sempre que a linha existente ainda nao tem
-          // numero_pedido e a requisicao trouxe um valor, completa so essa
-          // coluna (sem tocar em status/erro/demais campos).
-          if (!jaExiste[0].numero_pedido && numeroPedido) {
-            await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&marca=eq.${encodeURIComponent(marca)}`, {
-              method: 'PATCH',
-              headers: { ...titanHeaders(), Prefer: 'return=minimal' },
-              body: JSON.stringify({ numero_pedido: numeroPedido }),
-            }, LOG_TIMEOUT_MS);
-          }
-          return Response.json({ ok: true, ja_existia: true, status: statusAtual });
-        }
-
-        const r = await fetchComTimeout(`${TITAN_SB_URL}/rest/v1/infos_titan`, {
-          method: 'POST',
-          headers: { ...titanHeaders(), Prefer: 'return=minimal' },
-          body: JSON.stringify({
-            numero_nf: numeroNf,
-            numero_pedido: numeroPedido || null,
-            marca,
-            status: 'pendente',
-          }),
-        }, LOG_TIMEOUT_MS);
-        if (!r.ok) {
-          const t = await r.text().catch(() => '');
-          return Response.json({ error: `Supabase respondeu ${r.status}: ${t.slice(0, 300)}` }, { status: 502 });
-        }
-        return Response.json({ ok: true, ja_existia: false, status: 'pendente' });
-      } catch (e: any) {
-        return Response.json({ error: String((e && e.message) || e) }, { status: 500 });
-      }
-    }
-
-    // ---- Torre de Controle: consulta o status/resultado da fila do Titan
-    // (chave = NF+marca, mesmo motivo do endpoint acima) ----
+    // ---- Torre de Controle: consulta o que o Titan BI ja tem pra um pedido
+    // (chave = NOTA FISCAL, MARCA - migrado de so-NF em 24/08/2026 depois de
+    // achar, com print real da tela do Titan, que a MESMA NF aparece em mais
+    // de uma linha, uma por marca, CADA UMA com romaneio diferente: ex NF
+    // 940380, Kokeshi 169114 x Rituaria 173827). SO LEITURA (08/09/2026, a
+    // pedido da Ivna - existia um POST /api/logistica/titan-solicitar aqui
+    // que cadastrava/reenfileirava linha em infos_titan a cada busca da
+    // Torre/Unilog CD; removido de proposito - infos_titan agora e povoada
+    // EXCLUSIVAMENTE pelo que o titan_backfill.py/titan-watcher-worker
+    // trazem sozinhos do Titan, 2x/dia e a cada 5min respectivamente, nunca
+    // por uma busca avulsa daqui). ----
     if (url.pathname === '/api/logistica/titan-status' && request.method === 'GET') {
       try {
         const numeroNf = (url.searchParams.get('nf') || '').trim();
@@ -5554,7 +5754,10 @@ export default {
     // aqui dentro e chama enfileirarEndereco() direto - sem HTTP, sem URL, sem
     // secret. Esta rota existe pro caso de o bot ou o n8n quererem usar.
     if (url.pathname === '/api/enderecos-enfileirar' && request.method === 'POST') {
-      if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
+      // autorizadoEnfileirar, e nao autorizadoEnderecos: esta e a unica rota que
+      // aceita a chave dedicada do bot. As outras seguem exigindo SSO, a trigger
+      // key do app ou o cron.
+      if (!autorizadoEnfileirar(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
       try {
         const b: any = await request.json().catch(() => ({}));
         const res = await enfileirarEndereco(env, { ...b, origem: b.origem || 'externo' });
@@ -5689,7 +5892,7 @@ export default {
         const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
         if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
         return Response.json({
-          destino: TICKET_API_URL + '/gogroup-tickets-clind',
+          destino: ticketApiUrl(env) + '/gogroup-tickets-clind',
           metodo: 'POST',
           headers: { 'x-webhook-secret': '<TICKET_WEBHOOK_SECRET>', 'Content-Type': 'application/json' },
           payload: montarPayloadCriacaoEndereco(rows[0]),
@@ -5708,18 +5911,69 @@ export default {
     if (url.pathname === '/api/enderecos-cosmos-debug' && request.method === 'GET') {
       if (!autorizadoEnderecos(request, env)) return Response.json({ error: 'nao autorizado' }, { status: 401 });
       try {
+        // DUAS FORMAS DE CHAMAR, de proposito:
+        //   ?id=15                              -> uma linha da fila
+        //   ?pedido=SH1275300KS&marca=KOKESHI   -> um pedido qualquer
+        // A segunda existe porque investigar um pedido nao deveria exigir
+        // enfileirar ele primeiro: em 08/09 a gente precisou olhar um pedido
+        // CANCELADO tres vezes e sempre dependeu de haver linha na tabela, o
+        // que suja a fila e, pior, deixa a linha elegivel pra disparo.
         const id = url.searchParams.get('id');
-        if (!id) return Response.json({ error: 'id obrigatorio (id da linha em enderecos_para_ticket)' }, { status: 400 });
-        const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
-        if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
-        const row = rows[0];
-        if (!cosmosConfigurado(env)) return Response.json({ error: 'Cosmos nao configurado (COSMOS_BASE_URL / COSMOS_EMAIL / COSMOS_PASSWORD)' }, { status: 400 });
+        const pedidoQS = (url.searchParams.get('pedido') || '').trim();
+        const marcaQS = (url.searchParams.get('marca') || '').trim().toUpperCase();
+        let row: any;
+        if (id) {
+          const rows = await enderecoBuscar(env, { id: String(id), limit: 1 });
+          if (!rows.length) return Response.json({ error: 'linha nao encontrada' }, { status: 404 });
+          row = rows[0];
+        } else if (pedidoQS && marcaQS) {
+          // Linha sintetica: nao existe na tabela e nao e gravada em lugar
+          // nenhum. So o gate le, e ele so precisa de pedido + marca.
+          row = { id: null, pedido: pedidoQS, marca: marcaQS };
+        } else {
+          return Response.json({
+            error: 'informe ?id=<id da linha> ou ?pedido=<numero>&marca=<MARCA>',
+          }, { status: 400 });
+        }
         const brand = marcaParaBrand(row.marca);
+        if (!cosmosConfigurado(env)) {
+          return Response.json({
+            pedido: row.pedido, brand,
+            veredito: await pedidoEstaSent(env, row),
+            aviso: 'Cosmos nao configurado (COSMOS_BASE_URL / COSMOS_EMAIL / COSMOS_PASSWORD) - o veredito acima veio do fallback',
+          });
+        }
         const orgId = brand ? cosmosOrgIds(env)[brand] : null;
-        if (!orgId) return Response.json({ error: `marca ${row.marca} (brand ${brand}) sem organization_id em COSMOS_ORG_IDS` }, { status: 400 });
+        if (!orgId) {
+          return Response.json({
+            pedido: row.pedido, brand,
+            veredito: await pedidoEstaSent(env, row),
+            aviso: `marca ${row.marca} (brand ${brand}) sem organization_id em COSMOS_ORG_IDS - o veredito acima veio do fallback`,
+          });
+        }
 
-        const pedido = await cosmosBuscarPedido(env, orgId, row.pedido);
-        if (!pedido) return Response.json({ pedido: row.pedido, brand, orgId, encontrado: false });
+        let pedido: any = null;
+        let erroCosmos: string | null = null;
+        try {
+          pedido = await cosmosBuscarPedido(env, orgId, row.pedido);
+        } catch (e: any) {
+          // Nao propaga: o objetivo desta rota e DIAGNOSTICAR. Cosmos fora e
+          // justamente um dos resultados que interessa ver, junto do veredito
+          // que o fallback produziu.
+          erroCosmos = String((e && e.message) || e);
+        }
+        if (erroCosmos) {
+          return Response.json({
+            pedido: row.pedido, brand, orgId, cosmosFalhou: erroCosmos,
+            veredito: await pedidoSaiuPelaIntelipost(env, row),
+          });
+        }
+        if (!pedido) {
+          return Response.json({
+            pedido: row.pedido, brand, orgId, encontrado: false,
+            veredito: await pedidoSaiuPelaIntelipost(env, row),
+          });
+        }
 
         const chaves = Object.keys(pedido);
         const pareceStatus = /state|status|situa|sent|ship|envi|fulfil|deliver/i;
@@ -5731,6 +5985,8 @@ export default {
         });
         return Response.json({
           pedido: row.pedido, brand, orgId, encontrado: true,
+          // mesmo objeto, mesma logica do gate, UMA consulta
+          veredito: await vereditoPeloPedidoCosmos(env, row, pedido),
           chavesDoPedido: chaves,
           camposQueParecemStatus: candidatos,
           lidoPeloGate: cosmosLerStatus(env, pedido),

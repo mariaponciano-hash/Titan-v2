@@ -2224,11 +2224,12 @@ function renderTorreBlocos(d) {
     // "Romaneio" (24/08/2026): o campo que a Intelipost expunha pra isso
     // (logistic_provider_pre_shipment_list_id) foi conferido contra o
     // sistema de armazem real e NAO bate (ver historico) - por isso nunca
-    // mostramos aquele numero aqui. O valor de verdade vem do Titan BI,
-    // buscado sob demanda (torreSolicitarTitan) e preenchido via polling em
-    // torreAtualizarUiTitan - "dp-romaneio-valor"/"dp-romaneio-status" comecam
-    // vazios e sao atualizados via DOM direto, sem precisar re-renderizar
-    // (o que perderia o estado de outras coisas na tela).
+    // mostramos aquele numero aqui. O valor de verdade vem do que o Titan BI
+    // ja tem no infos_titan (torreSolicitarTitan so LE, nunca cadastra
+    // pedido novo - ver comentario grande la), preenchido via
+    // torreAtualizarUiTitan - "dp-romaneio-valor"/"dp-romaneio-status"
+    // comecam vazios e sao atualizados via DOM direto, sem precisar
+    // re-renderizar (o que perderia o estado de outras coisas na tela).
     +   (ehGocase ? '' : blocoRow('Romaneio', '<span class="bloco-v mono" id="dp-romaneio-valor">' + tEsc(p.romaneio_titan || '—') + '</span> '
         + '<span id="dp-romaneio-status" style="font-size:11px;color:var(--ink-3)"></span>'
         + '<div class="titan-loading-bar" id="dp-romaneio-bar"><div class="titan-loading-fill" id="dp-romaneio-fill"></div></div>'))
@@ -2853,7 +2854,7 @@ function campoEditavel(id, label, valor, confirmado) {
     ? ' <span class="tf-prefilled" style="color:var(--green)">✓ confirmado no Titan BI</span>'
     : ' <span class="tf-prefilled" style="color:var(--orange)">⚠ sugestão, confira</span>');
   // "tf-romaneio-status" (24/08/2026): so existe pro campo do romaneio - e
-  // onde torreSolicitarTitan()/torrePollTitanStatus() atualizam o texto via
+  // onde torreSolicitarTitan()/torreAtualizarUiTitan() atualizam o texto via
   // DOM direto (sem re-renderizar o formulario, que apagaria outros campos
   // que o agente ja tivesse preenchido enquanto espera a resposta do Titan).
   return '<div class="tf-field">'
@@ -3097,29 +3098,27 @@ function torreAbrirForm() {
   torreAtualizarLinkMaps();
 }
 
-// Pede pro Titan BI consultar o romaneio de verdade deste pedido (24/08/2026,
-// a pedido da Ivna). O trabalho pesado (login no Titan, scraping) roda no
-// titan-watcher-worker (Cloudflare, Cron a cada 5 min - migrado do script
-// Python que rodava no PC da Ivna, ver titan_cf_worker/), nunca aqui - isso
-// so avisa uma fila no Supabase (POST /api/logistica/titan-solicitar) e
-// fica de olho no resultado (torrePollTitanStatus). Se o Cron ainda nao
-// tiver rodado de novo (ate 5 min), o pedido fica "pendente" e o polling
-// desiste depois de ~80s - tanto o campo do formulario quanto o painel
-// "Dados do Pedido" continuam mostrando/editando isso manualmente o tempo
-// todo. Um romaneio ja resolvido antes continua valendo mesmo que o status
-// volte a 'pendente' num recheck (ver torreAtualizarUiTitan).
+// Mostra o romaneio que o Titan BI ja tem pra este pedido (24/08/2026, a
+// pedido da Ivna; mudou de "solicitar" pra so "consultar" em 08/09/2026, a
+// pedido da Ivna - ver comentario grande no endpoint /api/logistica/
+// titan-status em server.ts). A Torre NUNCA cadastra/reenfileira pedido no
+// infos_titan por aqui - so le o que o backfill (titan_backfill.py, 2x/dia)
+// ja trouxe do Titan sozinho. Pedido que o backfill ainda nao alcancou
+// (fora da janela de 10 dias, ou descoberta recente) simplesmente aparece
+// sem romaneio ate a proxima rodada - tanto o campo do formulario quanto o
+// painel "Dados do Pedido" continuam mostrando/editando isso manualmente o
+// tempo todo nesse meio-tempo.
 // Chamada tanto ao pesquisar (torreBuscar) quanto ao abrir o form
-// (torreAbrirForm) - o backend so enfileira de verdade na primeira vez
-// (ver /api/logistica/titan-solicitar), as chamadas seguintes so conferem o
-// status atual; chamar de novo ao abrir o form garante que os elementos
+// (torreAbrirForm) - so pra pegar o dado mais recente que o Supabase tiver
+// nesse instante; chamar de novo ao abrir o form garante que os elementos
 // "tf-romaneio-*" (que so existem depois desse clique) recebam o resultado
-// mesmo se o polling da busca original ja tiver terminado antes disso.
+// mesmo se a consulta da busca original ja tiver terminado antes disso.
 // CHAVE = (NOTA FISCAL, MARCA) - migrado de so-NF em 24/08/2026 depois de
 // confirmar com print real da tela do Titan que a MESMA NF aparece em mais
 // de uma linha (uma por marca), cada uma com romaneio DIFERENTE (ver
-// comentario grande no endpoint /api/logistica/titan-solicitar em
-// server.ts). Pedido sem NF emitida ainda nao tem como ser consultado - nem
-// tenta, so deixa os campos em branco pra edicao manual.
+// comentario grande no endpoint /api/logistica/titan-status em server.ts).
+// Pedido sem NF emitida ainda nao tem como ser consultado - nem tenta, so
+// deixa os campos em branco pra edicao manual.
 function torreSolicitarTitan() {
   var d = torreState.dados;
   var numeroNf = d && d.pedido && d.pedido.numero_nf;
@@ -3128,37 +3127,11 @@ function torreSolicitarTitan() {
   // pedido da Ivna) - Romaneio nao existe pra Gocase, entao nem vale a pena
   // gastar a consulta.
   if (!numeroNf || !marca || marca === 'gocase') return;
-  torreState._titanInicioMs = Date.now(); // pra mostrar "(Xs)" enquanto espera
-  torreAtualizarUiTitan({ status: 'pendente' }, 0);
-
-  fetch('/api/logistica/titan-solicitar', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      numero_nf: numeroNf,
-      numero_pedido: d.pedido.numero_pedido || '',
-      marca: marca,
-    }),
-  })
-    .then(function() { torrePollTitanStatus(numeroNf, marca, 0); })
-    .catch(function() { /* falha silenciosa - os campos continuam editaveis na mao */ });
-}
-
-var TORRE_TITAN_INTERVALO_MS = 4000;
-var TORRE_TITAN_MAX_TENTATIVAS = 20; // ~80s de espera antes de desistir
-
-function torrePollTitanStatus(numeroNf, marca, tentativa) {
+  torreAtualizarUiTitan({ status: 'consultando' });
   fetch('/api/logistica/titan-status?nf=' + encodeURIComponent(numeroNf) + '&marca=' + encodeURIComponent(marca))
     .then(function(r) { return r.json(); })
-    .then(function(d) {
-      var terminou = torreAtualizarUiTitan(d, tentativa);
-      if (terminou) return;
-      if (tentativa < TORRE_TITAN_MAX_TENTATIVAS) {
-        setTimeout(function() { torrePollTitanStatus(numeroNf, marca, tentativa + 1); }, TORRE_TITAN_INTERVALO_MS);
-      } else {
-        torreAtualizarUiTitan({ status: 'timeout' }, tentativa);
-      }
-    })
-    .catch(function() { /* falha silenciosa - so nao atualiza nada nesta rodada */ });
+    .then(function(d) { torreAtualizarUiTitan(d); })
+    .catch(function() { /* falha silenciosa - os campos continuam editaveis na mao */ });
 }
 
 // Atualiza os DOIS lugares da tela que podem mostrar o romaneio do Titan: o
@@ -3166,25 +3139,21 @@ function torrePollTitanStatus(numeroNf, marca, tentativa) {
 // com sucesso) e o campo do formulario de abertura de ticket (tf-romaneio*,
 // so existe se o agente ja clicou "Abrir Ticket"). Faz isso via DOM direto
 // (nunca chamando renderTorre() de novo), pra nao perder nada que o agente
-// ja tenha preenchido em outros campos enquanto espera. Devolve true quando
-// chegou a um estado final (concluido/erro/timeout/inexistente) - o polling
-// para de tentar; false quando ainda esta 'pendente'.
-// Barra de progresso (24/08/2026, a pedido da Ivna): enquanto 'pendente',
-// enche proporcional a tentativa/TORRE_TITAN_MAX_TENTATIVAS (nunca chega a
-// 100% sozinha - so quando realmente conclui), e o texto mostra os segundos
-// decorridos (torreState._titanInicioMs, guardado no momento em que a
-// consulta comecou) - assim o agente ve que esta processando, nao travado.
-function torreAtualizarUiTitan(d, tentativa) {
+// ja tenha preenchido em outros campos enquanto espera.
+//
+// SO LEITURA (08/09/2026, a pedido da Ivna): a Torre nao cadastra/reenfileira
+// pedido nenhum no infos_titan - so mostra o que o backfill ja trouxe do
+// Titan sozinho (2x/dia). Por isso nao ha mais polling/retry aqui: uma unica
+// consulta (torreSolicitarTitan) e o resultado e definitivo pra essa tela -
+// se vier 'pendente' de verdade (linha existe mas o backfill ainda nao
+// terminou de processar essa rodada) ou 'inexistente' (backfill ainda nao
+// alcancou esse pedido), so informamos isso, sem ficar tentando de novo.
+function torreAtualizarUiTitan(d) {
   var statusForm = document.getElementById('tf-romaneio-status');
   var inputForm = document.getElementById('tf-romaneio');
-  var barForm = document.getElementById('tf-romaneio-bar');
-  var fillForm = document.getElementById('tf-romaneio-fill');
   var statusPainel = document.getElementById('dp-romaneio-status');
   var valorPainel = document.getElementById('dp-romaneio-valor');
-  var barPainel = document.getElementById('dp-romaneio-bar');
-  var fillPainel = document.getElementById('dp-romaneio-fill');
-  // Agente trocou de pedido/saiu da tela - nada pra atualizar, para de tentar.
-  if (!statusForm && !statusPainel) return true;
+  if (!statusForm && !statusPainel) return;
 
   // Alimenta o checklist de status (renderTorreStatusChecklist) com a linha
   // completa do Titan (situacao/eventos) - guardado em torreState (nao so no
@@ -3193,7 +3162,7 @@ function torreAtualizarUiTitan(d, tentativa) {
   torreState.titan = d;
   torreAtualizarUiStatusChecklist();
 
-  function aplicar(texto, cor, valorConfirmado, percentual) {
+  function aplicar(texto, cor, valorConfirmado) {
     if (statusForm) { statusForm.textContent = texto; statusForm.style.color = cor; }
     if (statusPainel) { statusPainel.textContent = texto; statusPainel.style.color = cor; }
     if (valorConfirmado) {
@@ -3206,41 +3175,23 @@ function torreAtualizarUiTitan(d, tentativa) {
       // "—" voltava mesmo com a consulta ja concluida.
       if (torreState.dados && torreState.dados.pedido) torreState.dados.pedido.romaneio_titan = valorConfirmado;
     }
-    var mostrarBarra = percentual != null;
-    [barForm, barPainel].forEach(function(b) { if (b) b.style.display = mostrarBarra ? 'block' : 'none'; });
-    [fillForm, fillPainel].forEach(function(f) { if (f) f.style.width = (percentual || 0) + '%'; });
   }
 
+  if (d.status === 'consultando') { aplicar('Consultando o Titan BI...', 'var(--ink-3)', null); return; }
+
   // O romaneio ja gravado vale mesmo se status !== 'concluido' (bug real
-  // reportado pela Ivna, 27/08/2026): o recheck automatico do
-  // titan-watcher-worker devolve pedidos com situacao nao-final pra fila
-  // (status volta a 'pendente') pra tentar achar uma atualizacao mais
-  // recente, mas o romaneio ja confirmado antes continua valido nessa
-  // linha - so a situacao/data podem estar desatualizadas por uns minutos.
-  // Sem essa checagem primeiro, a tela ficava "Consultando..." ate estourar
-  // o timeout mesmo com o romaneio ja disponivel no Supabase.
-  if (d.romaneio) {
-    aplicar('✓ confirmado no Titan BI - confira antes de repassar.', 'var(--green)', d.romaneio, null);
-    return true;
-  }
-  if (d.status === 'concluido') {
-    aplicar('Titan BI consultado, mas não achou romaneio para este pedido.', 'var(--ink-3)', null, null);
-    return true;
-  }
-  if (d.status === 'erro') {
-    aplicar('Titan BI: ' + (d.erro || 'erro desconhecido') + '.', 'var(--red)', null, null);
-    return true;
-  }
-  if (d.status === 'inexistente') { aplicar('', 'var(--ink-3)', null, null); return true; }
-  if (d.status === 'timeout') {
-    aplicar('Titan BI não respondeu a tempo - o pedido está na fila e deve resolver sozinho em poucos minutos, tente consultar de novo.', 'var(--orange)', null, null);
-    return true;
-  }
-  // 'pendente'
-  var elapsedS = torreState._titanInicioMs ? Math.round((Date.now() - torreState._titanInicioMs) / 1000) : 0;
-  var percentual = Math.min(95, Math.round((tentativa / TORRE_TITAN_MAX_TENTATIVAS) * 95));
-  aplicar('Consultando no Titan BI... (' + elapsedS + 's)', 'var(--ink-3)', null, percentual);
-  return false;
+  // reportado pela Ivna, 27/08/2026): o recheck automatico do backfill
+  // devolve pedidos com situacao nao-final pra fila (status volta a
+  // 'pendente') pra tentar achar uma atualizacao mais recente, mas o
+  // romaneio ja confirmado antes continua valido nessa linha - so a
+  // situacao/data podem estar desatualizadas por uns minutos.
+  if (d.romaneio) { aplicar('✓ confirmado no Titan BI - confira antes de repassar.', 'var(--green)', d.romaneio); return; }
+  if (d.status === 'concluido') { aplicar('Titan BI consultado, mas não achou romaneio para este pedido.', 'var(--ink-3)', null); return; }
+  if (d.status === 'erro') { aplicar('Titan BI: ' + (d.erro || 'erro desconhecido') + '.', 'var(--red)', null); return; }
+  if (d.status === 'inexistente') { aplicar('', 'var(--ink-3)', null); return; }
+  // 'pendente' (linha existe mas o backfill ainda nao concluiu essa rodada
+  // pra ela) - a Torre nao solicita nem espera, so informa.
+  aplicar('Titan BI ainda não trouxe esse pedido - o backfill roda 2x/dia, tente consultar de novo mais tarde.', 'var(--ink-3)', null);
 }
 function torreFecharForm() { torreState.formAberto = false; renderTorre(); }
 
@@ -3491,13 +3442,12 @@ function unilogUsarCandidato(candidato) {
   if (!candidato) return;
   unilogState.titan = candidato;
   unilogState.titanStatus = candidato.status || 'concluido';
-  unilogState._titanInicioMs = Date.now();
-  fetch('/api/logistica/titan-solicitar', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ numero_nf: unilogState.termo, numero_pedido: candidato.numero_pedido || '', marca: candidato.marca }),
-  })
-    .then(function() { unilogPollTitanStatus(unilogState.termo, candidato.marca, 0); })
-    .catch(function() { /* falha silenciosa - o painel so fica com o que a lista de candidatos ja trouxe */ });
+  // O candidato (titan-candidatos) ja veio com situacao/romaneio/status,
+  // mas nao com eventos/itens (select enxuto, pra listar candidatos rapido)
+  // - so LEMOS o documento completo aqui (titan-status), nunca cadastramos/
+  // reenfileiramos nada (08/09/2026, a pedido da Ivna - ver comentario
+  // grande em unilogSolicitarTitan).
+  unilogConsultarTitanCompleto(unilogState.termo, candidato.marca);
 }
 
 // Quando a Torre nao acha o pedido, monta um "d" sintetico so com o que o
@@ -3562,13 +3512,23 @@ function unilogBuscarComMarca(termo, marcaForcada) {
     });
 }
 
-var UNILOG_TITAN_INTERVALO_MS = 4000;
-var UNILOG_TITAN_MAX_TENTATIVAS = 20; // ~80s de espera antes de desistir
+// SO LEITURA (08/09/2026, a pedido da Ivna): a Unilog CD nao cadastra nem
+// reenfileira pedido nenhum no infos_titan - so mostra o documento que o
+// backfill (titan_backfill.py, 2x/dia) ja trouxe do Titan sozinho. Usada
+// tanto por unilogUsarCandidato (candidato ja veio resumido, aqui buscamos o
+// documento completo com eventos/itens) quanto por unilogSolicitarTitan
+// (quando a busca da Torre achou a marca mas nao veio via candidato).
+function unilogConsultarTitanCompleto(numeroNf, marca) {
+  fetch('/api/logistica/titan-status?nf=' + encodeURIComponent(numeroNf) + '&marca=' + encodeURIComponent(marca))
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      unilogState.titan = d;
+      unilogState.titanStatus = d.status;
+      unilogRenderTitanPainelDom();
+    })
+    .catch(function() { /* falha silenciosa - o painel fica com o que ja tinha (candidato, se houver) */ });
+}
 
-// Reaproveita os MESMOS dois endpoints que a Torre usa pro romaneio (ver
-// torreSolicitarTitan) - a diferenca e que aqui consumimos o documento
-// inteiro que infos_titan ja guarda (situacao/eventos/itens - ver
-// titan_watcher.py), nao so o campo romaneio.
 function unilogSolicitarTitan() {
   var d = unilogState.dados;
   var numeroNf = d && d.pedido && d.pedido.numero_nf;
@@ -3578,39 +3538,9 @@ function unilogSolicitarTitan() {
     unilogRenderTitanPainelDom();
     return;
   }
-  unilogState._titanInicioMs = Date.now();
-  unilogState.titanStatus = 'pendente';
+  unilogState.titanStatus = 'consultando';
   unilogRenderTitanPainelDom();
-
-  fetch('/api/logistica/titan-solicitar', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ numero_nf: numeroNf, numero_pedido: d.pedido.numero_pedido || '', marca: marca }),
-  })
-    .then(function() { unilogPollTitanStatus(numeroNf, marca, 0); })
-    .catch(function() { /* falha silenciosa - o painel so fica sem dados do Titan */ });
-}
-
-function unilogPollTitanStatus(numeroNf, marca, tentativa) {
-  fetch('/api/logistica/titan-status?nf=' + encodeURIComponent(numeroNf) + '&marca=' + encodeURIComponent(marca))
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      unilogState.titan = d;
-      unilogState.titanStatus = d.status;
-      // Situacao/romaneio ja gravados valem mesmo com status==='pendente'
-      // (mesmo bug real corrigido na Torre, 27/08/2026 - o recheck
-      // automatico devolve pedidos com situacao nao-final pra fila e o
-      // status volta a 'pendente', mas o dado cacheado continua valido).
-      var terminou = ['concluido', 'erro', 'inexistente'].indexOf(d.status) !== -1 || !!(d.situacao || d.romaneio);
-      unilogRenderTitanPainelDom();
-      if (terminou) return;
-      if (tentativa < UNILOG_TITAN_MAX_TENTATIVAS) {
-        setTimeout(function() { unilogPollTitanStatus(numeroNf, marca, tentativa + 1); }, UNILOG_TITAN_INTERVALO_MS);
-      } else {
-        unilogState.titanStatus = 'timeout';
-        unilogRenderTitanPainelDom();
-      }
-    })
-    .catch(function() { /* falha silenciosa nesta rodada de polling */ });
+  unilogConsultarTitanCompleto(numeroNf, marca);
 }
 
 // Atualiza SO o painel do Titan via DOM direto (nunca renderUnilog() inteiro)
@@ -3639,18 +3569,19 @@ function renderUnilogTitanPaineis() {
   if (status === 'sem_nf') {
     return '<div class="torre-alert warn">Este pedido ainda não tem Nota Fiscal emitida - o Titan BI só é consultável por NF.</div>';
   }
-  if (!temDados && (status === 'pendente' || status === '')) {
-    var elapsedS = unilogState._titanInicioMs ? Math.round((Date.now() - unilogState._titanInicioMs) / 1000) : 0;
-    return '<div class="state-box"><p>Consultando o Titan BI... (' + elapsedS + 's)</p></div>';
-  }
-  if (!temDados && status === 'timeout') {
-    return '<div class="torre-alert warn">Titan BI não respondeu a tempo - o pedido está na fila e deve resolver sozinho em poucos minutos, tente consultar de novo.</div>';
+  if (!temDados && (status === 'consultando' || status === '')) {
+    return '<div class="state-box"><p>Consultando o Titan BI...</p></div>';
   }
   if (!temDados && status === 'erro') {
     return '<div class="torre-alert err">Titan BI: ' + tEsc(t.erro || 'erro desconhecido') + '</div>';
   }
   if (!temDados && (status === 'inexistente' || status === 'concluido')) {
     return '<div class="torre-alert warn">NF não encontrada no Titan BI para esta marca.</div>';
+  }
+  // 'pendente' (linha existe mas o backfill ainda nao concluiu essa rodada
+  // pra ela) - a Unilog CD nao solicita nem espera, so informa (08/09/2026).
+  if (!temDados && status === 'pendente') {
+    return '<div class="torre-alert warn">Titan BI ainda não trouxe esse pedido - o backfill roda 2x/dia, tente consultar de novo mais tarde.</div>';
   }
 
   var eventos = t.eventos || [];
@@ -3785,9 +3716,14 @@ function renderUnilogOcorrenciaCard(d) {
   // Idem pro estado da busca de produto Protheus (04/09/2026): sem isso, um
   // "pediu" selecionado numa consulta anterior sobreviveria pra ocorrencia
   // seguinte, misturando pedido diferente.
-  window._unilogModoProduto = 'falta';
-  window._unilogTroca = { pediu: null, recebeu: null };
   window._unilogProdutosPorSlot = {};
+  // Itens do PEDIDO (ja vem com EAN - ver torreBuscarNaMarca em server.ts,
+  // buscarEanPorSku), quais foram marcados como "com problema" (multi-selecao
+  // tipo pill, igual o Cerebro de Trocas) e a resolucao escolhida pra cada um
+  // (05/09/2026, a pedido da Ivna).
+  window._unilogProdutosPedido = produtos;
+  window._unilogItensProblema = {};
+  window._unilogResolucoes = {};
 
   return '<div class="bloco" style="margin-bottom:1.25rem">'
     + '<div class="bloco-head">Dados que a Central já sabe</div>'
@@ -3859,74 +3795,109 @@ function unilogCopiarDescricao() {
   }
 }
 
-// Busca produto no cadastro oficial Protheus (04/09/2026, a pedido da Ivna) -
-// GET /api/logistica/produto-protheus (server.ts -> Metabase Gobeaute, banco
-// "Protheus"). Confirma SKU/EAN/nome oficial antes de descrever a ocorrencia,
-// sem depender so do que a Intelipost trouxe no pedido (que pode faltar ou
-// estar incompleto pro item exato que teve avaria/falta).
-//
-// Dois modos (04/09/2026, a pedido da Ivna, no formato exato que ela pediu
-// pra descricao final):
-// - "falta": um produto so -> "Pedido faltando SKU X – EAN Y"
-// - "troca": dois produtos (o que o cliente pediu e o que recebeu) -> so
-//   monta a frase quando os DOIS estiverem escolhidos: "Cliente recebeu
-//   trocado: pediu SKU A – EAN B e recebeu SKU C – EAN D"
-// Cada modo/slot tem seu proprio input+resultados (uf-produto-busca-<slot>,
-// uf-produto-resultados-<slot>) pra buscas em paralelo nao se atropelarem.
+// Selecao de produto pra Unilog CD (04-05/09/2026, a pedido da Ivna) - mesmo
+// formato de duas etapas do Cerebro de Trocas ("Quais produtos apresentaram
+// problema?" -> decisao por item): pills com os itens do PEDIDO (multi-
+// selecao, ja vem com EAN - ver torreBuscarNaMarca em server.ts,
+// buscarEanPorSku), e pra CADA item marcado, uma decisao: "Faltou" (insere
+// direto) ou "Veio trocado" (abre busca livre no Protheus so pra achar o
+// produto RECEBIDO, que nao esta no pedido - a Central nao tem como saber
+// qual foi sem o agente procurar). Frases finais, no formato exato que a
+// Ivna pediu:
+// - Faltou: "Pedido faltando SKU X – EAN Y"
+// - Trocado: "Cliente recebeu trocado: pediu SKU A – EAN B e recebeu SKU C – EAN D"
 function renderUnilogBuscaProdutoHtml() {
-  var modo = window._unilogModoProduto || 'falta';
-  var pediu = window._unilogTroca.pediu, recebeu = window._unilogTroca.recebeu;
-  function pill(id, label) {
-    var ativo = modo === id;
-    return '<button type="button" onclick="unilogSetModoProduto(\'' + id + '\')" style="border:1px solid ' + (ativo ? 'var(--blue)' : 'var(--border-2)')
-      + ';background:' + (ativo ? 'var(--blue-bg)' : 'var(--white)') + ';color:' + (ativo ? 'var(--blue)' : 'var(--ink-3)')
-      + ';border-radius:16px;padding:6px 14px;cursor:pointer;font-family:\'Poppins\',sans-serif;font-size:12px;font-weight:600;margin-right:8px">' + label + '</button>';
+  var produtosPedido = window._unilogProdutosPedido || [];
+  var problema = window._unilogItensProblema || {};
+  var resolucoes = window._unilogResolucoes || {};
+
+  if (!produtosPedido.length) {
+    return '<div class="torre-alert warn" style="margin:0">Pedido sem itens conhecidos - descreva manualmente na caixa abaixo.</div>';
   }
-  function caixaBusca(slot, placeholder) {
-    return '<div style="display:flex;gap:8px;margin-bottom:6px">'
-      + '<input class="tf-input" id="uf-produto-busca-' + slot + '" style="flex:1" placeholder="' + tEsc(placeholder) + '" onkeydown="if(event.key===\'Enter\'){event.preventDefault();unilogBuscarProduto(\'' + slot + '\');}">'
-      + '<button type="button" class="torre-btn-ghost" onclick="unilogBuscarProduto(\'' + slot + '\')">Buscar</button>'
-      + '</div>'
-      + '<div id="uf-produto-resultados-' + slot + '"></div>';
-  }
-  var html = pill('falta', 'Falta de item') + pill('troca', 'Item trocado') + '<div style="margin-top:10px">';
-  if (modo === 'falta') {
-    html += caixaBusca('falta', 'Ex.: RT01020, 7908407004412 ou parte do nome');
-  } else {
-    html += '<div style="margin-bottom:14px">'
-      + '<div class="tf-label" style="font-size:11px;margin-bottom:4px">O cliente pediu'
-      + (pediu ? ' <span style="color:var(--green);font-weight:700">✓ SKU ' + tEsc(pediu.sku) + ' – EAN ' + tEsc(pediu.ean) + '</span>' : '')
-      + '</div>' + caixaBusca('pediu', 'Produto que o cliente pediu') + '</div>'
-      + '<div>'
-      + '<div class="tf-label" style="font-size:11px;margin-bottom:4px">O cliente recebeu'
-      + (recebeu ? ' <span style="color:var(--green);font-weight:700">✓ SKU ' + tEsc(recebeu.sku) + ' – EAN ' + tEsc(recebeu.ean) + '</span>' : '')
-      + '</div>' + caixaBusca('recebeu', 'Produto que o cliente recebeu') + '</div>';
-  }
-  return html + '</div>';
+
+  var pills = produtosPedido.map(function(p, i) {
+    var ativo = !!problema[i];
+    return '<button type="button" onclick="unilogToggleItemProblema(' + i + ')" style="display:inline-flex;align-items:center;gap:6px;border:1px solid '
+      + (ativo ? 'var(--red)' : 'var(--border-2)') + ';background:' + (ativo ? 'var(--red-bg)' : 'var(--white)') + ';color:' + (ativo ? 'var(--red)' : 'var(--ink-3)')
+      + ';border-radius:20px;padding:7px 14px;cursor:pointer;font-family:\'Poppins\',sans-serif;font-size:12px;font-weight:600;margin:0 8px 8px 0">'
+      + '<span style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:' + (ativo ? 'var(--red)' : 'var(--border-2)') + '"></span>'
+      + tEsc(p.descricao || p.sku || '—') + '</button>';
+  }).join('');
+
+  var indicesSelecionados = [];
+  produtosPedido.forEach(function(p, i) { if (problema[i]) indicesSelecionados.push(i); });
+
+  var acoes = indicesSelecionados.map(function(i) {
+    var p = produtosPedido[i];
+    var res = resolucoes[i];
+    var corpo;
+    if (res) {
+      corpo = '<div style="color:var(--green);font-size:12px;font-weight:700;margin-top:4px">✓ '
+        + (res.tipo === 'falta' ? 'Marcado como faltando' : ('Trocado - cliente recebeu SKU ' + tEsc(res.recebeu.sku))) + '</div>';
+    } else {
+      corpo = '<div style="display:flex;gap:10px;margin-top:8px">'
+        + '<button type="button" onclick="unilogResolverItemFalta(' + i + ')" style="display:inline-flex;align-items:center;gap:6px;border:1.5px solid var(--orange);background:var(--orange-bg);color:var(--orange);border-radius:20px;padding:8px 16px;cursor:pointer;font-family:\'Poppins\',sans-serif;font-size:12.5px;font-weight:700">⚠ Item faltante</button>'
+        + '<button type="button" onclick="unilogAbrirTrocaItem(' + i + ')" style="display:inline-flex;align-items:center;gap:6px;border:1.5px solid var(--purple);background:var(--purple-bg);color:var(--purple);border-radius:20px;padding:8px 16px;cursor:pointer;font-family:\'Poppins\',sans-serif;font-size:12.5px;font-weight:700">⇄ Item trocado</button>'
+        + '</div>'
+        + '<div id="uf-troca-busca-' + i + '" style="display:none;margin-top:8px">'
+        +   '<div class="tf-label" style="font-size:11px;margin-bottom:4px">Produto que o cliente recebeu no lugar</div>'
+        +   '<div style="display:flex;gap:8px;margin-bottom:6px">'
+        +     '<input class="tf-input" id="uf-troca-input-' + i + '" style="flex:1" placeholder="SKU, EAN ou nome do produto" onkeydown="if(event.key===\'Enter\'){event.preventDefault();unilogBuscarTrocaItem(' + i + ');}">'
+        +     '<button type="button" class="torre-btn-ghost" onclick="unilogBuscarTrocaItem(' + i + ')">Buscar</button>'
+        +   '</div>'
+        +   '<div id="uf-troca-resultados-' + i + '"></div>'
+        + '</div>';
+    }
+    return '<div class="bloco-row" style="display:block">'
+      + '<div class="bloco-k">' + tEsc(p.sku || '—') + ' · ' + tEsc(p.descricao || '—') + '</div>'
+      + corpo
+      + '</div>';
+  }).join('');
+
+  return '<div class="tf-label" style="font-size:12px;margin-bottom:8px">Quais produtos apresentaram problema? <span style="font-weight:400;color:var(--ink-4);text-transform:none">(selecione um ou mais)</span></div>'
+    + pills
+    + (indicesSelecionados.length ? '<div style="margin-top:10px">' + acoes + '</div>' : '');
 }
 
-function unilogSetModoProduto(modo) {
-  window._unilogModoProduto = modo;
+function unilogToggleItemProblema(i) {
+  window._unilogItensProblema[i] = !window._unilogItensProblema[i];
+  if (!window._unilogItensProblema[i]) delete window._unilogResolucoes[i];
   var wrap = document.getElementById('uf-busca-produto-wrap');
   if (wrap) wrap.innerHTML = renderUnilogBuscaProdutoHtml();
 }
 
-function unilogBuscarProduto(slot) {
-  var campo = document.getElementById('uf-produto-busca-' + slot);
-  var resultados = document.getElementById('uf-produto-resultados-' + slot);
+function unilogResolverItemFalta(i) {
+  var p = (window._unilogProdutosPedido || [])[i];
+  if (!p) return;
+  var linha = 'Pedido faltando SKU ' + (p.sku || '—') + ' – EAN ' + (p.ean || '—');
+  var campo = document.getElementById('uf-descricao');
+  if (campo) campo.value = linha + (campo.value ? '\n' + campo.value : '');
+  window._unilogResolucoes[i] = { tipo: 'falta' };
+  var wrap = document.getElementById('uf-busca-produto-wrap');
+  if (wrap) wrap.innerHTML = renderUnilogBuscaProdutoHtml();
+}
+
+function unilogAbrirTrocaItem(i) {
+  var el = document.getElementById('uf-troca-busca-' + i);
+  if (el) el.style.display = '';
+}
+
+function unilogBuscarTrocaItem(i) {
+  var campo = document.getElementById('uf-troca-input-' + i);
+  var resultados = document.getElementById('uf-troca-resultados-' + i);
   var termo = (campo && campo.value || '').trim();
   if (!resultados) return;
   if (!termo) { resultados.innerHTML = '<div class="torre-alert warn" style="margin:0">Digite um SKU, EAN ou parte do nome.</div>'; return; }
-  resultados.innerHTML = '<div class="state-box" style="padding:10px"><p>Buscando...</p></div>';
+  resultados.innerHTML = '<div class="state-box" style="padding:8px"><p>Buscando...</p></div>';
   fetchComTimeout('/api/logistica/produto-protheus?termo=' + encodeURIComponent(termo), {}, 15000)
     .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); })
     .then(function(res) {
       if (!res.ok) { resultados.innerHTML = '<div class="torre-alert err" style="margin:0">' + tEsc((res.j && res.j.error) || 'falha na busca') + '</div>'; return; }
       var produtos = (res.j && res.j.produtos) || [];
-      window._unilogProdutosPorSlot[slot] = produtos;
-      if (!produtos.length) { resultados.innerHTML = '<div class="state-box" style="padding:10px"><p>Nenhum produto encontrado.</p></div>'; return; }
-      resultados.innerHTML = produtos.map(function(p, i) {
-        return '<div class="bloco-row" style="cursor:pointer" onclick="unilogSelecionarProduto(\'' + slot + '\', ' + i + ')" title="Clique para usar este produto">'
+      window._unilogProdutosPorSlot['troca_' + i] = produtos;
+      if (!produtos.length) { resultados.innerHTML = '<div class="state-box" style="padding:8px"><p>Nenhum produto encontrado.</p></div>'; return; }
+      resultados.innerHTML = produtos.map(function(p, idx) {
+        return '<div class="bloco-row" style="cursor:pointer" onclick="unilogSelecionarTrocaItem(' + i + ', ' + idx + ')" title="Clique para usar este produto">'
           + '<div class="bloco-k">' + tEsc(p.sku || '—') + (p.marca ? ' · ' + tEsc(p.marca) : '') + '</div>'
           + '<div class="bloco-v">' + tEsc(p.nome || '—') + (p.ean ? ' <span style="color:var(--ink-4)">(EAN ' + tEsc(p.ean) + ')</span>' : '') + '</div>'
           + '</div>';
@@ -3937,34 +3908,17 @@ function unilogBuscarProduto(slot) {
     });
 }
 
-// "falta": insere a frase na hora. "pediu"/"recebeu": guarda a escolha e so
-// insere a frase de troca quando os DOIS lados estiverem preenchidos.
-function unilogSelecionarProduto(slot, indice) {
-  var p = (window._unilogProdutosPorSlot[slot] || [])[indice];
-  if (!p) return;
+function unilogSelecionarTrocaItem(i, idx) {
+  var pedido = (window._unilogProdutosPedido || [])[i];
+  var recebido = (window._unilogProdutosPorSlot['troca_' + i] || [])[idx];
+  if (!pedido || !recebido) return;
+  var linha = 'Cliente recebeu trocado: pediu SKU ' + (pedido.sku || '—') + ' – EAN ' + (pedido.ean || '—')
+    + ' e recebeu SKU ' + (recebido.sku || '—') + ' – EAN ' + (recebido.ean || '—');
   var campo = document.getElementById('uf-descricao');
-
-  if (slot === 'falta') {
-    var linhaFalta = 'Pedido faltando SKU ' + (p.sku || '—') + ' – EAN ' + (p.ean || '—');
-    if (campo) campo.value = linhaFalta + (campo.value ? '\n' + campo.value : '');
-    var resFalta = document.getElementById('uf-produto-resultados-falta');
-    if (resFalta) resFalta.innerHTML = '<div class="torre-alert ok" style="margin:0">Adicionado na descrição.</div>';
-    return;
-  }
-
-  window._unilogTroca[slot] = p;
+  if (campo) campo.value = linha + (campo.value ? '\n' + campo.value : '');
+  window._unilogResolucoes[i] = { tipo: 'troca', recebeu: recebido };
   var wrap = document.getElementById('uf-busca-produto-wrap');
   if (wrap) wrap.innerHTML = renderUnilogBuscaProdutoHtml();
-
-  var pediu = window._unilogTroca.pediu, recebeu = window._unilogTroca.recebeu;
-  if (pediu && recebeu) {
-    var linhaTroca = 'Cliente recebeu trocado: pediu SKU ' + (pediu.sku || '—') + ' – EAN ' + (pediu.ean || '—')
-      + ' e recebeu SKU ' + (recebeu.sku || '—') + ' – EAN ' + (recebeu.ean || '—');
-    if (campo) campo.value = linhaTroca + (campo.value ? '\n' + campo.value : '');
-    window._unilogTroca = { pediu: null, recebeu: null };
-    var wrap2 = document.getElementById('uf-busca-produto-wrap');
-    if (wrap2) wrap2.innerHTML = renderUnilogBuscaProdutoHtml();
-  }
 }
 
 // Mesmo padrao de adicionarAnexos (index.html, usado pela Torre) - le como
