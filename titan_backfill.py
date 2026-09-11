@@ -391,12 +391,23 @@ def _registrar_falhas(motivo, itens, detalhe=None):
 
     Nao deixa uma falha AQUI (ex: TABELA_FALHAS fora do ar tambem) derrubar
     o backfill - so avisa, mesmo padrao de titan_watcher.marcar_erro.
+
+    DEDUPLICA por (numero_nf, marca, motivo) antes de enviar (11/09/2026,
+    achado real - "HTTP Error 500" reproduzido em toda rodada com >1 linha
+    "sem_nf_ou_marca" no mesmo lote): como marca vira "" de proposito (ver
+    acima) pra colidir entre si, DUAS OU MAIS linhas sem NF/marca no mesmo
+    lote geram a MESMA chave ("", "", motivo) - e um unico INSERT com
+    ON CONFLICT nao aceita duas linhas com a mesma chave de conflito no
+    mesmo comando (Postgres recusa com erro, que o PostgREST repassa como
+    500). Sem isso, o lote inteiro falhava e nenhuma das falhas ficava
+    registrada - exatamente o "sumico silencioso" que esta tabela existe
+    pra evitar.
     """
-    linhas = []
+    por_chave = {}
     for item in itens:
         nf = (item.get("numero_nf") or item.get("Nota Fiscal") or "").strip()
         marca = (item.get("marca") or item.get("Nome Projeto") or "").strip().lower()
-        linhas.append({
+        por_chave[(nf, marca)] = {
             "numero_nf": nf,
             "marca": marca,
             "motivo": motivo,
@@ -404,7 +415,8 @@ def _registrar_falhas(motivo, itens, detalhe=None):
             "payload": item,
             "resolvido": False,
             "atualizado_em": _agora_iso(),
-        })
+        }
+    linhas = list(por_chave.values())
     if not linhas:
         return
     try:
