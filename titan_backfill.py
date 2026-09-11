@@ -156,7 +156,7 @@ def buscar_situacao_presa(limite=500):
     return titan_watcher._supabase_request("GET", path) or []
 
 
-def rechecar_situacoes_presas(page):
+def rechecar_situacoes_presas(page, orcamento_segundos=RECHECK_ORCAMENTO_SEGUNDOS):
     """
     Reconfere um por um (mesma logica ja validada em titan_watcher.
     processar_pedido - login com Playwright de verdade, sem o bloqueio de
@@ -165,16 +165,22 @@ def rechecar_situacoes_presas(page):
     janela fixa de 10 dias do backfill acima. Orcamento de tempo (nao so
     contagem de itens) pra nao estourar o timeout do job independente de
     quantos pedidos estiverem presos.
+
+    orcamento_segundos e parametro (nao so a constante direto) desde
+    11/09/2026 - o modo --so-recheck de main() roda SO isto (sem a
+    exportacao em massa antes), varias vezes por hora via
+    titan_recheck_eventos.yml, e passa um orcamento proprio maior que o do
+    job diario (que reparte tempo com a exportacao principal).
     """
     presos = buscar_situacao_presa()
     if not presos:
         print("Nenhum pedido preso em situacao intermediaria fora da janela do backfill.")
         return
-    print(f"{len(presos)} pedido(s) presos em situacao intermediaria - reconferindo (orcamento {RECHECK_ORCAMENTO_SEGUNDOS}s)...")
+    print(f"{len(presos)} pedido(s) presos em situacao intermediaria - reconferindo (orcamento {orcamento_segundos}s)...")
     inicio = time.monotonic()
     processados = 0
     for item in presos:
-        if time.monotonic() - inicio > RECHECK_ORCAMENTO_SEGUNDOS:
+        if time.monotonic() - inicio > orcamento_segundos:
             print(f"  orcamento de tempo esgotado - {processados}/{len(presos)} reconferido(s), resto fica pra proxima rodada.")
             break
         try:
@@ -206,23 +212,36 @@ def buscar_concluidos_sem_eventos(limite=500):
     return titan_watcher._supabase_request("GET", path) or []
 
 
-def rechecar_concluidos_sem_eventos(page):
+def rechecar_concluidos_sem_eventos(page, orcamento_segundos=EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS):
     """
     Reconfere um por um (mesma logica do rechecar_situacoes_presas acima -
     processar_pedido sempre clica na linha e extrai Eventos/Itens) os
     pedidos que o backfill deixou concluidos mas sem essa informacao.
     Orcamento de tempo proprio, separado do recheck de situacao presa.
+
+    Achado real (11/09/2026, reportado pela Maria): confirmado por
+    exportacao em massa dos paineis "Eventos"/"Itens do pedido" que NAO da
+    pra trazer isso em lote - sem uma linha de "Informacao Pedido"
+    selecionada, o Power BI devolve os dois paineis AGREGADOS (Eventos vira
+    so Situacao+Horario sem NF nenhuma pra identificar o pedido; Itens vira
+    quantidade somada por SKU no periodo inteiro) - impossivel desagregar de
+    volta pro pedido certo. O clique-por-pedido continua sendo o UNICO jeito
+    (backlog real medido nesse dia: ~1,2 milhao de linhas com eventos=NULL).
+    Como paliativo (nao resolve a raiz, so aumenta o ritmo - ver conversa),
+    orcamento_segundos virou parametro pra titan_recheck_eventos.yml poder
+    rodar SO isto varias vezes por hora com um orcamento proprio, em vez de
+    competir por tempo com a exportacao principal 2x/dia.
     """
     pendentes = buscar_concluidos_sem_eventos()
     if not pendentes:
         print("Nenhum pedido concluido sem Eventos/Itens.")
         return
     print(f"{len(pendentes)} pedido(s) concluidos sem Eventos/Itens - completando "
-          f"(orcamento {EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS}s)...")
+          f"(orcamento {orcamento_segundos}s)...")
     inicio = time.monotonic()
     processados = 0
     for item in pendentes:
-        if time.monotonic() - inicio > EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS:
+        if time.monotonic() - inicio > orcamento_segundos:
             print(f"  orcamento de tempo esgotado - {processados}/{len(pendentes)} completado(s), resto fica pra proxima rodada.")
             break
         try:
@@ -438,10 +457,26 @@ def registro_para_supabase(r):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data-inicial", required=True, help="formato DD/MM/AAAA, ex: 01/06/2026")
-    parser.add_argument("--data-final", required=True, help="formato DD/MM/AAAA, ex: 24/08/2026")
+    parser.add_argument("--data-inicial", help="formato DD/MM/AAAA, ex: 01/06/2026 (obrigatorio, exceto com --so-recheck)")
+    parser.add_argument("--data-final", help="formato DD/MM/AAAA, ex: 24/08/2026 (obrigatorio, exceto com --so-recheck)")
     parser.add_argument("--headless", action="store_true", default=False, help="roda sem abrir janela - so use depois de validar visualmente sem esta flag")
+    # --so-recheck (11/09/2026, achado real: backlog de ~1,2 milhao de
+    # pedidos com eventos=NULL - ver docstring de rechecar_concluidos_sem_
+    # eventos pro porque o clique-por-pedido e o unico jeito) - pula a
+    # exportacao em massa (que so roda 2x/dia e tem que repartir tempo com
+    # os dois rechecks) e roda SO os rechecks, com orcamento proprio maior.
+    # Pensado pra rodar isolado, varias vezes por hora, via
+    # titan_recheck_eventos.yml - throughput bem maior que os 2x/dia atuais
+    # sem competir pelo tempo do job de exportacao.
+    parser.add_argument("--so-recheck", action="store_true", default=False,
+                         help="pula a exportacao em massa - so roda rechecar_situacoes_presas + rechecar_concluidos_sem_eventos")
+    parser.add_argument("--recheck-orcamento-situacao-segundos", type=int, default=RECHECK_ORCAMENTO_SEGUNDOS,
+                         help=f"orcamento pro recheck de situacao presa (padrao {RECHECK_ORCAMENTO_SEGUNDOS}s)")
+    parser.add_argument("--recheck-orcamento-eventos-segundos", type=int, default=EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS,
+                         help=f"orcamento pro recheck de eventos/itens faltando (padrao {EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS}s)")
     args = parser.parse_args()
+    if not args.so_recheck and (not args.data_inicial or not args.data_final):
+        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck)")
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")
@@ -455,6 +490,13 @@ def main():
         try:
             print("Entrando no Titan BI...")
             scraper.login(page, email, senha)
+
+            if args.so_recheck:
+                print("\n--so-recheck: pulando exportacao em massa, so reconferindo pedidos presos e sem eventos...")
+                rechecar_situacoes_presas(page, orcamento_segundos=args.recheck_orcamento_situacao_segundos)
+                rechecar_concluidos_sem_eventos(page, orcamento_segundos=args.recheck_orcamento_eventos_segundos)
+                return
+
             frame = scraper.get_dashboard_frame(page)
 
             print(f"Definindo periodo {args.data_inicial} - {args.data_final}...")
