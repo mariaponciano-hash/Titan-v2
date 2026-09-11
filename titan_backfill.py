@@ -512,10 +512,12 @@ def _gerar_intervalos_diarios(data_inicial, data_final):
         dia += datetime.timedelta(days=1)
 
 
-def _validar_filtro_aplicado(filtro_aplicado, data_inicial, data_final):
+LINHA_TRUNCAMENTO = "Exported data exceeded the allowed volume"
+
+
+def _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_final):
     """
-    Confere se o texto "Filtros aplicados: ..." que vem na propria
-    exportacao (ver scraper.ler_export_xlsx) bate de verdade com o periodo
+    Confere se o periodo que o Titan REALMENTE aplicou bate com o periodo
     pedido, ANTES de confiar nos dados. Achado real (11/09/2026, Maria): um
     periodo de 1 dia so (data_inicial == data_final, o unico caso que o
     loop diario de main() realmente usa) as vezes nao era aplicado de
@@ -527,18 +529,30 @@ def _validar_filtro_aplicado(filtro_aplicado, data_inicial, data_final):
     ser real; um export manual do mesmo painel/dia trouxe so 14.806 linhas
     de verdade).
 
-    So valida quando data_inicial == data_final (unico caso real usado por
-    main()) - pra periodo com datas diferentes nao da pra prever com
-    seguranca o texto exato que o Titan gera, entao deixa passar sem checar
-    em vez de arriscar falso-negativo. Sem filtro_aplicado nenhum (Titan as
-    vezes nao inclui essa linha - ver ler_export_xlsx), tambem deixa passar,
-    ja que nao ha como validar.
+    DOIS sinais, porque nenhum sozinho e confiavel:
+    1. O texto "Filtros aplicados: ..." (ver ler_export_xlsx) quando o
+       Titan inclui ele - confere se cita o dia certo. So valida quando
+       data_inicial == data_final (unico caso real usado); com datas
+       diferentes ou sem essa linha, esse sinal sozinho nao decide nada
+       (fica pro sinal 2).
+    2. TRUNCAMENTO (ver LINHA_TRUNCAMENTO): achado real (11/09/2026, MESMO
+       dia, exportacao automatica via GitHub Actions) - essa exportacao
+       especifica NAO trouxe a linha "Filtros aplicados" nenhuma (sinal 1
+       fica de fora), mas voltou truncada em exatamente 150.003 linhas pra
+       um pedido de 1 dia so - e SABEMOS que um dia de verdade tem ~15-30
+       mil linhas (bem abaixo do teto), entao truncamento num periodo de 1
+       dia so e por si so prova de que o filtro nao foi aplicado - nao
+       precisa da linha de texto pra saber disso.
     """
-    if not filtro_aplicado or data_inicial != data_final:
-        return True
-    dia = datetime.datetime.strptime(data_inicial, "%d/%m/%Y").date()
-    dia_seguinte = dia + datetime.timedelta(days=1)
-    return dia.strftime("%d/%m/%Y") in filtro_aplicado and dia_seguinte.strftime("%d/%m/%Y") in filtro_aplicado
+    se_aplica = data_inicial == data_final
+    if se_aplica and filtro_aplicado:
+        dia = datetime.datetime.strptime(data_inicial, "%d/%m/%Y").date()
+        dia_seguinte = dia + datetime.timedelta(days=1)
+        if not (dia.strftime("%d/%m/%Y") in filtro_aplicado and dia_seguinte.strftime("%d/%m/%Y") in filtro_aplicado):
+            return False
+    if se_aplica and any(LINHA_TRUNCAMENTO in str(v) for r in registros for v in r.values()):
+        return False
+    return True
 
 
 def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
@@ -559,6 +573,13 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
         sufixo = f" (tentativa {tentativa}/{tentativas})" if tentativa > 1 else ""
         print(f"Definindo periodo {data_inicial} - {data_final}{sufixo}...")
         scraper.definir_periodo(frame, data_inicial, data_final)
+        # Print SEMPRE (nao so quando falha) - achado real (11/09/2026): sem
+        # nenhuma evidencia visual de como o filtro fica depois do
+        # definir_periodo, nao da pra saber se o bug e na digitacao (campo
+        # mostra data errada) ou em como o Power BI reage a ela (campo
+        # mostra certo, visual nao filtra mesmo assim). Nome do arquivo
+        # inclui o dia e a tentativa pra nao sobrescrever entre chamadas.
+        scraper.salvar_diagnostico(frame, f"periodo_definido_{data_inicial.replace('/', '-')}_t{tentativa}")
 
         print("Exportando dados do painel 'Informação Pedido'...")
         caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
@@ -569,16 +590,18 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
         except OSError:
             pass  # nao critico - so um arquivo de trabalho
 
-        filtro_ok = _validar_filtro_aplicado(filtro_aplicado, data_inicial, data_final)
+        filtro_ok = _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_final)
         if filtro_ok:
             break
         print(f"  AVISO: o filtro de periodo que o Titan aplicou nao bate com o periodo pedido "
-              f"({data_inicial} a {data_final}) - texto real do Titan: {filtro_aplicado!r}.", file=sys.stderr)
+              f"({data_inicial} a {data_final}) - texto do Titan: {filtro_aplicado!r}, "
+              f"{len(registros)} linha(s) recebidas.", file=sys.stderr)
 
     if not filtro_ok:
         print(f"  Desistindo de {data_inicial} apos {tentativas} tentativa(s) sem o filtro certo - "
               f"esse dia fica pra proxima rodada do backfill (nao grava nada agora, pra nao arriscar "
-              f"gravar dado de um periodo errado).", file=sys.stderr)
+              f"gravar dado de um periodo errado). Ver titan_debug/periodo_definido_{data_inicial.replace('/', '-')}_t*"
+              f" no artifact do job pra diagnosticar.", file=sys.stderr)
         return 0, 0, 0
 
     print(f"{len(registros)} linha(s) encontradas no periodo.")
@@ -588,17 +611,19 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
 
     # O Power BI tem um limite de volume por exportacao - descoberto com uma
     # exportacao real (25/08/2026) que voltou com uma linha extra so com
-    # este aviso no lugar de um pedido de verdade. Quebrar em blocos de 1
-    # dia (ver _gerar_intervalos_diarios) deveria evitar isso na pratica,
-    # mas a checagem continua aqui como rede de seguranca pra um dia
-    # especifico com volume fora do normal.
-    LINHA_TRUNCAMENTO = "Exported data exceeded the allowed volume"
+    # este aviso no lugar de um pedido de verdade. Pra periodo de VARIOS
+    # dias (nao e o caso do loop diario de main(), mas exportar_e_gravar_
+    # periodo pode ser chamada com qualquer periodo) isso ainda pode
+    # acontecer legitimamente (volume real grande, nao filtro quebrado) -
+    # _validar_filtro_aplicado acima ja tratou o caso de 1 dia so (onde
+    # truncamento e sinal de bug, nao de volume real). Aqui so filtra a
+    # linha sintetica antes de processar, pro caso legitimo de periodo
+    # maior mesmo.
     truncou = any(LINHA_TRUNCAMENTO in str(v) for r in registros for v in r.values())
     if truncou:
-        print(f"\n  AVISO: o Titan/Power BI truncou esta exportacao (limite de volume excedido) mesmo pra "
-              f"um periodo de 1 dia so ({data_inicial}) - esse dia especifico tem volume incomum. Pedidos "
-              f"desse dia podem estar faltando - considere rodar so ele manualmente com um periodo ainda "
-              f"menor.", file=sys.stderr)
+        print(f"\n  AVISO: o Titan/Power BI truncou esta exportacao (limite de volume excedido) - "
+              f"o periodo {data_inicial} a {data_final} tem mais dados do que a exportacao trouxe de "
+              f"uma vez so.", file=sys.stderr)
         # NAO so avisa - filtra a linha sintetica antes de processar
         # (08/09/2026, achado real: o backfill so CHECAVA essa mensagem na
         # coluna "Depositante", mas nunca excluia a linha de registros - ela
