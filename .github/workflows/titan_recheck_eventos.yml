@@ -1,0 +1,74 @@
+name: Titan recheck eventos/itens
+
+# Roda titan_backfill.py --so-recheck a cada 15min, o dia inteiro (11/09/2026,
+# a pedido da Maria - ver conversa e o comentario grande em
+# rechecar_concluidos_sem_eventos em titan_backfill.py). Existe pra aumentar
+# o ritmo de um backlog real de ~1,2 MILHAO de pedidos com eventos/itens
+# faltando: confirmado por exportacao em massa real dos paineis "Eventos" e
+# "Itens do pedido" que NAO da pra trazer isso em lote (sem uma linha
+# especifica selecionada em "Informacao Pedido", o Power BI devolve os dois
+# paineis AGREGADOS - sem nenhuma coluna de NF/pedido pra identificar de quem
+# e cada evento/item) - o clique pedido-por-pedido (~15-20s cada, via
+# Playwright) e o UNICO jeito.
+#
+# Antes, esse recheck so rodava dentro do "Titan backfill diario" (2x/dia,
+# repartindo orcamento com a exportacao principal + o recheck de situacao
+# presa) - na pratica uns 200-250 pedidos/dia. Rodando isolado (sem a
+# exportacao) a cada 15min, o throughput sobe pra ~2000-3000 pedidos/dia -
+# nao zera o backlog de um dia pro outro, mas para de so crescer e vai
+# esvaziando de verdade. --so-recheck pula a exportacao inteira, entao cada
+# rodada e rapida (so login + os dois rechecks).
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}  # permite rodar manualmente pela aba Actions, pra testar
+
+# Evita rodadas empilhadas (11/09/2026) - se uma rodada atrasar (Titan lento,
+# runner demorando pra subir) e a proxima disparar antes dela terminar, as
+# duas fariam login concorrente no Titan e brigariam pela mesma fila. "queue"
+# (nao cancel-in-progress) deixa a rodada atual terminar e so entao roda a
+# proxima - nunca duas rodando ao mesmo tempo, mas tambem nunca perde uma
+# rodada agendada.
+concurrency:
+  group: titan-recheck-eventos
+  cancel-in-progress: false
+
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    # 12min - cabe dentro do intervalo de 15min entre rodadas com folga real
+    # pra login/setup variarem, mesmo com os dois orcamentos abaixo somando
+    # 9min (60s situacao + 480s eventos).
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: |
+          pip install playwright openpyxl
+          playwright install --with-deps chromium
+
+      - name: Rodar recheck
+        env:
+          TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
+          TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
+        run: |
+          python titan_backfill.py \
+            --so-recheck \
+            --recheck-orcamento-situacao-segundos 60 \
+            --recheck-orcamento-eventos-segundos 480 \
+            --headless
+
+      # Mesmo motivo do "Titan backfill diario" - ver comentario la.
+      - name: Subir diagnostico (se tiver)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: titan_debug
+          path: titan_debug/
+          retention-days: 7
+          if-no-files-found: ignore
