@@ -119,14 +119,48 @@ def marcar_nao_encontrado(numero_nf, marca, mensagem):
         print(f"  (nao consegui nem marcar erro no Supabase: {e})", file=sys.stderr)
 
 
+def _situacao_mais_recente(eventos):
+    """
+    Achado real (11/09/2026, reportado pela Maria - 226+ pedidos da apice
+    concluidos com situacao=NULL apesar de ja EMBARCADO): pra apice (mesma
+    marca com "Nome Projeto" vazio no Titan - ver _bate_marca em
+    titan_bi_scraper.py), a linha de "Informacao Pedido" TAMBEM vem com
+    "Situacao" vazio, mesmo quando a tabela "Eventos" desse mesmo pedido tem
+    o historico completo (FATURADO -> ... -> EMBARCADO). Usa o evento mais
+    recente (por "Horário da Situação", nao so o ultimo da lista - a ordem
+    de exibicao do Power BI nao e garantida) como situacao quando o painel
+    resumo nao expoe. Devolve None se nao der pra determinar (lista vazia ou
+    nenhuma data reconhecida).
+    """
+    melhor_data, melhor_situacao = None, None
+    for evento in eventos or []:
+        situacao = (evento.get("Situação") or "").strip()
+        # " ".join(.split()): mesmo achado do \xa0 (nbsp) ja documentado pra
+        # "Nome Projeto" em titan_bi_scraper._normalizar_espacos - o Titan
+        # usa nbsp em vez de espaco normal aqui tambem (confirmado com bytes
+        # reais, 11/09/2026: "8/23/2026\xa010:45:15\xa0AM"), o que quebra
+        # datetime.strptime silenciosamente (ValueError) se nao normalizar.
+        horario = " ".join((evento.get("Horário da Situação") or "").split())
+        if not situacao or not horario:
+            continue
+        try:
+            data = datetime.datetime.strptime(horario, "%m/%d/%Y %I:%M:%S %p")
+        except ValueError:
+            continue
+        if melhor_data is None or data > melhor_data:
+            melhor_data, melhor_situacao = data, situacao
+    return melhor_situacao
+
+
 def marcar_concluido(numero_nf, marca, pedido_data, eventos, itens):
+    situacao = pedido_data.get("Situação") or _situacao_mais_recente(eventos)
     corpo = {
         "status": "concluido",
         "erro": None,
         # Depositante/Cliente ficam de fora de proposito - confirmado (JSON
         # real, 24/08/2026) que o Titan renderiza essas duas colunas sem
         # texto acessivel no DOM, mesmo aparecendo na tela. Precisaria de OCR.
-        "situacao": pedido_data.get("Situação"),
+        "situacao": situacao,
         "romaneio": pedido_data.get("Romaneio") or None,
         "valor_pedido": pedido_data.get("Valor Pedido"),
         "volume": pedido_data.get("Volume"),
