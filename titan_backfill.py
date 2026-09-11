@@ -226,17 +226,46 @@ def rechecar_concluidos_sem_eventos(page):
 
 def _supabase_upsert_lote(registros):
     """
-    Upsert em lote, on_conflict=numero_nf. O Postgres/PostgREST so atualiza
-    as colunas presentes no JSON enviado quando ha conflito (resolution=
-    merge-duplicates) - como este script NAO envia numero_pedido/eventos/
-    itens, um pedido que ja tenha esses campos preenchidos por uma consulta
-    avulsa anterior (titan_watcher.py) NAO tem esses campos apagados por um
-    backfill rodado depois. So romaneio/situacao/datas/etc. sao sobrescritos
-    (o que e o esperado - o backfill sempre traz o dado mais recente do Titan
-    pra esses campos).
+    Upsert em lote, on_conflict=numero_nf,marca. O Postgres/PostgREST so
+    atualiza as colunas presentes no JSON enviado quando ha conflito
+    (resolution=merge-duplicates) - como este script NAO envia numero_pedido/
+    eventos/itens, um pedido que ja tenha esses campos preenchidos por uma
+    consulta avulsa anterior (titan_watcher.py) NAO tem esses campos apagados
+    por um backfill rodado depois. So romaneio/situacao/datas/etc. sao
+    sobrescritos (o que e o esperado - o backfill sempre traz o dado mais
+    recente do Titan pra esses campos).
+
+    O PostgREST exige que TODOS os objetos de um mesmo array de upsert tenham
+    exatamente as mesmas chaves - senao rejeita o POST inteiro com
+    PGRST102 "All object keys must match" (achado real, 11/09/2026: como
+    numero_pedido so entra no dict quando da pra derivar - ver
+    registro_para_supabase -, um lote de 200 registros que misturasse
+    pedidos com e sem essa chave derrubava o lote INTEIRO, silenciosamente -
+    numa unica rodada isso descartou ~54% dos 150 mil registros exportados,
+    sem nenhuma linha sequer chegar ao Supabase, sem erro nenhum gravado
+    nelas: elas simplesmente nunca existiram na tabela). Agrupa por conjunto
+    de chaves antes de mandar - um POST por grupo uniforme, em vez de um so
+    pro lote inteiro, pra um formato de linha diferente nao derrubar as
+    outras.
     """
     if not registros:
         return
+    grupos = {}
+    for r in registros:
+        grupos.setdefault(frozenset(r.keys()), []).append(r)
+    erros = []
+    for grupo in grupos.values():
+        try:
+            _supabase_upsert_grupo_uniforme(grupo)
+        except Exception as e:
+            erros.append(str(e))
+    if erros:
+        raise RuntimeError("; ".join(erros))
+
+def _supabase_upsert_grupo_uniforme(registros):
+    """POST de um unico grupo onde todo registro tem o mesmo conjunto de
+    chaves (exigencia do PostgREST pra upsert em lote - ver
+    _supabase_upsert_lote acima)."""
     url = f"{SUPABASE_URL}/rest/v1/{TABELA}?on_conflict=numero_nf,marca"
     data = json.dumps(registros).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
