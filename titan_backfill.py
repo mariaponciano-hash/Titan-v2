@@ -78,6 +78,12 @@ import titan_watcher  # reusa processar_pedido/marcar_erro do recheck por-NF (28
 SUPABASE_URL = "https://ozwcyrkzsqzmavjtsmsp.supabase.co"
 SUPABASE_KEY = "sb_publishable_CPF6bT_HC0jkTvYWnxHmDg_61qaWqSQ"
 TABELA = "infos_titan"
+# Destino de tudo que NAO consegue entrar em infos_titan (marca nao
+# identificavel, ou upsert que falhou mesmo depois das tentativas - ver
+# _registrar_falhas) - nada mais e so descartado/logado no stderr da Action,
+# fica gravado e consultavel aqui (achado real, 11/09/2026: NF 30280 e outras
+# desapareciam sem NENHUM sinal em lugar nenhum que alguem realmente olhe).
+TABELA_FALHAS = "infos_titan_falhas_backfill"
 TAMANHO_LOTE = 200  # registros por chamada ao Supabase - evita 1 request por pedido
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabalho - o arquivo e apagado apos o upload
 
@@ -226,37 +232,136 @@ def rechecar_concluidos_sem_eventos(page):
 
 def _supabase_upsert_lote(registros):
     """
-    Upsert em lote, on_conflict=numero_nf. O Postgres/PostgREST so atualiza
-    as colunas presentes no JSON enviado quando ha conflito (resolution=
-    merge-duplicates) - como este script NAO envia numero_pedido/eventos/
-    itens, um pedido que ja tenha esses campos preenchidos por uma consulta
-    avulsa anterior (titan_watcher.py) NAO tem esses campos apagados por um
-    backfill rodado depois. So romaneio/situacao/datas/etc. sao sobrescritos
-    (o que e o esperado - o backfill sempre traz o dado mais recente do Titan
-    pra esses campos).
+    Upsert em lote, on_conflict=numero_nf,marca. O Postgres/PostgREST so
+    atualiza as colunas presentes no JSON enviado quando ha conflito
+    (resolution=merge-duplicates) - como este script NAO envia numero_pedido/
+    eventos/itens, um pedido que ja tenha esses campos preenchidos por uma
+    consulta avulsa anterior (titan_watcher.py) NAO tem esses campos apagados
+    por um backfill rodado depois. So romaneio/situacao/datas/etc. sao
+    sobrescritos (o que e o esperado - o backfill sempre traz o dado mais
+    recente do Titan pra esses campos).
+
+    O PostgREST exige que TODOS os objetos de um mesmo array de upsert tenham
+    exatamente as mesmas chaves - senao rejeita o POST inteiro com
+    PGRST102 "All object keys must match" (achado real, 11/09/2026: como
+    numero_pedido so entra no dict quando da pra derivar - ver
+    registro_para_supabase -, um lote de 200 registros que misturasse
+    pedidos com e sem essa chave derrubava o lote INTEIRO, silenciosamente -
+    numa unica rodada isso descartou ~54% dos 150 mil registros exportados,
+    sem nenhuma linha sequer chegar ao Supabase, sem erro nenhum gravado
+    nelas: elas simplesmente nunca existiram na tabela). Agrupa por conjunto
+    de chaves antes de mandar - um POST por grupo uniforme, em vez de um so
+    pro lote inteiro, pra um formato de linha diferente nao derrubar as
+    outras.
     """
     if not registros:
         return
+    grupos = {}
+    for r in registros:
+        grupos.setdefault(frozenset(r.keys()), []).append(r)
+    erros = []
+    for grupo in grupos.values():
+        try:
+            _supabase_upsert_grupo_uniforme(grupo)
+        except Exception as e:
+            erros.append(str(e))
+            # Antes disso o grupo so virava uma linha de log no stderr da
+            # Action e sumia pra sempre (11/09/2026, mesmo achado da NF
+            # 30280) - agora fica gravado e consultavel em TABELA_FALHAS,
+            # mesmo que a rodada inteira ainda seja reportada como "com erro"
+            # (ver lotes_com_erro em main()).
+            _registrar_falhas("upsert_falhou", grupo, detalhe=str(e))
+    if erros:
+        raise RuntimeError("; ".join(erros))
+
+def _supabase_upsert_grupo_uniforme(registros, tentativas=3):
+    """POST de um unico grupo onde todo registro tem o mesmo conjunto de
+    chaves (exigencia do PostgREST pra upsert em lote - ver
+    _supabase_upsert_lote acima).
+
+    Tenta ate `tentativas` vezes com backoff (2s, 4s, ...) pra erro
+    transitorio (rede, timeout, 5xx do proprio Supabase) - achado real
+    (11/09/2026): antes, qualquer excecao aqui - transitoria ou nao -
+    derrubava o grupo na primeira tentativa, e uma instabilidade momentanea
+    da rede/Supabase perdia pedidos do mesmo jeito que um erro de dado real.
+    Erro 4xx (ex: PGRST102, coluna invalida) NAO tenta de novo - e um
+    problema no formato dos dados, tentar de novo com o mesmo payload so
+    atrasa sem mudar o resultado.
+    """
     url = f"{SUPABASE_URL}/rest/v1/{TABELA}?on_conflict=numero_nf,marca"
     data = json.dumps(registros).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("apikey", SUPABASE_KEY)
-    req.add_header("Authorization", f"Bearer {SUPABASE_KEY}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
+    ultimo_erro = None
+    for tentativa in range(1, tentativas + 1):
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("apikey", SUPABASE_KEY)
+        req.add_header("Authorization", f"Bearer {SUPABASE_KEY}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+            return
+        except urllib.error.HTTPError as e:
+            # Achado real (08/09/2026): um HTTPError sozinho so mostra "HTTP Error
+            # 400: Bad Request", sem o motivo de verdade que o PostgREST/Postgres
+            # devolve no corpo da resposta (ex: qual coluna/valor violou o que) -
+            # sem ler esse corpo, um lote ruim vira um "Bad Request" mudo e a
+            # unica pista sobra ser adivinhar. Le e inclui na excecao antes de
+            # repropagar, pra quem chamar (o loop principal) conseguir logar o
+            # motivo real e (com o fix ao lado) isolar so o lote problematico.
+            corpo = e.read().decode("utf-8", errors="replace")[:1000]
+            ultimo_erro = RuntimeError(f"Supabase respondeu {e.code} no upsert em lote: {corpo}")
+            if e.code < 500:
+                raise ultimo_erro from e
+        except urllib.error.URLError as e:
+            ultimo_erro = RuntimeError(f"Falha de rede no upsert em lote: {e}")
+        if tentativa < tentativas:
+            time.sleep(2 ** tentativa)
+    raise ultimo_erro
+
+def _registrar_falhas(motivo, itens, detalhe=None):
+    """
+    Grava em TABELA_FALHAS em vez de so descartar/logar. Usado tanto pra
+    linha do Titan sem marca identificavel (motivo="sem_nf_ou_marca", `item`
+    e a linha bruta da exportacao) quanto pro registro que um upsert em lote
+    nao conseguiu gravar mesmo depois das tentativas (motivo="upsert_falhou",
+    `item` e o dict ja processado por registro_para_supabase).
+
+    marca vira "" (nao None) de proposito: o unique constraint da tabela e
+    (numero_nf, marca, motivo), e o Postgres trata cada NULL como distinto
+    de qualquer outro NULL - com None, duas falhas da MESMA nf+motivo sem
+    marca virariam duas linhas em vez de uma so (upsert nunca colide).
+
+    Nao deixa uma falha AQUI (ex: TABELA_FALHAS fora do ar tambem) derrubar
+    o backfill - so avisa, mesmo padrao de titan_watcher.marcar_erro.
+    """
+    linhas = []
+    for item in itens:
+        nf = (item.get("numero_nf") or item.get("Nota Fiscal") or "").strip()
+        marca = (item.get("marca") or item.get("Nome Projeto") or "").strip().lower()
+        linhas.append({
+            "numero_nf": nf,
+            "marca": marca,
+            "motivo": motivo,
+            "detalhe": (str(detalhe)[:500] if detalhe else None),
+            "payload": item,
+            "resolvido": False,
+            "atualizado_em": _agora_iso(),
+        })
+    if not linhas:
+        return
     try:
+        url = f"{SUPABASE_URL}/rest/v1/{TABELA_FALHAS}?on_conflict=numero_nf,marca,motivo"
+        data = json.dumps(linhas).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("apikey", SUPABASE_KEY)
+        req.add_header("Authorization", f"Bearer {SUPABASE_KEY}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
         with urllib.request.urlopen(req, timeout=30) as resp:
             resp.read()
-    except urllib.error.HTTPError as e:
-        # Achado real (08/09/2026): um HTTPError sozinho so mostra "HTTP Error
-        # 400: Bad Request", sem o motivo de verdade que o PostgREST/Postgres
-        # devolve no corpo da resposta (ex: qual coluna/valor violou o que) -
-        # sem ler esse corpo, um lote ruim vira um "Bad Request" mudo e a
-        # unica pista sobra ser adivinhar. Le e inclui na excecao antes de
-        # repropagar, pra quem chamar (o loop principal) conseguir logar o
-        # motivo real e (com o fix ao lado) isolar so o lote problematico.
-        corpo = e.read().decode("utf-8", errors="replace")[:1000]
-        raise RuntimeError(f"Supabase respondeu {e.code} no upsert em lote: {corpo}") from e
+    except Exception as e:
+        print(f"  (nao consegui registrar {len(linhas)} falha(s) de '{motivo}' em {TABELA_FALHAS}: {e})", file=sys.stderr)
 
 
 def registro_para_supabase(r):
@@ -388,13 +493,22 @@ def main():
                 print(f"  ({antes - len(registros)} linha(s) de aviso de truncamento removida(s) antes de gravar)", file=sys.stderr)
 
             lote = []
+            ignorados_lote = []
             gravados = 0
             ignorados = 0
             lotes_com_erro = 0
             for r in registros:
                 payload = registro_para_supabase(r)
                 if payload is None:
+                    # Antes so incrementava esse contador e a linha sumia -
+                    # agora fica gravada em TABELA_FALHAS pra revisao manual
+                    # (mesmo achado da NF 30280: nada pode desaparecer sem
+                    # deixar rastro consultavel em algum lugar).
                     ignorados += 1
+                    ignorados_lote.append(r)
+                    if len(ignorados_lote) >= TAMANHO_LOTE:
+                        _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
+                        ignorados_lote = []
                     continue
                 lote.append(payload)
                 if len(lote) >= TAMANHO_LOTE:
@@ -418,14 +532,18 @@ def main():
                 except Exception as e:
                     lotes_com_erro += 1
                     print(f"  ERRO no ultimo lote ({len(lote)} linha(s)), pulando: {e}", file=sys.stderr)
+            if ignorados_lote:
+                _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
 
             print(f"\nConcluido - {gravados} pedido(s) gravados no Supabase.")
             if lotes_com_erro:
-                print(f"{lotes_com_erro} lote(s) falharam e foram pulados (ver ERRO acima pro motivo real) - "
-                      f"esses pedidos ficam pra proxima rodada do backfill.", file=sys.stderr)
+                print(f"{lotes_com_erro} lote(s) falharam e foram pulados (ver ERRO acima pro motivo real, e "
+                      f"{TABELA_FALHAS} pros registros exatos) - esses pedidos ficam pra proxima rodada do "
+                      f"backfill.", file=sys.stderr)
             if ignorados:
                 print(f"{ignorados} linha(s) ignoradas por falta de Nota Fiscal ou de \"Nome Projeto\" "
-                      f"(marca) - sem os dois, nao da pra identificar com seguranca.")
+                      f"(marca) - sem os dois, nao da pra identificar com seguranca. Gravadas em "
+                      f"{TABELA_FALHAS} pra revisao manual, em vez de so descartadas.")
             print("Eventos/Itens NAO foram trazidos por este backfill (ver LIMITACAO no topo do arquivo) - "
                   "continuam vindo via titan_watcher.py quando a Torre precisar de um pedido especifico.")
 
