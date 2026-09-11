@@ -152,7 +152,30 @@ def marcar_concluido(numero_nf, marca, pedido_data, eventos, itens):
     _supabase_request("PATCH", f"{TABELA}?numero_nf=eq.{urllib.parse.quote(numero_nf)}&marca=eq.{urllib.parse.quote(marca)}", corpo)
 
 
-def processar_pedido(page, item):
+def processar_pedido(page, item, permitir_limpar_dados=True):
+    """
+    `permitir_limpar_dados=False` (achado real, 11/09/2026, reportado pela
+    Maria): titan_backfill.rechecar_situacoes_presas/rechecar_concluidos_
+    sem_eventos chamam esta funcao em massa, sem supervisao, SO pra pedidos
+    que ja tem status='concluido' com dado bom (romaneio/situacao/eventos/
+    itens reais). Um "nao encontrado" nesse contexto e MUITO mais provavel
+    de ser um problema transitorio do proprio scraping (sessao caiu no meio
+    da rodada, frame nao carregou, Titan mudou de layout etc.) do que o
+    pedido ter genuinamente sumido do Titan (pedido de WMS nao se apaga
+    sozinho) - mas marcar_nao_encontrado APAGA os campos como se fosse
+    definitivo. Resultado real observado: uma rodada do backfill (11/09/2026,
+    run #22) passou por centenas de pedidos ja concluidos e zerou
+    situacao/romaneio/valor_pedido/eventos/itens/etc. de varios deles, ao
+    que tudo indica por uma falha ampla e transitoria (nao pedido por
+    pedido) que fez toda uma sequencia dar "nao encontrado" em fila. Com
+    False, um "nao encontrado" vira so um marcar_erro (preserva os campos
+    ja gravados, so seta status/erro) - o dado antigo fica visivel e intacto
+    ate alguem confirmar de verdade que o pedido sumiu. True (padrao) mantem
+    o comportamento original pra quem processa a fila 'pendente' via
+    rodar_fila_uma_vez/main() - ali o pedido nunca teve dado bom pra perder
+    (ou, se foi reenfileirado, "nao encontrado agora" e um sinal mais direto
+    porque veio de uma consulta avulsa, nao de uma varredura em massa).
+    """
     # (numero_nf, marca) e a CHAVE (ver comentario grande no topo do arquivo
     # e no endpoint /api/logistica/titan-solicitar em server.ts) -
     # numero_pedido so fica de referencia, nunca usado pra buscar/atualizar
@@ -188,7 +211,13 @@ def processar_pedido(page, item):
     pedido_data = scraper.extrair_linha_por_pedido(frame, numero_nf, marca_esperada=marca)
     if pedido_data is None:
         print(f"[NF {numero_nf} / marca {marca}] nao encontrada no Titan (ou a NF existe mas nao pra essa marca).")
-        marcar_nao_encontrado(numero_nf, marca, f"NF {numero_nf} nao encontrada no Titan BI para a marca {marca}.")
+        mensagem = f"NF {numero_nf} nao encontrada no Titan BI para a marca {marca}."
+        if permitir_limpar_dados:
+            marcar_nao_encontrado(numero_nf, marca, mensagem)
+        else:
+            # Nao apaga dado bom com base num "nao encontrado" vindo de
+            # varredura em massa sem supervisao - ver docstring da funcao.
+            marcar_erro(numero_nf, marca, mensagem)
         return
 
     scraper.clicar_na_linha(frame, numero_nf, marca_esperada=marca)
