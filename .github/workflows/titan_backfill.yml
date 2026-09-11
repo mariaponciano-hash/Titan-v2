@@ -8,9 +8,8 @@ name: Titan backfill diario
 # Agendada "TitanBackfillDiario" do Windows (ver rodar_titan_backfill_diario.ps1)
 # - desativar essa tarefa localmente depois de confirmar que isso funciona,
 # pra nao rodar em duplicidade (upsert e idempotente, mas gasta tempo/execucao
-# a toa). 5 dias e folga de sobra pra cobrir qualquer falha/skip de um dia
-# especifico (ver _gerar_intervalos_diarios em titan_backfill.py) ate a
-# proxima rodada pegar de novo, rodando 2x/dia.
+# a toa). 5 dias e folga de sobra pra cobrir qualquer falha/skip de uma
+# rodada ate a proxima pegar de novo, rodando 2x/dia.
 on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
@@ -20,13 +19,12 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # titan_backfill.py exporta 'Informação Pedido' um dia por vez (ver
-    # _gerar_intervalos_diarios) - ate 5 exportacoes nesta janela, cada uma
-    # podendo levar ate 3min so esperando o download (ver expect_download em
-    # titan_bi_scraper.exportar_dados_do_painel), somado aos 40min dos dois
-    # rechecks (10min situacao presa + 30min eventos/itens). 120min da folga
-    # real pro pior caso.
-    timeout-minutes: 120
+    # titan_backfill.py faz UM export do painel 'Informação Pedido' pra
+    # janela inteira (ate 3min so esperando o download, ver expect_download
+    # em titan_bi_scraper.exportar_dados_do_painel) somado aos 40min dos
+    # dois rechecks (10min situacao presa + 30min eventos/itens). 60min da
+    # folga real pro pior caso.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
