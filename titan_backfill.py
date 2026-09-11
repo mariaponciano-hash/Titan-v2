@@ -178,7 +178,12 @@ def rechecar_situacoes_presas(page):
             print(f"  orcamento de tempo esgotado - {processados}/{len(presos)} reconferido(s), resto fica pra proxima rodada.")
             break
         try:
-            titan_watcher.processar_pedido(page, item)
+            # permitir_limpar_dados=False (achado real, 11/09/2026): isto so
+            # roda sobre pedidos ja 'concluido' com dado bom - um "nao
+            # encontrado" transitorio (sessao/scraping, nao o pedido ter
+            # sumido de verdade) nao pode apagar situacao/romaneio/eventos
+            # ja gravados. Ver docstring de titan_watcher.processar_pedido.
+            titan_watcher.processar_pedido(page, item, permitir_limpar_dados=False)
         except Exception as e:
             print(f"  [NF {item.get('numero_nf')} / marca {item.get('marca')}] erro no recheck: {e}", file=sys.stderr)
             if item.get("numero_nf") and item.get("marca"):
@@ -221,7 +226,9 @@ def rechecar_concluidos_sem_eventos(page):
             print(f"  orcamento de tempo esgotado - {processados}/{len(pendentes)} completado(s), resto fica pra proxima rodada.")
             break
         try:
-            titan_watcher.processar_pedido(page, item)
+            # permitir_limpar_dados=False - mesmo motivo de rechecar_situacoes_
+            # presas acima: so roda sobre pedidos ja 'concluido'.
+            titan_watcher.processar_pedido(page, item, permitir_limpar_dados=False)
         except Exception as e:
             print(f"  [NF {item.get('numero_nf')} / marca {item.get('marca')}] erro completando eventos/itens: {e}", file=sys.stderr)
             if item.get("numero_nf") and item.get("marca"):
