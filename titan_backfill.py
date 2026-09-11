@@ -88,8 +88,8 @@ TAMANHO_LOTE = 200  # registros por chamada ao Supabase - evita 1 request por pe
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabalho - o arquivo e apagado apos o upload
 
 # RECHECK DE SITUACAO PRESA (28/08/2026, achado real pela Ivna): a janela do
-# backfill acima e sempre "ultimos 10 dias corridos" - um pedido importado ha
-# mais de 10 dias que AINDA nao chegou em situacao final (EMBARCADO/
+# backfill acima e sempre "ultimos 5 dias corridos" - um pedido importado ha
+# mais de 5 dias que AINDA nao chegou em situacao final (EMBARCADO/
 # CANCELADO) cai fora dessa janela e nunca mais seria revisitado. Simetrico
 # ao recheck que ja existe no titan_cf_worker (Cloudflare) pro mesmo
 # problema, so que aqui roda com Playwright de verdade (sem o bloqueio de
@@ -175,7 +175,7 @@ def rechecar_situacoes_presas(page, orcamento_segundos=RECHECK_ORCAMENTO_SEGUNDO
     processar_pedido - login com Playwright de verdade, sem o bloqueio de
     renderizacao do Browser Rendering do Cloudflare pra esse dashboard Power
     BI) os pedidos que ficaram presos numa situacao intermediaria fora da
-    janela fixa de 10 dias do backfill acima. Orcamento de tempo (nao so
+    janela fixa de 5 dias do backfill acima. Orcamento de tempo (nao so
     contagem de itens) pra nao estourar o timeout do job independente de
     quantos pedidos estiverem presos.
 
@@ -498,86 +498,44 @@ def registro_para_supabase(r):
     return registro
 
 
-def _gerar_intervalos_diarios(data_inicial, data_final):
-    """
-    Quebra (data_inicial, data_final) em blocos de 1 dia (formato DD/MM/AAAA,
-    igual o resto do script). Achado real (11/09/2026, reportado pela Maria -
-    NF 10034363/apice, situacao AGUARDANDO_PRODUCAO, sumida do Supabase):
-    confirmado que ela aparece no Titan filtrando so por essa NF, mas nao
-    esta em infos_titan NEM em TABELA_FALHAS - ou seja, a linha nunca chegou
-    a ser LIDA pelo backfill. O periodo de 10 dias inteiro ja bate perto do
-    teto de exportacao do Power BI por conta propria (confirmado: um export
-    real de 10 dias veio com exatamente 150.003 linhas - o aviso de
-    truncamento SEMPRE dispara pra essa janela). O codigo so avisava
-    (LINHA_TRUNCAMENTO em exportar_e_gravar_periodo) mas nunca quebrava o
-    periodo sozinho - dependia de alguem notar o aviso no log e rodar nao
-    de novo manualmente com um periodo menor, o que nunca acontecia na
-    pratica. 1 dia por vez fica bem abaixo do teto (150mil/10 = ~15mil
-    linhas/dia).
-    """
-    inicio = datetime.datetime.strptime(data_inicial, "%d/%m/%Y").date()
-    fim = datetime.datetime.strptime(data_final, "%d/%m/%Y").date()
-    dia = inicio
-    while dia <= fim:
-        texto = dia.strftime("%d/%m/%Y")
-        yield texto, texto
-        dia += datetime.timedelta(days=1)
-
-
 LINHA_TRUNCAMENTO = "Exported data exceeded the allowed volume"
 
 
 def _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_final):
     """
     Confere se o periodo que o Titan REALMENTE aplicou bate com o periodo
-    pedido, ANTES de confiar nos dados. Achado real (11/09/2026, Maria): um
-    periodo de 1 dia so (data_inicial == data_final, o unico caso que o
-    loop diario de main() realmente usa) as vezes nao era aplicado de
-    verdade pelo scraper.definir_periodo - a exportacao voltava com um
-    periodo bem mais largo, e o mesmo teto de 150.000 linhas do Power BI
-    disparava de novo (confirmado: uma exportacao pra "01/09/2026 -
-    01/09/2026" voltou com exatamente 150.003 linhas - o MESMO numero que
-    uma exportacao anterior de 10 dias inteiros - coincidencia demais pra
-    ser real; um export manual do mesmo painel/dia trouxe so 14.806 linhas
-    de verdade).
+    pedido, ANTES de confiar nos dados.
 
     DOIS sinais, porque nenhum sozinho e confiavel:
     1. O texto "Filtros aplicados: ..." (ver ler_export_xlsx) quando o
-       Titan inclui ele - confere se cita o dia certo. So valida quando
-       data_inicial == data_final (unico caso real usado); com datas
-       diferentes ou sem essa linha, esse sinal sozinho nao decide nada
-       (fica pro sinal 2).
-    2. TRUNCAMENTO (ver LINHA_TRUNCAMENTO): achado real (11/09/2026, MESMO
-       dia, exportacao automatica via GitHub Actions) - essa exportacao
-       especifica NAO trouxe a linha "Filtros aplicados" nenhuma (sinal 1
-       fica de fora), mas voltou truncada em exatamente 150.003 linhas pra
-       um pedido de 1 dia so - e SABEMOS que um dia de verdade tem ~15-30
-       mil linhas (bem abaixo do teto), entao truncamento num periodo de 1
-       dia so e por si so prova de que o filtro nao foi aplicado - nao
-       precisa da linha de texto pra saber disso.
+       Titan inclui ele - confere se cita o dia certo. So decide algo
+       quando data_inicial == data_final (um unico dia da pra comparar
+       contra um texto especifico); pra periodo de varios dias, ou sem
+       essa linha, esse sinal fica de fora (fica so pro sinal 2).
+    2. TRUNCAMENTO (ver LINHA_TRUNCAMENTO): se o Titan avisa que a
+       exportacao passou do teto de volume, os dados vieram incompletos -
+       vale pra QUALQUER tamanho de periodo (nao so 1 dia), entao mais
+       seguro descartar e tentar de novo do que arriscar gravar so uma
+       parte do periodo pedido.
     """
-    se_aplica = data_inicial == data_final
-    if se_aplica and filtro_aplicado:
+    if data_inicial == data_final and filtro_aplicado:
         dia = datetime.datetime.strptime(data_inicial, "%d/%m/%Y").date()
         dia_seguinte = dia + datetime.timedelta(days=1)
         if not (dia.strftime("%d/%m/%Y") in filtro_aplicado and dia_seguinte.strftime("%d/%m/%Y") in filtro_aplicado):
             return False
-    if se_aplica and any(LINHA_TRUNCAMENTO in str(v) for r in registros for v in r.values()):
+    if any(LINHA_TRUNCAMENTO in str(v) for r in registros for v in r.values()):
         return False
     return True
 
 
 def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     """
-    Faz UM export + upsert de 'Informação Pedido' pro periodo
-    (data_inicial, data_final) - extraido de main() (11/09/2026) pra poder
-    ser chamado uma vez por dia (ver _gerar_intervalos_diarios) em vez de
-    uma vez so pro periodo inteiro, que estoura o teto de volume do Power
-    BI pra janelas de varios dias. Devolve (gravados, ignorados,
-    lotes_com_erro) desse periodo especifico - (0, 0, 0) se o filtro de
-    periodo nunca bater mesmo apos `tentativas` (ver
-    _validar_filtro_aplicado - melhor pular o dia e tentar de novo na
-    proxima rodada do que arriscar gravar dado de um periodo errado).
+    Faz um export + upsert de 'Informação Pedido' pro periodo
+    (data_inicial, data_final) inteiro. Devolve (gravados, ignorados,
+    lotes_com_erro) - (0, 0, 0) se o filtro de periodo nunca bater mesmo
+    apos `tentativas` (ver _validar_filtro_aplicado - melhor pular esta
+    rodada e tentar de novo na proxima do que arriscar gravar dado de um
+    periodo errado ou incompleto).
     """
     registros = []
     filtro_ok = False
@@ -738,24 +696,21 @@ def main():
 
             frame = scraper.get_dashboard_frame(page)
 
-            # Um export por DIA em vez de um export so pro periodo inteiro
-            # (11/09/2026, achado real - ver docstring de
-            # _gerar_intervalos_diarios: NF 10034363/apice existia no Titan
-            # dentro da janela normal do backfill mas nunca chegou nem a ser
-            # lida, porque 10 dias inteiros de 'Informacao Pedido' ja batem
-            # perto do teto de exportacao do Power BI por conta propria).
-            intervalos = list(_gerar_intervalos_diarios(args.data_inicial, args.data_final))
-            print(f"Periodo {args.data_inicial} - {args.data_final} quebrado em {len(intervalos)} dia(s) "
-                  f"(um export por dia, evita estourar o teto de volume do Power BI).")
-            gravados_total = 0
-            ignorados_total = 0
-            lotes_com_erro_total = 0
-            for i, (dia_inicial, dia_final) in enumerate(intervalos, start=1):
-                print(f"\n[{i}/{len(intervalos)}] --- {dia_inicial} ---")
-                gravados, ignorados, lotes_com_erro = exportar_e_gravar_periodo(frame, dia_inicial, dia_final)
-                gravados_total += gravados
-                ignorados_total += ignorados
-                lotes_com_erro_total += lotes_com_erro
+            # Export UNICO pro periodo inteiro (voltou a ser assim em
+            # 11/09/2026 - tinha virado um export por dia por engano: o
+            # motivo real do teto de volume do Power BI estourar era o
+            # filtro de data nao aplicar direito (ja corrigido em
+            # scraper.definir_periodo), nao o tamanho do periodo em si.
+            # Conferido direto no Supabase: o total REAL e distinto de uma
+            # janela de 5 dias fica bem abaixo do teto de ~150 mil linhas -
+            # exportar por dia so multiplicava o tempo do job sem
+            # necessidade. _validar_filtro_aplicado ainda pega qualquer
+            # truncamento de verdade (volume real crescendo no futuro),
+            # devolvendo (0, 0, 0) sem gravar nada errado.
+            print(f"Exportando periodo {args.data_inicial} - {args.data_final}...")
+            gravados_total, ignorados_total, lotes_com_erro_total = exportar_e_gravar_periodo(
+                frame, args.data_inicial, args.data_final
+            )
 
             print(f"\nConcluido - {gravados_total} pedido(s) gravados no Supabase.")
             if lotes_com_erro_total:
