@@ -125,10 +125,14 @@ EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 1800  # 30min
 # atualizado_em.asc (mais antigo primeiro) colocava um pedido RECEM-criado
 # pelo backfill no fim de uma fila de ~1,2 milhao de linhas antigas - na
 # pratica ele nunca chegava a vez dele, mesmo rodando titan_recheck_eventos.
-# yml a cada 15min. Um pedido dos ultimos RECENTE_JANELA_DIAS (que um agente
-# pode estar atendendo agora) importa mais do que um pedido de semanas atras
-# ja embarcado - ver buscar_concluidos_sem_eventos.
-RECENTE_JANELA_DIAS = 3
+# yml a cada 15min. Um pedido recente (que um agente pode estar atendendo
+# agora) importa mais do que um pedido de semanas atras ja embarcado. A
+# janela em si (3 dias) mora dentro da funcao reivindicar_recheck_eventos
+# no banco (nao aqui) desde que o paralelismo real (ver
+# buscar_concluidos_sem_eventos) precisou de reserva atomica via SQL -
+# no Postgres, nao dava pra fazer 2 chamadas HTTP separadas (recentes,
+# depois antigos) de forma atomica sem risco de duas instancias
+# reivindicarem o mesmo pedido entre uma chamada e outra.
 
 
 def _agora_iso():
@@ -207,37 +211,36 @@ def rechecar_situacoes_presas(page, orcamento_segundos=RECHECK_ORCAMENTO_SEGUNDO
     print(f"Recheck de situacao concluido: {processados} pedido(s) processado(s).")
 
 
-def buscar_concluidos_sem_eventos(limite=500):
-    """Pedidos status='concluido' mas eventos ainda NULL (ver
-    EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS acima pro porque).
+def buscar_concluidos_sem_eventos(limite=500, lease_minutos=20):
+    """
+    REIVINDICA (nao so le) ate `limite` pedidos status='concluido' com
+    eventos ainda NULL, chamando a funcao reivindicar_recheck_eventos no
+    Supabase (SELECT ... FOR UPDATE SKIP LOCKED por baixo, ver migracao
+    reivindicar_recheck_eventos).
 
-    Devolve RECENTES primeiro (solicitado_em dentro de RECENTE_JANELA_DIAS),
-    depois o backlog antigo pra completar ate `limite` - ver comentario de
-    RECENTE_JANELA_DIAS acima pro porque (achado real, 11/09/2026: sem essa
-    separacao, um pedido novo nunca furava a fila de 1,2 milhao de linhas
-    antigas). solicitado_em (nao atualizado_em) e o que diferencia "pedido
-    novo" de "pedido antigo que o backfill so tocou de novo hoje" - o
-    backfill sempre atualiza atualizado_em de tudo que exporta, mas so seta
-    solicitado_em na criacao da linha (upsert com merge-duplicates nao
-    reenvia essa coluna).
+    Achado real (11/09/2026, pedido da Maria pra acelerar o backlog de
+    ~1,2 milhao de linhas de ~400 dias pra semanas): titan_recheck_eventos.
+    yml agora roda VARIAS instancias em paralelo (ver strategy.matrix no
+    workflow). Com um SELECT simples (sem reserva), duas instancias rodando
+    ao mesmo tempo pegariam OS MESMOS pedidos - duplicando trabalho (o
+    dobro de logins/navegacao no Titan pros MESMOS pedidos, cobrindo
+    METADE dos pedidos diferentes que deveria num mesmo intervalo de
+    tempo - o paralelismo inteiro seria desperdicado). A funcao no banco
+    marca cada linha reivindicada com recheck_reservado_ate (lease de
+    `lease_minutos`, default folgado o bastante pra cobrir uma rodada
+    inteira) - outra instancia so pode reivindicar essa linha de novo
+    depois que o lease expirar, o que tambem AUTO-RECUPERA pedidos cuja
+    instancia caiu/travou no meio do processamento, sem precisar de
+    limpeza manual nenhuma.
 
-    order=atualizado_em.asc em cada bloco (08/09/2026, mesmo motivo de
-    buscar_situacao_presa acima - sem isso a fila nao tem garantia nenhuma
-    de avancar rodada apos rodada)."""
-    corte = (
-        datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-        - datetime.timedelta(days=RECENTE_JANELA_DIAS)
-    ).isoformat() + "Z"
-    base = f"{TABELA}?status=eq.concluido&eventos=is.null&select=numero_nf,marca&order=atualizado_em.asc"
-    recentes = titan_watcher._supabase_request(
-        "GET", f"{base}&solicitado_em=gte.{urllib.parse.quote(corte)}&limit={limite}"
+    A prioridade "recentes primeiro" (achado anterior - pedido novo nao
+    pode ficar preso atras do backlog antigo) ja fica dentro da funcao no
+    banco (janela de 3 dias), nao precisa mais de duas chamadas separadas
+    aqui.
+    """
+    return titan_watcher._supabase_request(
+        "POST", "rpc/reivindicar_recheck_eventos", {"qtd": limite, "lease_minutos": lease_minutos}
     ) or []
-    if len(recentes) >= limite:
-        return recentes  # ja lotou o limite so com recentes - nem busca o backlog antigo desta vez
-    antigos = titan_watcher._supabase_request(
-        "GET", f"{base}&solicitado_em=lt.{urllib.parse.quote(corte)}&limit={limite - len(recentes)}"
-    ) or []
-    return recentes + antigos
 
 
 def rechecar_concluidos_sem_eventos(page, orcamento_segundos=EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS):
@@ -509,26 +512,75 @@ def _gerar_intervalos_diarios(data_inicial, data_final):
         dia += datetime.timedelta(days=1)
 
 
-def exportar_e_gravar_periodo(frame, data_inicial, data_final):
+def _validar_filtro_aplicado(filtro_aplicado, data_inicial, data_final):
+    """
+    Confere se o texto "Filtros aplicados: ..." que vem na propria
+    exportacao (ver scraper.ler_export_xlsx) bate de verdade com o periodo
+    pedido, ANTES de confiar nos dados. Achado real (11/09/2026, Maria): um
+    periodo de 1 dia so (data_inicial == data_final, o unico caso que o
+    loop diario de main() realmente usa) as vezes nao era aplicado de
+    verdade pelo scraper.definir_periodo - a exportacao voltava com um
+    periodo bem mais largo, e o mesmo teto de 150.000 linhas do Power BI
+    disparava de novo (confirmado: uma exportacao pra "01/09/2026 -
+    01/09/2026" voltou com exatamente 150.003 linhas - o MESMO numero que
+    uma exportacao anterior de 10 dias inteiros - coincidencia demais pra
+    ser real; um export manual do mesmo painel/dia trouxe so 14.806 linhas
+    de verdade).
+
+    So valida quando data_inicial == data_final (unico caso real usado por
+    main()) - pra periodo com datas diferentes nao da pra prever com
+    seguranca o texto exato que o Titan gera, entao deixa passar sem checar
+    em vez de arriscar falso-negativo. Sem filtro_aplicado nenhum (Titan as
+    vezes nao inclui essa linha - ver ler_export_xlsx), tambem deixa passar,
+    ja que nao ha como validar.
+    """
+    if not filtro_aplicado or data_inicial != data_final:
+        return True
+    dia = datetime.datetime.strptime(data_inicial, "%d/%m/%Y").date()
+    dia_seguinte = dia + datetime.timedelta(days=1)
+    return dia.strftime("%d/%m/%Y") in filtro_aplicado and dia_seguinte.strftime("%d/%m/%Y") in filtro_aplicado
+
+
+def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     """
     Faz UM export + upsert de 'Informação Pedido' pro periodo
     (data_inicial, data_final) - extraido de main() (11/09/2026) pra poder
     ser chamado uma vez por dia (ver _gerar_intervalos_diarios) em vez de
     uma vez so pro periodo inteiro, que estoura o teto de volume do Power
     BI pra janelas de varios dias. Devolve (gravados, ignorados,
-    lotes_com_erro) desse periodo especifico.
+    lotes_com_erro) desse periodo especifico - (0, 0, 0) se o filtro de
+    periodo nunca bater mesmo apos `tentativas` (ver
+    _validar_filtro_aplicado - melhor pular o dia e tentar de novo na
+    proxima rodada do que arriscar gravar dado de um periodo errado).
     """
-    print(f"Definindo periodo {data_inicial} - {data_final}...")
-    scraper.definir_periodo(frame, data_inicial, data_final)
+    registros = []
+    filtro_ok = False
+    for tentativa in range(1, tentativas + 1):
+        sufixo = f" (tentativa {tentativa}/{tentativas})" if tentativa > 1 else ""
+        print(f"Definindo periodo {data_inicial} - {data_final}{sufixo}...")
+        scraper.definir_periodo(frame, data_inicial, data_final)
 
-    print("Exportando dados do painel 'Informação Pedido'...")
-    caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
-    print(f"  baixado em {caminho_export}")
-    registros = scraper.ler_export_xlsx(caminho_export)
-    try:
-        caminho_export.unlink()
-    except OSError:
-        pass  # nao critico - so um arquivo de trabalho
+        print("Exportando dados do painel 'Informação Pedido'...")
+        caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
+        print(f"  baixado em {caminho_export}")
+        filtro_aplicado, registros = scraper.ler_export_xlsx(caminho_export)
+        try:
+            caminho_export.unlink()
+        except OSError:
+            pass  # nao critico - so um arquivo de trabalho
+
+        filtro_ok = _validar_filtro_aplicado(filtro_aplicado, data_inicial, data_final)
+        if filtro_ok:
+            break
+        print(f"  AVISO: o filtro de periodo que o Titan aplicou nao bate com o periodo pedido "
+              f"({data_inicial} a {data_final}) - texto real do Titan: {filtro_aplicado!r}.", file=sys.stderr)
+
+    if not filtro_ok:
+        print(f"  Desistindo de {data_inicial} apos {tentativas} tentativa(s) sem o filtro certo - "
+              f"esse dia fica pra proxima rodada do backfill (nao grava nada agora, pra nao arriscar "
+              f"gravar dado de um periodo errado).", file=sys.stderr)
+        return 0, 0, 0
+
     print(f"{len(registros)} linha(s) encontradas no periodo.")
     if not registros:
         print("Nenhum registro encontrado - confira se o periodo esta certo (ver print salvo, se houver).")

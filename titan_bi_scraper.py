@@ -623,12 +623,46 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
 
 def ler_export_xlsx(caminho):
     """
-    Le um .xlsx baixado via exportar_dados_do_painel e devolve uma lista de
-    dicts {cabecalho: valor}, um por linha. Le em modo streaming
-    (read_only=True) pra nao pesar na memoria - exportacoes reais chegaram a
-    150.003 linhas (25/08/2026). Datas viram string ISO (o openpyxl devolve
+    Le um .xlsx baixado via exportar_dados_do_painel e devolve
+    (filtro_aplicado, registros) - registros e uma lista de dicts
+    {cabecalho: valor}, um por linha; filtro_aplicado e o texto da linha
+    "Filtros aplicados: ..." quando o Titan inclui ela (ou None se nao
+    incluir - ver abaixo). Datas viram string ISO (o openpyxl devolve
     datetime.datetime de verdade pras celulas de data - diferente da leitura
     por DOM/scroll, que sempre devolvia texto).
+
+    NAO usa read_only=True (11/09/2026, achado real e bem mais grave que o
+    de cima - descoberto testando um export manual real de "Informação
+    Pedido"): o .xlsx que o Titan/Power BI gera vem com a tag interna
+    <dimension ref="A1"/> (conferido abrindo o .xlsx como zip e olhando
+    xl/worksheets/sheet1.xml) - ou seja, o proprio arquivo declara ERRADO
+    que a planilha inteira e so a celula A1, mesmo tendo 14 mil+ linhas de
+    dado de verdade. O modo read_only=True do openpyxl confia nessa tag pra
+    otimizar a leitura em streaming, e para de iterar logo depois da
+    "1 linha" declarada - um teste real confirmou que isso fazia
+    ler_export_xlsx devolver ZERO registros pro arquivo inteiro, silencio-
+    samente (nao um IndexError, nao um erro nenhum - so uma lista vazia,
+    que main() interpreta como "nenhum registro encontrado" e segue em
+    frente sem gravar nada). O modo padrao (sem read_only) ignora essa tag
+    e le o XML de verdade - mais lento e mais memoria pra arquivos grandes,
+    mas com o backfill agora quebrado em 1 dia por vez (ver
+    _gerar_intervalos_diarios em titan_backfill.py) os arquivos ficam bem
+    menores do que a mega-exportacao de 150 mil linhas de antes, entao o
+    custo de memoria deixa de ser o problema critico que era.
+
+    PULA linhas de preambulo antes do cabecalho de verdade (11/09/2026,
+    achado real - confirmado com exports manuais de "Informação Pedido" e
+    "Itens do pedido"): o Titan as vezes prefixa a exportacao com uma linha
+    "Filtros aplicados:\n..." seguida de uma linha em branco, ANTES do
+    cabecalho de verdade (Depositante/Cliente/Situacao/... pra "Informação
+    Pedido"). Antes, este codigo assumia cegamente que a 1a linha do arquivo
+    JA era o cabecalho - se essa linha de filtro estiver presente e nao for
+    pulada, o "cabecalho" vira essa string gigante (colunas 2+ ficam None),
+    e TODO registro subsequente perde o mapeamento de coluna de verdade
+    (numero_nf/marca nunca sao encontrados, registro_para_supabase descarta
+    tudo). Pula qualquer linha que comece com "Filtros aplicados" ou que
+    esteja inteiramente vazia antes de aceitar a proxima como cabecalho -
+    funciona tanto quando o preambulo existe quanto quando nao existe.
 
     Precisa de `pip install openpyxl` (import so aqui dentro, de proposito -
     quem so usa titan_watcher.py, que nunca chama isto, nao precisa instalar).
@@ -636,10 +670,23 @@ def ler_export_xlsx(caminho):
     import datetime as _datetime
     from openpyxl import load_workbook
 
-    wb = load_workbook(str(caminho), read_only=True, data_only=True)
+    wb = load_workbook(str(caminho), data_only=True)
     try:
         linhas = wb.worksheets[0].iter_rows(values_only=True)
-        cabecalho = next(linhas)
+        filtro_aplicado = None
+        cabecalho = None
+        for linha in linhas:
+            primeira_celula = str(linha[0]).strip() if linha and linha[0] is not None else ""
+            if not primeira_celula and all(v is None for v in linha):
+                continue  # linha em branco entre o preambulo e o cabecalho
+            if primeira_celula.startswith("Filtros aplicados"):
+                filtro_aplicado = primeira_celula
+                continue
+            cabecalho = linha
+            break
+        if cabecalho is None:
+            return filtro_aplicado, []
+
         registros = []
         for linha in linhas:
             registro = {}
@@ -648,7 +695,7 @@ def ler_export_xlsx(caminho):
                     valor = valor.isoformat()
                 registro[chave] = valor
             registros.append(registro)
-        return registros
+        return filtro_aplicado, registros
     finally:
         wb.close()
 
