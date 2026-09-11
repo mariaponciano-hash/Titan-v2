@@ -121,6 +121,15 @@ RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - deixa margem dentro do timeout do jo
 # este recheck, todos dentro do mesmo job).
 EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 1800  # 30min
 
+# Achado real (11/09/2026, pedido da Maria): ordenar a fila so por
+# atualizado_em.asc (mais antigo primeiro) colocava um pedido RECEM-criado
+# pelo backfill no fim de uma fila de ~1,2 milhao de linhas antigas - na
+# pratica ele nunca chegava a vez dele, mesmo rodando titan_recheck_eventos.
+# yml a cada 15min. Um pedido dos ultimos RECENTE_JANELA_DIAS (que um agente
+# pode estar atendendo agora) importa mais do que um pedido de semanas atras
+# ja embarcado - ver buscar_concluidos_sem_eventos.
+RECENTE_JANELA_DIAS = 3
+
 
 def _agora_iso():
     return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
@@ -202,14 +211,33 @@ def buscar_concluidos_sem_eventos(limite=500):
     """Pedidos status='concluido' mas eventos ainda NULL (ver
     EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS acima pro porque).
 
-    order=atualizado_em.asc (08/09/2026, mesmo motivo de buscar_situacao_
-    presa acima - sem isso a fila de ate 500 nao tem garantia nenhuma de
-    avancar rodada apos rodada)."""
-    path = (
-        f"{TABELA}?status=eq.concluido&eventos=is.null"
-        f"&select=numero_nf,marca&order=atualizado_em.asc&limit={limite}"
-    )
-    return titan_watcher._supabase_request("GET", path) or []
+    Devolve RECENTES primeiro (solicitado_em dentro de RECENTE_JANELA_DIAS),
+    depois o backlog antigo pra completar ate `limite` - ver comentario de
+    RECENTE_JANELA_DIAS acima pro porque (achado real, 11/09/2026: sem essa
+    separacao, um pedido novo nunca furava a fila de 1,2 milhao de linhas
+    antigas). solicitado_em (nao atualizado_em) e o que diferencia "pedido
+    novo" de "pedido antigo que o backfill so tocou de novo hoje" - o
+    backfill sempre atualiza atualizado_em de tudo que exporta, mas so seta
+    solicitado_em na criacao da linha (upsert com merge-duplicates nao
+    reenvia essa coluna).
+
+    order=atualizado_em.asc em cada bloco (08/09/2026, mesmo motivo de
+    buscar_situacao_presa acima - sem isso a fila nao tem garantia nenhuma
+    de avancar rodada apos rodada)."""
+    corte = (
+        datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        - datetime.timedelta(days=RECENTE_JANELA_DIAS)
+    ).isoformat() + "Z"
+    base = f"{TABELA}?status=eq.concluido&eventos=is.null&select=numero_nf,marca&order=atualizado_em.asc"
+    recentes = titan_watcher._supabase_request(
+        "GET", f"{base}&solicitado_em=gte.{urllib.parse.quote(corte)}&limit={limite}"
+    ) or []
+    if len(recentes) >= limite:
+        return recentes  # ja lotou o limite so com recentes - nem busca o backlog antigo desta vez
+    antigos = titan_watcher._supabase_request(
+        "GET", f"{base}&solicitado_em=lt.{urllib.parse.quote(corte)}&limit={limite - len(recentes)}"
+    ) or []
+    return recentes + antigos
 
 
 def rechecar_concluidos_sem_eventos(page, orcamento_segundos=EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS):
@@ -455,6 +483,128 @@ def registro_para_supabase(r):
     return registro
 
 
+def _gerar_intervalos_diarios(data_inicial, data_final):
+    """
+    Quebra (data_inicial, data_final) em blocos de 1 dia (formato DD/MM/AAAA,
+    igual o resto do script). Achado real (11/09/2026, reportado pela Maria -
+    NF 10034363/apice, situacao AGUARDANDO_PRODUCAO, sumida do Supabase):
+    confirmado que ela aparece no Titan filtrando so por essa NF, mas nao
+    esta em infos_titan NEM em TABELA_FALHAS - ou seja, a linha nunca chegou
+    a ser LIDA pelo backfill. O periodo de 10 dias inteiro ja bate perto do
+    teto de exportacao do Power BI por conta propria (confirmado: um export
+    real de 10 dias veio com exatamente 150.003 linhas - o aviso de
+    truncamento SEMPRE dispara pra essa janela). O codigo so avisava
+    (LINHA_TRUNCAMENTO em exportar_e_gravar_periodo) mas nunca quebrava o
+    periodo sozinho - dependia de alguem notar o aviso no log e rodar nao
+    de novo manualmente com um periodo menor, o que nunca acontecia na
+    pratica. 1 dia por vez fica bem abaixo do teto (150mil/10 = ~15mil
+    linhas/dia).
+    """
+    inicio = datetime.datetime.strptime(data_inicial, "%d/%m/%Y").date()
+    fim = datetime.datetime.strptime(data_final, "%d/%m/%Y").date()
+    dia = inicio
+    while dia <= fim:
+        texto = dia.strftime("%d/%m/%Y")
+        yield texto, texto
+        dia += datetime.timedelta(days=1)
+
+
+def exportar_e_gravar_periodo(frame, data_inicial, data_final):
+    """
+    Faz UM export + upsert de 'Informação Pedido' pro periodo
+    (data_inicial, data_final) - extraido de main() (11/09/2026) pra poder
+    ser chamado uma vez por dia (ver _gerar_intervalos_diarios) em vez de
+    uma vez so pro periodo inteiro, que estoura o teto de volume do Power
+    BI pra janelas de varios dias. Devolve (gravados, ignorados,
+    lotes_com_erro) desse periodo especifico.
+    """
+    print(f"Definindo periodo {data_inicial} - {data_final}...")
+    scraper.definir_periodo(frame, data_inicial, data_final)
+
+    print("Exportando dados do painel 'Informação Pedido'...")
+    caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
+    print(f"  baixado em {caminho_export}")
+    registros = scraper.ler_export_xlsx(caminho_export)
+    try:
+        caminho_export.unlink()
+    except OSError:
+        pass  # nao critico - so um arquivo de trabalho
+    print(f"{len(registros)} linha(s) encontradas no periodo.")
+    if not registros:
+        print("Nenhum registro encontrado - confira se o periodo esta certo (ver print salvo, se houver).")
+        return 0, 0, 0
+
+    # O Power BI tem um limite de volume por exportacao - descoberto com uma
+    # exportacao real (25/08/2026) que voltou com uma linha extra so com
+    # este aviso no lugar de um pedido de verdade. Quebrar em blocos de 1
+    # dia (ver _gerar_intervalos_diarios) deveria evitar isso na pratica,
+    # mas a checagem continua aqui como rede de seguranca pra um dia
+    # especifico com volume fora do normal.
+    LINHA_TRUNCAMENTO = "Exported data exceeded the allowed volume"
+    truncou = any(LINHA_TRUNCAMENTO in str(v) for r in registros for v in r.values())
+    if truncou:
+        print(f"\n  AVISO: o Titan/Power BI truncou esta exportacao (limite de volume excedido) mesmo pra "
+              f"um periodo de 1 dia so ({data_inicial}) - esse dia especifico tem volume incomum. Pedidos "
+              f"desse dia podem estar faltando - considere rodar so ele manualmente com um periodo ainda "
+              f"menor.", file=sys.stderr)
+        # NAO so avisa - filtra a linha sintetica antes de processar
+        # (08/09/2026, achado real: o backfill so CHECAVA essa mensagem na
+        # coluna "Depositante", mas nunca excluia a linha de registros - ela
+        # seguia pro loop normal como se fosse um pedido de verdade. Se o
+        # Power BI colocar o aviso em outra coluna dessa vez, ela pode
+        # passar pelas checagens de nf/marca de registro_para_supabase com
+        # lixo em vez de um valor de verdade, envenenando o lote inteiro no
+        # upsert). Confere QUALQUER coluna, nao so Depositante, pra nao
+        # depender de onde o Power BI decidir colocar o aviso.
+        antes = len(registros)
+        registros = [r for r in registros if not any(LINHA_TRUNCAMENTO in str(v) for v in r.values())]
+        print(f"  ({antes - len(registros)} linha(s) de aviso de truncamento removida(s) antes de gravar)", file=sys.stderr)
+
+    lote = []
+    ignorados_lote = []
+    gravados = 0
+    ignorados = 0
+    lotes_com_erro = 0
+    for r in registros:
+        payload = registro_para_supabase(r)
+        if payload is None:
+            # Antes so incrementava esse contador e a linha sumia - agora
+            # fica gravada em TABELA_FALHAS pra revisao manual (mesmo
+            # achado da NF 30280: nada pode desaparecer sem deixar rastro
+            # consultavel em algum lugar).
+            ignorados += 1
+            ignorados_lote.append(r)
+            if len(ignorados_lote) >= TAMANHO_LOTE:
+                _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
+                ignorados_lote = []
+            continue
+        lote.append(payload)
+        if len(lote) >= TAMANHO_LOTE:
+            try:
+                _supabase_upsert_lote(lote)
+                gravados += len(lote)
+                print(f"  {gravados} gravados...")
+            except Exception as e:
+                # Isola o lote ruim (08/09/2026, achado real: um HTTP 400
+                # num unico lote de 200 derrubava o script inteiro com
+                # sys.exit(1), descartando todos os lotes restantes - lote
+                # ruim vira log e o resto continua, em vez de tudo ou nada).
+                lotes_com_erro += 1
+                print(f"  ERRO no lote (linhas {gravados + 1}-{gravados + len(lote)}), pulando: {e}", file=sys.stderr)
+            lote = []
+    if lote:
+        try:
+            _supabase_upsert_lote(lote)
+            gravados += len(lote)
+        except Exception as e:
+            lotes_com_erro += 1
+            print(f"  ERRO no ultimo lote ({len(lote)} linha(s)), pulando: {e}", file=sys.stderr)
+    if ignorados_lote:
+        _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
+
+    return gravados, ignorados, lotes_com_erro
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-inicial", help="formato DD/MM/AAAA, ex: 01/06/2026 (obrigatorio, exceto com --so-recheck)")
@@ -499,98 +649,32 @@ def main():
 
             frame = scraper.get_dashboard_frame(page)
 
-            print(f"Definindo periodo {args.data_inicial} - {args.data_final}...")
-            scraper.definir_periodo(frame, args.data_inicial, args.data_final)
+            # Um export por DIA em vez de um export so pro periodo inteiro
+            # (11/09/2026, achado real - ver docstring de
+            # _gerar_intervalos_diarios: NF 10034363/apice existia no Titan
+            # dentro da janela normal do backfill mas nunca chegou nem a ser
+            # lida, porque 10 dias inteiros de 'Informacao Pedido' ja batem
+            # perto do teto de exportacao do Power BI por conta propria).
+            intervalos = list(_gerar_intervalos_diarios(args.data_inicial, args.data_final))
+            print(f"Periodo {args.data_inicial} - {args.data_final} quebrado em {len(intervalos)} dia(s) "
+                  f"(um export por dia, evita estourar o teto de volume do Power BI).")
+            gravados_total = 0
+            ignorados_total = 0
+            lotes_com_erro_total = 0
+            for i, (dia_inicial, dia_final) in enumerate(intervalos, start=1):
+                print(f"\n[{i}/{len(intervalos)}] --- {dia_inicial} ---")
+                gravados, ignorados, lotes_com_erro = exportar_e_gravar_periodo(frame, dia_inicial, dia_final)
+                gravados_total += gravados
+                ignorados_total += ignorados
+                lotes_com_erro_total += lotes_com_erro
 
-            print("Exportando dados do painel 'Informação Pedido'...")
-            caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
-            print(f"  baixado em {caminho_export}")
-            registros = scraper.ler_export_xlsx(caminho_export)
-            try:
-                caminho_export.unlink()
-            except OSError:
-                pass  # nao critico - so um arquivo de trabalho
-            print(f"{len(registros)} linha(s) encontradas no periodo.")
-            if not registros:
-                print("Nenhum registro encontrado - confira se o periodo esta certo (ver print salvo, se houver).")
-                return
-
-            # O Power BI tem um limite de volume por exportacao - descoberto
-            # com uma exportacao real (25/08/2026) que voltou com uma linha
-            # extra so com este aviso no lugar de um pedido de verdade. Sem
-            # essa checagem, um periodo grande demais perderia pedidos SEM
-            # nenhum sinal de que algo ficou de fora.
-            LINHA_TRUNCAMENTO = "Exported data exceeded the allowed volume"
-            truncou = any(LINHA_TRUNCAMENTO in str(v) for r in registros for v in r.values())
-            if truncou:
-                print(f"\n  AVISO: o Titan/Power BI truncou esta exportacao (limite de volume excedido) - "
-                      f"o periodo {args.data_inicial} a {args.data_final} tem mais dados do que a exportacao "
-                      f"trouxe de uma vez so. Pedidos podem estar faltando. Rode de novo quebrando esse "
-                      f"periodo em blocos menores (ex: mes a mes) pra cobrir tudo.", file=sys.stderr)
-                # NAO so avisa - filtra a linha sintetica antes de processar
-                # (08/09/2026, achado real: o backfill so CHECAVA essa mensagem
-                # na coluna "Depositante", mas nunca excluia a linha de
-                # registros - ela seguia pro loop normal como se fosse um
-                # pedido de verdade. Se o Power BI colocar o aviso em outra
-                # coluna dessa vez, ela pode passar pelas checagens de nf/
-                # marca de registro_para_supabase com lixo em vez de um valor
-                # de verdade, envenenando o lote inteiro no upsert). Confere
-                # QUALQUER coluna, nao so Depositante, pra nao depender de
-                # onde o Power BI decidir colocar o aviso.
-                antes = len(registros)
-                registros = [r for r in registros if not any(LINHA_TRUNCAMENTO in str(v) for v in r.values())]
-                print(f"  ({antes - len(registros)} linha(s) de aviso de truncamento removida(s) antes de gravar)", file=sys.stderr)
-
-            lote = []
-            ignorados_lote = []
-            gravados = 0
-            ignorados = 0
-            lotes_com_erro = 0
-            for r in registros:
-                payload = registro_para_supabase(r)
-                if payload is None:
-                    # Antes so incrementava esse contador e a linha sumia -
-                    # agora fica gravada em TABELA_FALHAS pra revisao manual
-                    # (mesmo achado da NF 30280: nada pode desaparecer sem
-                    # deixar rastro consultavel em algum lugar).
-                    ignorados += 1
-                    ignorados_lote.append(r)
-                    if len(ignorados_lote) >= TAMANHO_LOTE:
-                        _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
-                        ignorados_lote = []
-                    continue
-                lote.append(payload)
-                if len(lote) >= TAMANHO_LOTE:
-                    try:
-                        _supabase_upsert_lote(lote)
-                        gravados += len(lote)
-                        print(f"  {gravados} gravados...")
-                    except Exception as e:
-                        # Isola o lote ruim (08/09/2026, achado real: um HTTP
-                        # 400 num unico lote de 200 derrubava o script inteiro
-                        # com sys.exit(1), descartando os ~750 lotes restantes
-                        # de uma exportacao de 150 mil linhas - lote ruim vira
-                        # log e o resto continua, em vez de tudo ou nada).
-                        lotes_com_erro += 1
-                        print(f"  ERRO no lote (linhas {gravados + 1}-{gravados + len(lote)}), pulando: {e}", file=sys.stderr)
-                    lote = []
-            if lote:
-                try:
-                    _supabase_upsert_lote(lote)
-                    gravados += len(lote)
-                except Exception as e:
-                    lotes_com_erro += 1
-                    print(f"  ERRO no ultimo lote ({len(lote)} linha(s)), pulando: {e}", file=sys.stderr)
-            if ignorados_lote:
-                _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
-
-            print(f"\nConcluido - {gravados} pedido(s) gravados no Supabase.")
-            if lotes_com_erro:
-                print(f"{lotes_com_erro} lote(s) falharam e foram pulados (ver ERRO acima pro motivo real, e "
+            print(f"\nConcluido - {gravados_total} pedido(s) gravados no Supabase.")
+            if lotes_com_erro_total:
+                print(f"{lotes_com_erro_total} lote(s) falharam e foram pulados (ver ERRO acima pro motivo real, e "
                       f"{TABELA_FALHAS} pros registros exatos) - esses pedidos ficam pra proxima rodada do "
                       f"backfill.", file=sys.stderr)
-            if ignorados:
-                print(f"{ignorados} linha(s) ignoradas por falta de Nota Fiscal ou de \"Nome Projeto\" "
+            if ignorados_total:
+                print(f"{ignorados_total} linha(s) ignoradas por falta de Nota Fiscal ou de \"Nome Projeto\" "
                       f"(marca) - sem os dois, nao da pra identificar com seguranca. Gravadas em "
                       f"{TABELA_FALHAS} pra revisao manual, em vez de so descartadas.")
             print("Eventos/Itens NAO foram trazidos por este backfill (ver LIMITACAO no topo do arquivo) - "
