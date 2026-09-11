@@ -11,35 +11,44 @@ name: Titan recheck eventos/itens
 # e cada evento/item) - o clique pedido-por-pedido (~15-20s cada, via
 # Playwright) e o UNICO jeito.
 #
-# Antes, esse recheck so rodava dentro do "Titan backfill diario" (2x/dia,
-# repartindo orcamento com a exportacao principal + o recheck de situacao
-# presa) - na pratica uns 200-250 pedidos/dia. Rodando isolado (sem a
-# exportacao) a cada 15min, o throughput sobe pra ~2000-3000 pedidos/dia -
-# nao zera o backlog de um dia pro outro, mas para de so crescer e vai
-# esvaziando de verdade. --so-recheck pula a exportacao inteira, entao cada
-# rodada e rapida (so login + os dois rechecks).
+# PARALELISMO REAL (11/09/2026, pedido explicito da Maria, ciente do risco -
+# ver conversa): `instancia` abaixo faz N jobs identicos rodarem ao mesmo
+# tempo a cada disparo do cron. Isso e seguro contra trabalho duplicado
+# porque buscar_concluidos_sem_eventos() nao faz um SELECT simples - chama a
+# funcao reivindicar_recheck_eventos no Supabase (SELECT ... FOR UPDATE SKIP
+# LOCKED por baixo, ver migracao reivindicar_recheck_eventos), que marca
+# cada linha reivindicada com um lease (recheck_reservado_ate) antes de
+# devolver - duas instancias concorrentes SEMPRE recebem pedidos diferentes,
+# nunca o mesmo. RISCO ACEITO (explicito, nao decisao minha): 20 sessoes
+# concorrentes fazendo login real no Titan e um volume de trafego bem maior
+# do que o testado ate agora - pode disparar rate-limiting ou ate suspensao
+# temporaria da conta de automacao por uso "anormal" do lado do Titan/Unilog,
+# o que quebraria TAMBEM o backfill/watcher normais que os agentes dependem.
+# Se isso acontecer, a primeira acao e reduzir `instancia` (ou zerar o cron
+# abaixo) ANTES de qualquer outra tentativa.
 on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch: {}  # permite rodar manualmente pela aba Actions, pra testar
 
-# Evita rodadas empilhadas (11/09/2026) - se uma rodada atrasar (Titan lento,
-# runner demorando pra subir) e a proxima disparar antes dela terminar, as
-# duas fariam login concorrente no Titan e brigariam pela mesma fila. "queue"
-# (nao cancel-in-progress) deixa a rodada atual terminar e so entao roda a
-# proxima - nunca duas rodando ao mesmo tempo, mas tambem nunca perde uma
-# rodada agendada.
-concurrency:
-  group: titan-recheck-eventos
-  cancel-in-progress: false
-
+# NAO usa concurrency aqui de proposito (diferente da versao anterior,
+# sequencial) - o objetivo agora e JUSTAMENTE ter varias rodadas concorrentes
+# (dentro do mesmo disparo do cron, via matrix, e entre disparos seguidos do
+# cron se um atrasar) - o lease no banco (reivindicar_recheck_eventos) e o
+# unico mecanismo de coordenacao necessario, sem precisar serializar nada
+# aqui no workflow.
 jobs:
   recheck:
     runs-on: ubuntu-latest
-    # 12min - cabe dentro do intervalo de 15min entre rodadas com folga real
-    # pra login/setup variarem, mesmo com os dois orcamentos abaixo somando
-    # 9min (60s situacao + 480s eventos).
     timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 instancias identicas - cada uma so existe pra criar mais um job
+        # concorrente (nao ha particionamento estatico nenhum aqui, o lease
+        # no banco cuida de nao duplicar trabalho entre elas). Pra reduzir o
+        # paralelismo, e so encurtar esta lista.
+        instancia: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
       - uses: actions/checkout@v7
 
@@ -63,12 +72,13 @@ jobs:
             --recheck-orcamento-eventos-segundos 480 \
             --headless
 
-      # Mesmo motivo do "Titan backfill diario" - ver comentario la.
+      # Mesmo motivo do "Titan backfill diario" - ver comentario la. Nome
+      # inclui a instancia pra nao colidir entre os 20 uploads do mesmo job.
       - name: Subir diagnostico (se tiver)
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: titan_debug
+          name: titan_debug-${{ matrix.instancia }}
           path: titan_debug/
           retention-days: 7
           if-no-files-found: ignore
