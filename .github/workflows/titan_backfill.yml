@@ -18,14 +18,20 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # 90min (era 50) - 08/09/2026: EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS
-    # subiu de 10 pra 30min (backlog real de 1000+ pedidos EMBARCADO sem
-    # Eventos/Itens, reportado pela Ivna - ver comentario grande no topo de
-    # titan_backfill.py) - exportacao principal + 10min do recheck de
-    # situacao presa + 30min deste recheck ja somam 40min so de orcamento
-    # interno; 90min de teto deixa margem real pra login/export variarem
-    # sem estourar o timeout do job antes mesmo do script terminar sozinho.
-    timeout-minutes: 90
+    # 180min (era 90) - 11/09/2026: titan_backfill.py agora exporta
+    # 'Informação Pedido' UM DIA POR VEZ em vez do periodo de 10 dias
+    # inteiro numa exportacao so (achado real - NF 10034363/apice existia no
+    # Titan dentro da janela normal mas nunca chegava nem a ser lida, porque
+    # 10 dias inteiros ja batem perto do teto de volume do Power BI por
+    # conta propria - ver _gerar_intervalos_diarios em titan_backfill.py).
+    # Isso multiplica por ~10 o numero de exportacoes desse job (cada uma
+    # pode levar ate 3min so esperando o download, ver expect_download em
+    # titan_bi_scraper.exportar_dados_do_painel) - 90min nao tem mais
+    # margem segura pra isso somado aos 40min ja gastos pelos dois rechecks
+    # (10min situacao presa + 30min eventos/itens). 180min da folga real
+    # mesmo no pior caso (10 exports de ~3min = 30min a mais que o pior
+    # caso anterior).
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
 
