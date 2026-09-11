@@ -442,7 +442,19 @@ def fechar_popup_calendario(frame, tentativas=5):
 # Janela usada por buscas avulsas (titan_watcher.processar_pedido) pra
 # garantir que o filtro "Data Inicial - Data Final" nao exclua o pedido
 # procurado - ver definir_periodo abaixo pro porque isso e necessario.
-PERIODO_AMPLO_INICIAL = "01/01/2020"
+#
+# Ultimos 60 dias (era fixo em "01/01/2020", 11/09/2026, a pedido da Maria):
+# um periodo de anos faz o Power BI reindexar um volume enorme de valores
+# pro slicer de NF/pedido, e essa reindexacao as vezes ainda esta rolando
+# no instante exato da busca (mesmo motivo documentado em
+# marcar_item_da_lista, so que pior quanto maior a janela) - achado real
+# rodando o recheck em producao: varias buscas seguidas falhando com
+# "Nenhum elemento visivel encontrado"/"tabela_linha_nao_encontrada" logo
+# apos abrir a janela ampla. 60 dias cobre de sobra qualquer pedido que o
+# recheck realmente precisa reencontrar (ver rechecar_situacoes_presas/
+# rechecar_concluidos_sem_eventos em titan_backfill.py) com uma janela bem
+# menor pro Power BI reindexar.
+PERIODO_AMPLO_INICIAL = (datetime.date.today() - datetime.timedelta(days=60)).strftime("%d/%m/%Y")
 
 
 def _formatar_data_para_titan(data_str):
