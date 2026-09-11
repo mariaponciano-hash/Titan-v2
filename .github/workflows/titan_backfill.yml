@@ -3,12 +3,14 @@ name: Titan backfill diario
 # Roda o titan_backfill.py duas vezes por dia (06h e 20h horario de Brasilia,
 # = 09h e 23h UTC - Brasil nao tem horario de verao desde 2019, entao esse
 # offset fixo de -3h nao muda ao longo do ano) pra uma janela deslizante dos
-# ultimos 10 dias ate hoje, sem depender do PC da Ivna estar ligado - mesmo
+# ultimos 5 dias ate hoje, sem depender do PC da Ivna estar ligado - mesmo
 # motivo do titan_watcher.py ter virado titan_cf_worker. Substitui a Tarefa
 # Agendada "TitanBackfillDiario" do Windows (ver rodar_titan_backfill_diario.ps1)
 # - desativar essa tarefa localmente depois de confirmar que isso funciona,
 # pra nao rodar em duplicidade (upsert e idempotente, mas gasta tempo/execucao
-# a toa).
+# a toa). 5 dias e folga de sobra pra cobrir qualquer falha/skip de um dia
+# especifico (ver _gerar_intervalos_diarios em titan_backfill.py) ate a
+# proxima rodada pegar de novo, rodando 2x/dia.
 on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
@@ -18,20 +20,13 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # 180min (era 90) - 11/09/2026: titan_backfill.py agora exporta
-    # 'Informação Pedido' UM DIA POR VEZ em vez do periodo de 10 dias
-    # inteiro numa exportacao so (achado real - NF 10034363/apice existia no
-    # Titan dentro da janela normal mas nunca chegava nem a ser lida, porque
-    # 10 dias inteiros ja batem perto do teto de volume do Power BI por
-    # conta propria - ver _gerar_intervalos_diarios em titan_backfill.py).
-    # Isso multiplica por ~10 o numero de exportacoes desse job (cada uma
-    # pode levar ate 3min so esperando o download, ver expect_download em
-    # titan_bi_scraper.exportar_dados_do_painel) - 90min nao tem mais
-    # margem segura pra isso somado aos 40min ja gastos pelos dois rechecks
-    # (10min situacao presa + 30min eventos/itens). 180min da folga real
-    # mesmo no pior caso (10 exports de ~3min = 30min a mais que o pior
-    # caso anterior).
-    timeout-minutes: 180
+    # titan_backfill.py exporta 'Informação Pedido' um dia por vez (ver
+    # _gerar_intervalos_diarios) - ate 5 exportacoes nesta janela, cada uma
+    # podendo levar ate 3min so esperando o download (ver expect_download em
+    # titan_bi_scraper.exportar_dados_do_painel), somado aos 40min dos dois
+    # rechecks (10min situacao presa + 30min eventos/itens). 120min da folga
+    # real pro pior caso.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
 
@@ -44,10 +39,10 @@ jobs:
           pip install playwright openpyxl
           playwright install --with-deps chromium
 
-      - name: Calcular janela de 10 dias
+      - name: Calcular janela de 5 dias
         id: janela
         run: |
-          echo "inicial=$(date -d '-10 days' +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
+          echo "inicial=$(date -d '-5 days' +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
           echo "final=$(date +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
 
       - name: Rodar backfill
