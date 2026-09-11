@@ -445,6 +445,30 @@ def fechar_popup_calendario(frame, tentativas=5):
 PERIODO_AMPLO_INICIAL = "01/01/2020"
 
 
+def _formatar_data_para_titan(data_str):
+    """
+    Converte 'dd/mm/yyyy' (formato usado no resto deste projeto) pro
+    'M/d/yyyy' que o campo de data do Titan exige de verdade - SEM zero a
+    esquerda em mes/dia, com MES antes de DIA (ao contrario do formato
+    brasileiro). CAUSA RAIZ real do "150003 linha(s) recebidas" identica
+    em TODO dia testado (confirmado com HTML real salvo por
+    salvar_diagnostico em titan_debug/periodo_definido_*.html, 11/09/2026):
+    os dois <input class="date-slicer-datepicker"> do slicer tem
+    aria-description="Enter date in M/d/yyyy format" - digitar
+    "01/09/2026" (querendo 1 de SETEMBRO) fazia o campo "Start date"
+    aplicar mes=01/dia=09, ou seja 9 de JANEIRO. Pior: o campo "End date"
+    nunca recebia valor nenhum (aria-label sempre confirmava
+    "selected: 9/11/2026", a data de HOJE, em toda tentativa de todo dia -
+    prova de que o Tab entre os dois campos, no codigo antigo, nunca
+    chegava a focar o campo de verdade). Resultado real: o periodo
+    aplicado nunca era "1 dia", e sim "[data errada, la atras] ate hoje" -
+    uma janela enorme, sempre estourando o teto de volume do Power BI do
+    mesmo jeito, disfarcado de "150003 linhas" indiferente ao dia pedido.
+    """
+    dia, mes, ano = data_str.split("/")
+    return f"{int(mes)}/{int(dia)}/{ano}"
+
+
 def definir_periodo(frame, data_inicial, data_final):
     """
     CONFIRMADO COM TESTE REAL (24/08/2026, periodo 01/06-23/08/2026): o
@@ -466,6 +490,21 @@ def definir_periodo(frame, data_inicial, data_final):
     de seletor nenhum. Generalizada aqui pra processar_pedido tambem poder
     abrir bem mais o periodo (ver PERIODO_AMPLO_INICIAL) antes de buscar por
     NF, do mesmo jeito que o backfill ja fazia pra sua janela especifica.
+
+    REESCRITO (11/09/2026, achado real - ver docstring de
+    _formatar_data_para_titan pra causa raiz completa, com HTML real de
+    evidencia): o clique por coordenada (bounding_box do rotulo + 15px)
+    seguido de Tab pra "pular" pro segundo campo NUNCA foi confiavel pra
+    achar o campo de verdade - so "funcionava" pro campo de INICIO (o
+    primeiro, que recebe o foco direto do clique) e nunca pro de TERMINO,
+    silenciosamente (sem erro nenhum, so um campo que ficava sempre preso
+    em "hoje"). Agora localiza os dois <input class="date-slicer-
+    datepicker"> de verdade via aria-label estavel ("Start date"/"End
+    date" - confirmado em 5 exports reais de dias diferentes que esse
+    texto e sempre em ingles, mesmo com o resto do relatorio em
+    portugues - e string interna do proprio Power BI, nao do autor do
+    relatorio) e clica em CADA UM individualmente, em vez de confiar em
+    Tab pra navegar entre eles.
     """
     try:
         # timeout_ms=60000 (era o padrao de 30000) - achado real rodando via
@@ -474,20 +513,21 @@ def definir_periodo(frame, data_inicial, data_final):
         # no HTML capturado apos os 30s padrao - o runner (CPU compartilhada)
         # parece ser bem mais lento que um PC normal pra este slicer
         # especifico do Power BI terminar de renderizar.
-        rotulo = elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
-        caixa = rotulo.bounding_box()
-        if not caixa:
-            raise PWTimeout("rotulo 'Data Inicial - Data Final' visivel mas sem bounding_box (layout inesperado)")
-        x = caixa["x"] + caixa["width"] / 2
-        y = caixa["y"] + caixa["height"] + 15
-        frame.page.mouse.click(x, y)
-        time.sleep(0.5)
+        elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
+
+        campo_inicio = frame.locator('input.date-slicer-datepicker[aria-label^="Start date"]')
+        campo_fim = frame.locator('input.date-slicer-datepicker[aria-label^="End date"]')
+        campo_inicio.wait_for(state="visible", timeout=10000)
+
+        campo_inicio.click()
         frame.page.keyboard.press("Control+A")
-        frame.page.keyboard.type(data_inicial, delay=60)
+        frame.page.keyboard.type(_formatar_data_para_titan(data_inicial), delay=60)
         frame.page.keyboard.press("Tab")
         time.sleep(0.3)
+
+        campo_fim.click()
         frame.page.keyboard.press("Control+A")
-        frame.page.keyboard.type(data_final, delay=60)
+        frame.page.keyboard.type(_formatar_data_para_titan(data_final), delay=60)
         frame.page.keyboard.press("Enter")
         time.sleep(0.5)
         fechar_popup_calendario(frame)
