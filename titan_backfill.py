@@ -698,30 +698,44 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2, orc
     for tentativa in range(1, tentativas + 1):
         sufixo = f" (tentativa {tentativa}/{tentativas})" if tentativa > 1 else ""
         print(f"Definindo periodo {data_inicial} - {data_final}{sufixo}...")
-        scraper.definir_periodo(frame, data_inicial, data_final)
-        # Print SEMPRE (nao so quando falha) - achado real (11/09/2026): sem
-        # nenhuma evidencia visual de como o filtro fica depois do
-        # definir_periodo, nao da pra saber se o bug e na digitacao (campo
-        # mostra data errada) ou em como o Power BI reage a ela (campo
-        # mostra certo, visual nao filtra mesmo assim). Nome do arquivo
-        # inclui o dia e a tentativa pra nao sobrescrever entre chamadas.
-        scraper.salvar_diagnostico(frame, f"periodo_definido_{data_inicial.replace('/', '-')}_t{tentativa}")
-
-        print("Exportando dados do painel 'Informação Pedido'...")
-        caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
-        print(f"  baixado em {caminho_export}")
-        filtro_aplicado, registros = scraper.ler_export_xlsx(caminho_export)
         try:
-            caminho_export.unlink()
-        except OSError:
-            pass  # nao critico - so um arquivo de trabalho
+            scraper.definir_periodo(frame, data_inicial, data_final)
+            # Print SEMPRE (nao so quando falha) - achado real (11/09/2026): sem
+            # nenhuma evidencia visual de como o filtro fica depois do
+            # definir_periodo, nao da pra saber se o bug e na digitacao (campo
+            # mostra data errada) ou em como o Power BI reage a ela (campo
+            # mostra certo, visual nao filtra mesmo assim). Nome do arquivo
+            # inclui o dia e a tentativa pra nao sobrescrever entre chamadas.
+            scraper.salvar_diagnostico(frame, f"periodo_definido_{data_inicial.replace('/', '-')}_t{tentativa}")
 
-        filtro_ok = _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_final)
-        if filtro_ok:
-            break
-        print(f"  AVISO: o filtro de periodo que o Titan aplicou nao bate com o periodo pedido "
-              f"({data_inicial} a {data_final}) - texto do Titan: {filtro_aplicado!r}, "
-              f"{len(registros)} linha(s) recebidas.", file=sys.stderr)
+            print("Exportando dados do painel 'Informação Pedido'...")
+            caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
+            print(f"  baixado em {caminho_export}")
+            filtro_aplicado, registros = scraper.ler_export_xlsx(caminho_export)
+            try:
+                caminho_export.unlink()
+            except OSError:
+                pass  # nao critico - so um arquivo de trabalho
+
+            filtro_ok = _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_final)
+            if filtro_ok:
+                break
+            print(f"  AVISO: o filtro de periodo que o Titan aplicou nao bate com o periodo pedido "
+                  f"({data_inicial} a {data_final}) - texto do Titan: {filtro_aplicado!r}, "
+                  f"{len(registros)} linha(s) recebidas.", file=sys.stderr)
+        except Exception as e:
+            # NOVO (11/09/2026, achado real - crash em producao, run #32):
+            # scraper.definir_periodo as vezes estoura o timeout esperando a
+            # 1a linha da tabela aparecer (Playwright TimeoutError) - sem
+            # este try/except, essa excecao nunca era pega AQUI, so
+            # propagava e derrubava o processo INTEIRO (sys.exit(1)) mesmo
+            # com `tentativas` pra tentar de novo (o loop nunca chegava a
+            # tentar a 2a vez). Trata como "filtro nao bateu" nesta
+            # tentativa - tenta de novo (ou desiste e pula esta janela pra
+            # proxima rodada, ver abaixo) em vez de derrubar o job inteiro.
+            filtro_ok = False
+            registros = []
+            print(f"  ERRO tentando definir/exportar o periodo: {e}", file=sys.stderr)
 
     if not filtro_ok:
         print(f"  Desistindo de {data_inicial} apos {tentativas} tentativa(s) sem o filtro certo - "

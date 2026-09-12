@@ -345,11 +345,24 @@ def digitar_busca(campo, valor):
     o valor anterior do campo ficou concatenado com o novo (busca virou
     "6486299980880" em vez de "9980880", e claro deu "Nenhum resultado
     encontrado"). Seleciona tudo e apaga antes de digitar.
+
+    CORRIGIDO (11/09/2026, achado real da Maria testando manualmente, HTML
+    real de titan_debug/filtro_nao_encontrado.html confirmando): digitar
+    tecla por tecla (mesmo com delay baixo) faz o Power BI rodar uma busca
+    PARA CADA CARACTERE digitado - a lista de opcoes visivel no meio desse
+    processo reflete um prefixo PARCIAL do valor (ex: buscando "1147557",
+    a tela chegou a mostrar "1147568"/"1147569" junto - numeros que so
+    combinam com um prefixo mais curto ainda em digitacao, nao com o valor
+    final). insert_text() poe o valor INTEIRO de uma vez so (um unico
+    evento "input", que o Angular do Power BI escuta pro two-way binding -
+    ver _ngcontent-ng-c* nos elementos do slicer) - a busca roda uma vez
+    so, ja com o valor completo, sem estados intermediarios incorretos no
+    meio.
     """
     campo.click()
     campo.press("Control+A")
     campo.press("Delete")
-    campo.press_sequentially(str(valor), delay=60)
+    campo.page.keyboard.insert_text(str(valor))
 
 
 def _abrir_dropdown_e_pegar_campo_busca(frame, rotulo, tentativas=3):
