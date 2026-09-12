@@ -615,7 +615,21 @@ def _limpar_filtro_slicer(frame, rotulo):
     verdade o slicer mostrar "Todos"/"All" (ver scraper.esperar_slicer_
     limpo) antes de devolver - se nao confirmar dentro do timeout, propaga
     o erro (quem chama decide o que fazer, ver _completar_eventos_itens).
+
+    FECHA O DROPDOWN ANTES DE PROCURAR O BOTAO (12/09/2026, causa raiz
+    achada pela Maria com HTML real - ver docstring de scraper.filtrar):
+    o Power BI esconde "Clear selections" (style="display: none",
+    confirmado no HTML) enquanto o PROPRIO popup do slicer esta aberto -
+    se o passo anterior (scraper.filtrar ou a selecao de "Numero do
+    pedido" em _ler_eventos_itens_via_filtro_cruzado) tiver deixado o
+    dropdown aberto por causa de um timeout, elemento_visivel nunca acha
+    o botao e a limpeza falha, travando o pedido seguinte na mesma
+    cascata. Um Escape aqui (idempotente - nao faz nada se ja estiver
+    fechado) garante que o botao esteja visivel antes de procura-lo,
+    nao importa qual passo anterior deixou o popup aberto.
     """
+    frame.page.keyboard.press("Escape")
+    time.sleep(0.3)
     painel = scraper.localizar_painel(frame, rotulo)
     botao = scraper.elemento_visivel(
         painel.get_by_role("button", name=re.compile("Clear selections|Limpar sele", re.IGNORECASE)),

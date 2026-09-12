@@ -592,6 +592,22 @@ def filtrar(frame, nf=None, numero_pedido=None):
     o valor gravado no Supabase e so o ID da Torre, mas a opcao no Titan
     mostra o texto completo original ("SH<id>RT<nf>") - contains, nao
     igualdade estrita.
+
+    CORRIGIDO (12/09/2026, causa raiz achada pela Maria a partir do HTML
+    real de titan_debug/filtro_nao_encontrado.html): quando marcar_item_da_
+    lista dava timeout (a NF/numero_pedido nao aparecia a tempo na lista -
+    normalmente porque o filtro do pedido ANTERIOR nao tinha sido limpo
+    ainda), a excecao pulava direto pro except, sem passar pelo Escape que
+    fecha o dropdown - ele ficava aberto (aria-expanded="true"). O proximo
+    passo (_limpar_filtro_slicer, em titan_backfill.py) tentava clicar em
+    "Clear selections" desse MESMO slicer pra limpar o filtro travado, mas
+    o Power BI esconde esse botao (style="display: none") enquanto o
+    proprio popup do slicer esta aberto - confirmado correlacionando os
+    offsets de bytes no HTML (o botao ficava a ~200 bytes ANTES do rotulo
+    do painel, igual aos outros slicers, so que com display:none) - ai a
+    limpeza tambem falhava, e o proximo pedido repetia o mesmo problema em
+    cascata. Fecha o popup (Escape) ANTES de propagar o erro, pra o
+    dropdown nunca ficar preso aberto so por causa de um timeout.
     """
     try:
         if nf:
@@ -611,6 +627,11 @@ def filtrar(frame, nf=None, numero_pedido=None):
             frame.page.keyboard.press("Escape")
             _esperar_tabela_refletir_filtro(frame, numero_pedido)
     except PWTimeout:
+        try:
+            frame.page.keyboard.press("Escape")
+            time.sleep(0.3)
+        except Exception:
+            pass  # mesmo se isto falhar, ainda queremos salvar o diagnostico e propagar o erro real
         salvar_diagnostico(frame, "filtro_nao_encontrado")
         raise
     time.sleep(1)
