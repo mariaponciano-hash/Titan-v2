@@ -863,15 +863,24 @@ def extrair_numero_pedido_torre(registro):
     "Numero do Pedido" do Titan (confirmado pela Ivna, 04/09/2026): pra toda
     marca Gobeaute EXCETO apice, o "Numero do Pedido" do Titan e sempre o
     numero da Torre com a NF colada no final, sem separador (ex: NF 1196008
-    -> Titan mostra "SH38497BS001196008"). Apice fica de fora (e a marca com
-    "Nome Projeto" vazio - ver _bate_marca -, padrao nao confirmado pra ela).
-    Gocase tambem fica de fora - o Titan/Unilog e exclusivo de Gobeaute
-    (Gocase nem chega a ter linha aqui, ver bloqueio em
-    torreSolicitarTitan/index.html - checagem so por seguranca).
+    -> Titan mostra "SH38497BS001196008"). Gocase fica de fora - o
+    Titan/Unilog e exclusivo de Gobeaute (Gocase nem chega a ter linha aqui,
+    ver bloqueio em torreSolicitarTitan/index.html - checagem so por
+    seguranca).
 
-    So corta o sufixo IGUAL a "Nota Fiscal" dessa mesma linha - devolve None
-    se o "Numero do Pedido" nao terminar exatamente com a NF (mais seguro que
-    arriscar gravar um valor cortado errado).
+    APICE (achado real, 11/09/2026 - print da Maria mostrando o painel
+    "Informação Pedido" filtrado por AGUARDANDO_PRODUCAO): ao contrario do
+    que o padrao "NF colada no numero" sugeria, o "Numero do Pedido" da
+    apice no Titan e um ID PROPRIO e direto (ex: "1684668"), sem NF colada -
+    confirmado que nao termina com a NF da mesma linha. Antes disto, "Nome
+    Projeto" vazio (unico jeito de identificar apice - ver _bate_marca)
+    fazia esta funcao devolver None sempre pra apice, descartando um valor
+    que o Titan ja trazia certinho. Usa o valor bruto direto pra apice, sem
+    o corte de sufixo que as outras marcas precisam.
+
+    So corta o sufixo IGUAL a "Nota Fiscal" dessa mesma linha pras outras
+    marcas - devolve None se o "Numero do Pedido" nao terminar exatamente
+    com a NF (mais seguro que arriscar gravar um valor cortado errado).
 
     LOG DE DIAGNOSTICO (08/09/2026, investigando "maioria continua null" pos-
     fix): pra marca que DEVERIA dar pra derivar (nao apice/gocase), imprime
@@ -881,12 +890,12 @@ def extrair_numero_pedido_torre(registro):
     scraper (celula nao terminou de renderizar/rolar a tempo) - ver conversa
     com a Ivna, 08/09/2026."""
     projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper().replace(" ", "")
+    numero_pedido_titan = _normalizar_espacos(registro.get("Número do Pedido"))
     if not projeto:
-        return None  # apice
+        return numero_pedido_titan or None  # apice
     if projeto == "GOCASE":
         return None
     nf = _normalizar_espacos(registro.get("Nota Fiscal"))
-    numero_pedido_titan = _normalizar_espacos(registro.get("Número do Pedido"))
     if not nf or not numero_pedido_titan or not numero_pedido_titan.endswith(nf):
         print(f"  (numero_pedido nao derivado pra marca {projeto}: "
               f"Nota Fiscal={nf!r} Numero do Pedido={numero_pedido_titan!r})", file=sys.stderr)
