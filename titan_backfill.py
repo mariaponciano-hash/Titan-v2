@@ -587,20 +587,27 @@ def _buscar_pares_sem_eventos_itens(nfs):
 
 def _limpar_filtro_slicer(frame, rotulo):
     """
-    Reabre o dropdown do slicer (ex: "Nota Fiscal de Saída", "Número do
-    pedido") e marca "Selecionar tudo" de novo - devolve o filtro pra
-    "Todos" SEM sair do periodo de datas atual (bem mais rapido que um
-    reload completo da pagina, que resetaria o periodo tambem).
+    Clica no botao "Clear selections" do slicer especifico (rotulo) -
+    devolve o filtro pra "Todos" SEM sair do periodo de datas atual (bem
+    mais rapido que um reload completo da pagina, que resetaria o periodo
+    tambem).
+
+    CORRIGIDO (11/09/2026, achado real rodando em producao): a 1a versao
+    tentava reabrir o dropdown e marcar "Selecionar tudo" na lista de
+    opcoes, mas isso nunca achava o elemento (timeout toda vez) - mesmo
+    assim o pedido seguinte completava certo, porque marcar_item_da_lista
+    troca a selecao ao inves de adicionar. Usa "Clear selections" (aria-
+    label confirmado em HTML real de titan_debug/ mais cedo nesta mesma
+    investigacao) - um botao dedicado no proprio visual do slicer,
+    localizado do mesmo jeito que localizar_painel acha qualquer visual
+    (role="group" com aria-label prefixado pelo titulo).
     """
-    scraper.abrir_dropdown_filtro(frame, rotulo)
-    time.sleep(0.5)
-    opcao = scraper.elemento_visivel(
-        frame.get_by_role("option", name=re.compile("Selecionar tudo|Select all", re.IGNORECASE)),
+    painel = scraper.localizar_painel(frame, rotulo)
+    botao = scraper.elemento_visivel(
+        painel.get_by_role("button", name=re.compile("Clear selections|Limpar sele", re.IGNORECASE)),
         timeout_ms=8000,
     )
-    opcao.click()
-    time.sleep(0.3)
-    frame.page.keyboard.press("Escape")
+    botao.click()
     time.sleep(0.3)
 
 
