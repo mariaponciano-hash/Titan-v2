@@ -288,6 +288,12 @@ def rechecar_concluidos_sem_eventos(page, orcamento_segundos=EVENTOS_NULOS_RECHE
     orcamento_segundos virou parametro pra titan_recheck_eventos.yml poder
     rodar SO isto varias vezes por hora com um orcamento proprio, em vez de
     competir por tempo com a exportacao principal 2x/dia.
+
+    NAO mexido (12/09/2026) quando o clique-de-linha foi tirado do caminho
+    da janela do backfill - a Maria pediu especificamente pra nao alterar
+    este caminho (usado so pelo modo --so-recheck, hoje desativado via
+    titan_recheck_eventos.yml), entao continua chamando
+    titan_watcher.processar_pedido como sempre.
     """
     # Mesma protecao de rechecar_situacoes_presas acima, mesmo motivo real.
     try:
@@ -620,6 +626,31 @@ def _limpar_filtro_slicer(frame, rotulo):
     scraper.esperar_slicer_limpo(frame, rotulo, timeout_ms=8000)
 
 
+def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf):
+    """
+    Filtra so pela NF, abre "Numero do pedido" (ja vem cross-filtrado so
+    pelas opcoes validas pra essa NF, sem digitar nada - ver scraper.
+    primeira_opcao_real) e le Eventos/Itens SEM clicar em nenhuma linha da
+    tabela "Informacao Pedido" - fluxo confirmado pela Maria com prints
+    reais (11/09/2026). Fatorado aqui (12/09/2026) pra fora do corpo do
+    loop de _completar_eventos_itens (unico chamador ate agora - a janela
+    do backfill).
+
+    Nao limpa os filtros - quem chama decide (ver _limpar_filtro_slicer).
+    """
+    scraper.filtrar(frame, nf=numero_nf)
+    scraper.abrir_dropdown_filtro(frame, "Número do pedido")
+    time.sleep(1)
+    opcao_pedido = scraper.primeira_opcao_real(frame, timeout_ms=10000)
+    opcao_pedido.click()
+    time.sleep(0.5)
+    frame.page.keyboard.press("Escape")
+    time.sleep(1)
+    eventos = scraper.extrair_eventos(frame)
+    itens = scraper.extrair_itens_pedido(frame)
+    return eventos, itens
+
+
 def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
     """
     Pra cada payload cujo (numero_nf, marca) esteja em pares_alvo (ja existe
@@ -672,18 +703,7 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
         numero_nf = p["numero_nf"]
         marca = p["marca"]
         try:
-            scraper.filtrar(frame, nf=numero_nf)
-
-            scraper.abrir_dropdown_filtro(frame, "Número do pedido")
-            time.sleep(1)
-            opcao_pedido = scraper.primeira_opcao_real(frame, timeout_ms=10000)
-            opcao_pedido.click()
-            time.sleep(0.5)
-            frame.page.keyboard.press("Escape")
-            time.sleep(1)
-
-            p["eventos"] = scraper.extrair_eventos(frame)
-            p["itens"] = scraper.extrair_itens_pedido(frame)
+            p["eventos"], p["itens"] = _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf)
             completados += 1
         except Exception as e:
             print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
@@ -937,8 +957,13 @@ def main():
                       f"(marca) - sem os dois, nao da pra identificar com seguranca. Gravadas em "
                       f"{TABELA_FALHAS} pra revisao manual, em vez de so descartadas.")
 
-            print("\nCompletando Eventos/Itens de pedidos que o backfill deixou concluidos sem essa informacao...")
-            rechecar_concluidos_sem_eventos(page)
+            # REMOVIDO (12/09/2026, pedido direto da Maria): a chamada de
+            # rechecar_concluidos_sem_eventos(page) daqui - o recheck amplo
+            # (qualquer pedido concluido do site inteiro, nao so desta
+            # janela) saiu do fluxo principal do backfill. A funcao continua
+            # existindo (usada pelo modo --so-recheck, hoje so acionado pelo
+            # titan_recheck_eventos.yml, que a Maria ja deixou desativado -
+            # ver "foi eu, deixa desativado por enquanto").
         finally:
             browser.close()
 
