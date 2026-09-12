@@ -634,6 +634,39 @@ def localizar_painel(frame, titulo):
     return frame.locator(f'[role="group"][aria-label^="{titulo}"]').first
 
 
+def esperar_slicer_limpo(frame, rotulo, timeout_ms=8000, intervalo=0.3):
+    """
+    Confirma DE VERDADE (nao so assume que o clique surtiu efeito) que o
+    slicer `rotulo` voltou pra "Todos"/"All" - pedido direto da Maria
+    (12/09/2026), depois do achado real do run #34: _limpar_filtro_slicer
+    so clicava em "Clear selections" e seguia em frente sem checar nada,
+    entao um clique que falhasse silenciosamente (ou nao surtisse efeito a
+    tempo) deixava o filtro sujo pro proximo pedido sem nenhum aviso -
+    causa raiz da cascata de 11 falhas em sequencia vista naquele log.
+
+    O sinal visivel e o texto do <div class="slicer-restatement"> dentro do
+    painel do slicer (confirmado em HTML real de titan_debug/filtro_nao_
+    encontrado.html, 12/09/2026): mostra "All" quando limpo, ou o valor
+    selecionado (ex: "1147558", "SH1254855RT1147558") quando filtrado -
+    exatamente o mesmo elemento que provou visualmente, nos prints da
+    Maria, que o filtro de "Numero do pedido" ficava preso depois de trocar
+    de NF. So aceita "all"/"todos" (minusculo, sem acento) - texto de UI do
+    proprio Power BI, mesmo padrao ja visto no placeholder de busca
+    ("Pesquisar"/"Search") que segue o locale do navegador.
+    """
+    painel = localizar_painel(frame, rotulo)
+    limite = time.time() + timeout_ms / 1000
+    while time.time() < limite:
+        try:
+            texto = painel.locator(".slicer-restatement").first.inner_text(timeout=1000).strip().lower()
+            if texto in ("all", "todos"):
+                return
+        except Exception:
+            pass
+        time.sleep(intervalo)
+    raise PWTimeout(f"Slicer '{rotulo}' nao voltou pra 'Todos'/'All' dentro de {timeout_ms}ms")
+
+
 def rolar_tabela_ate_o_fim(frame):
     """A tabela 'Informacao Pedido' tem scroll horizontal proprio - sem rolar
     ate o fim, colunas como Romaneio ficam fora da tela (e Playwright as vezes

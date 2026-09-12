@@ -601,6 +601,14 @@ def _limpar_filtro_slicer(frame, rotulo):
     investigacao) - um botao dedicado no proprio visual do slicer,
     localizado do mesmo jeito que localizar_painel acha qualquer visual
     (role="group" com aria-label prefixado pelo titulo).
+
+    CONFIRMA VISUALMENTE (12/09/2026, pedido direto da Maria apos o
+    achado real do run #34): so clicar no botao nao era garantia - o clique
+    podia nao surtir efeito a tempo (ou falhar em silencio), e o chamador
+    seguia pro proximo pedido com o filtro ainda sujo. Agora espera de
+    verdade o slicer mostrar "Todos"/"All" (ver scraper.esperar_slicer_
+    limpo) antes de devolver - se nao confirmar dentro do timeout, propaga
+    o erro (quem chama decide o que fazer, ver _completar_eventos_itens).
     """
     painel = scraper.localizar_painel(frame, rotulo)
     botao = scraper.elemento_visivel(
@@ -609,6 +617,7 @@ def _limpar_filtro_slicer(frame, rotulo):
     )
     botao.click()
     time.sleep(0.3)
+    scraper.esperar_slicer_limpo(frame, rotulo, timeout_ms=8000)
 
 
 def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
@@ -679,11 +688,28 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
         except Exception as e:
             print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
         finally:
+            # CORRIGIDO (12/09/2026, achado real - log do run #34 mostrando 11
+            # falhas em sequencia apos a 1a): as duas chamadas ficavam dentro
+            # do MESMO try - se limpar "Numero do pedido" desse timeout (ex:
+            # "Clear selections" nao carregou a tempo), a linha que limpa
+            # "Nota Fiscal de Saida" NUNCA rodava, pulando pro proximo pedido
+            # com os DOIS filtros ainda sujos. A NF do pedido anterior ficava
+            # presa no slicer, entao a busca da NF seguinte nunca achava a
+            # opcao certa - uma falha isolada virava uma cascata ate o fim do
+            # orcamento de tempo (confirmado pela Maria com print real: reabrir
+            # o filtro de NF pra buscar outra ainda mostrava o "Numero do
+            # pedido" da busca anterior selecionado). Cada limpeza agora tem
+            # seu proprio try/except - uma falhar nao impede a outra de
+            # tentar, entao o pior caso deixa so 1 dos 2 filtros sujo (nao os
+            # 2), e o proximo pedido tem chance real de achar sua NF.
             try:
                 _limpar_filtro_slicer(frame, "Número do pedido")
+            except Exception as e:
+                print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Numero do pedido' pro proximo pedido: {e}", file=sys.stderr)
+            try:
                 _limpar_filtro_slicer(frame, "Nota Fiscal de Saída")
             except Exception as e:
-                print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar os filtros pro proximo pedido: {e}", file=sys.stderr)
+                print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Nota Fiscal de Saida' pro proximo pedido: {e}", file=sys.stderr)
     print(f"Eventos/Itens completados pra {completados}/{len(alvo)} pedido(s).")
     return completados
 
