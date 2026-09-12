@@ -679,15 +679,26 @@ def _limpar_filtro_slicer(frame, rotulo, pasta_registro=None, indice_passo=None)
 
 def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, pasta_registro=None):
     """
-    Filtra so pela NF, abre "Numero do pedido" (ja vem cross-filtrado so
-    pelas opcoes validas pra essa NF, sem digitar nada - ver scraper.
-    primeira_opcao_real) e le Eventos/Itens SEM clicar em nenhuma linha da
-    tabela "Informacao Pedido" - fluxo confirmado pela Maria com prints
-    reais (11/09/2026). Fatorado aqui (12/09/2026) pra fora do corpo do
-    loop de _completar_eventos_itens (unico chamador ate agora - a janela
-    do backfill).
-
-    Nao limpa os filtros - quem chama decide (ver _limpar_filtro_slicer).
+    Passo a passo OFICIAL do loop, ditado direto pela Maria (12/09/2026,
+    depois de eu ter tentado 3 causas raiz diferentes pro pbi-overlay-caret
+    e ainda ter passado por cima de um passo que ela ja tinha dito antes -
+    "voce esta tentando muito e esta errando bastante"). Ordem que NAO pode
+    mudar, pra cada NF do loop:
+    1. Verifica/limpa linha residual destacada em "Informação Pedido" (ver
+       scraper.limpar_linha_selecionada) - EM TODA NF, nao so na primeira
+       (achado real: o destaque volta a aparecer entre um pedido e outro,
+       nao e algo que se resolve so uma vez por rodada).
+    2. Filtra a NF (scraper.filtrar).
+    3. Filtra "Numero do pedido" (abre o dropdown, ja vem so com as opcoes
+       validas pra essa NF - sem digitar nada -, marca a 1a opcao real).
+    4. Le "Itens do pedido" (scraper.extrair_itens_pedido - mesma funcao
+       que o titan_watcher.py usa, SEM clicar em nenhuma linha da tabela -
+       confirmado pela Maria, os paineis ja vem cross-filtrados so pelos
+       passos 2 e 3 acima).
+    5. Le "Eventos" (scraper.extrair_eventos - idem).
+    Os passos 6-7 (limpar os dois filtros) ficam no finally de quem chama
+    (_completar_eventos_itens) - o passo 8 (proxima NF) e so o loop
+    continuar.
 
     pasta_registro (12/09/2026, pedido direto da Maria depois do achado do
     "pbi-overlay-caret" - ela quer ver o passo a passo visual completo, nao
@@ -702,7 +713,8 @@ def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, pasta_registro=None)
             passo[0] += 1
             scraper.registrar_passo(frame, pasta_registro, passo[0], nome)
 
-    registrar("00_antes_de_filtrar_nf")
+    scraper.limpar_linha_selecionada(frame, "Informação Pedido")
+    registrar("00_linha_residual_verificada")
     scraper.filtrar(frame, nf=numero_nf)
     registrar("01_nf_filtrada")
     scraper.abrir_dropdown_filtro(frame, "Número do pedido")
@@ -715,9 +727,10 @@ def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, pasta_registro=None)
     frame.page.keyboard.press("Escape")
     time.sleep(1)
     registrar("04_dropdown_numero_pedido_fechado")
-    eventos = scraper.extrair_eventos(frame)
     itens = scraper.extrair_itens_pedido(frame)
-    registrar("05_eventos_itens_lidos")
+    registrar("05_itens_lidos")
+    eventos = scraper.extrair_eventos(frame)
+    registrar("06_eventos_lidos")
     return eventos, itens
 
 
@@ -728,31 +741,17 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
     enche "eventos"/"itens" no proprio dict do payload - o upsert em lote
     logo depois grava tudo junto, sem precisar de um PATCH extra por pedido.
 
-    Fluxo confirmado pela Maria com prints reais (11/09/2026, filtrando
-    manualmente no Titan) - reaproveita o MESMO frame ja aberto no periodo
-    desta janela (NAO recarrega o dashboard do zero por pedido, ao contrario
-    de titan_watcher.processar_pedido - um reload voltaria pro periodo
-    padrao estreito do Titan, que foi exatamente o motivo de "Nenhum
-    elemento visivel encontrado" em quase todo pedido numa tentativa
-    anterior; o periodo desta janela ja fica valendo o tempo todo aqui):
-    1. Abre o dropdown "Nota Fiscal de Saída", digita a NF, marca o item
-       (scraper.filtrar cuida disso).
-    2. Abre o dropdown "Número do pedido" SEM digitar nada - ja vem
-       filtrado so pelas opcoes validas pra essa NF - marca a PRIMEIRA
-       opcao que aparecer (se tiver mais de uma, nao desambigua por marca -
-       pega a primeira mesmo, decisao direta da Maria). CORRIGIDO
-       (12/09/2026, mesmo HTML real que motivou o exact=False em
-       marcar_item_da_lista): "primeira opcao" tem que pular "Select all" -
-       ele SEMPRE aparece como a 1a opcao de um slicer com selecao
-       multipla; clicar nele cegamente (como era antes, so pegando a 1a
-       visivel) selecionava TODOS os pedidos cross-filtrados por essa NF em
-       vez do pedido de verdade - ver scraper.primeira_opcao_real.
-    3. Eventos/Itens ja vem cross-filtrados so pelos dois slicers acima -
-       NAO precisa clicar em nenhuma linha da tabela "Informação Pedido"
-       (confirmado pela Maria - diferente do fluxo de titan_watcher.py).
-    4. Le os dois paineis, depois LIMPA os dois filtros (volta pra "Todos",
-       sem sair do periodo) antes do proximo pedido - ver
-       _limpar_filtro_slicer.
+    PASSO A PASSO OFICIAL do loop, ditado direto pela Maria (12/09/2026) -
+    ver a docstring de _ler_eventos_itens_via_filtro_cruzado pro detalhe
+    dos passos 1-5 (linha residual, filtrar NF, filtrar Numero do pedido,
+    ler Itens, ler Eventos). Os passos 6-7 (limpar os dois filtros) ficam
+    no finally abaixo - o 8 (proxima NF) e so o loop continuar. Reaproveita
+    o MESMO frame ja aberto no periodo desta janela (NAO recarrega o
+    dashboard do zero por pedido, ao contrario de titan_watcher.
+    processar_pedido - um reload voltaria pro periodo padrao estreito do
+    Titan, que foi exatamente o motivo de "Nenhum elemento visivel
+    encontrado" em quase todo pedido numa tentativa anterior; o periodo
+    desta janela ja fica valendo o tempo todo aqui).
 
     Orcamento de tempo (nao so contagem) - o resto fica pra proxima rodada
     do backfill, mesmo padrao ja usado em rechecar_situacoes_presas/
@@ -762,13 +761,6 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
     if not alvo:
         print("Nenhum pedido desta janela precisa completar eventos/itens (ja completos, ou pedido novo demais pra ja ter chegado no Supabase).")
         return 0
-
-    # Desmarca qualquer linha com selecao residual em "Informacao Pedido"
-    # ANTES de comecar a filtrar o 1o pedido - achado real da Maria via o
-    # print do registro passo a passo (12/09/2026, ver scraper.
-    # limpar_linha_selecionada). So roda uma vez por rodada, aqui - o resto
-    # do loop continua filtrando so por NF/Numero do pedido como ja estava.
-    scraper.limpar_linha_selecionada(frame, "Informação Pedido")
 
     print(f"{len(alvo)} pedido(s) desta janela sem eventos/itens - completando (orcamento {orcamento_segundos}s)...")
     if REGISTRO_PASSO_A_PASSO_MAX_PEDIDOS > 0:
@@ -810,14 +802,16 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
             # seu proprio try/except - uma falhar nao impede a outra de
             # tentar, entao o pior caso deixa so 1 dos 2 filtros sujo (nao os
             # 2), e o proximo pedido tem chance real de achar sua NF.
-            try:
-                _limpar_filtro_slicer(frame, "Número do pedido", pasta_registro=pasta_deste_pedido, indice_passo=6)
-            except Exception as e:
-                print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Numero do pedido' pro proximo pedido: {e}", file=sys.stderr)
+            # Ordem 6-7 conforme o passo a passo oficial da Maria (12/09/2026):
+            # limpar a NF PRIMEIRO, depois o Numero do pedido.
             try:
                 _limpar_filtro_slicer(frame, "Nota Fiscal de Saída", pasta_registro=pasta_deste_pedido, indice_passo=7)
             except Exception as e:
                 print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Nota Fiscal de Saida' pro proximo pedido: {e}", file=sys.stderr)
+            try:
+                _limpar_filtro_slicer(frame, "Número do pedido", pasta_registro=pasta_deste_pedido, indice_passo=8)
+            except Exception as e:
+                print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Numero do pedido' pro proximo pedido: {e}", file=sys.stderr)
     print(f"Eventos/Itens completados pra {completados}/{len(alvo)} pedido(s).")
     return completados
 
