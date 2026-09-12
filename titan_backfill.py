@@ -134,6 +134,14 @@ EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 1800  # 30min
 # menor ja basta na pratica.
 EVENTOS_JANELA_ORCAMENTO_SEGUNDOS = 600  # 10min
 
+# Registro passo a passo visual (12/09/2026, pedido direto da Maria depois
+# do achado do "pbi-overlay-caret"): print de CADA acao (nao so do momento
+# da falha, ver scraper.registrar_passo) pros primeiros N pedidos de
+# _completar_eventos_itens - da pra acompanhar visualmente o fluxo inteiro
+# sem gerar um print por pedido de uma janela com dezenas de milhares.
+REGISTRO_PASSO_A_PASSO_MAX_PEDIDOS = 20
+PASTA_REGISTRO_PASSO_A_PASSO = scraper.PASTA_DIAGNOSTICO / "passo_a_passo"
+
 # Achado real (11/09/2026, pedido da Maria): ordenar a fila so por
 # atualizado_em.asc (mais antigo primeiro) colocava um pedido RECEM-criado
 # pelo backfill no fim de uma fila de ~1,2 milhao de linhas antigas - na
@@ -591,7 +599,7 @@ def _buscar_pares_sem_eventos_itens(nfs):
     return pares
 
 
-def _limpar_filtro_slicer(frame, rotulo):
+def _limpar_filtro_slicer(frame, rotulo, pasta_registro=None, indice_passo=None):
     """
     Clica no botao "Clear selections" do slicer especifico (rotulo) -
     devolve o filtro pra "Todos" SEM sair do periodo de datas atual (bem
@@ -631,6 +639,10 @@ def _limpar_filtro_slicer(frame, rotulo):
     slicer pelo <h3 title="..."> e sobe ate o role="group" certo, em vez de
     depender de um aria-label que nunca existiu pros slicers) - so DEPOIS
     disso o hover() e a busca do botao fazem sentido.
+
+    pasta_registro/indice_passo (12/09/2026, pedido direto da Maria): se
+    informados, grava um print depois de confirmar a limpeza - ver
+    scraper.registrar_passo.
     """
     frame.page.keyboard.press("Escape")
     time.sleep(0.3)
@@ -644,9 +656,12 @@ def _limpar_filtro_slicer(frame, rotulo):
     botao.click()
     time.sleep(0.3)
     scraper.esperar_slicer_limpo(frame, rotulo, timeout_ms=8000)
+    if pasta_registro is not None:
+        nome_rotulo = re.sub(r"\W+", "_", rotulo).strip("_").lower()
+        scraper.registrar_passo(frame, pasta_registro, indice_passo, f"limpou_{nome_rotulo}")
 
 
-def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf):
+def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, pasta_registro=None):
     """
     Filtra so pela NF, abre "Numero do pedido" (ja vem cross-filtrado so
     pelas opcoes validas pra essa NF, sem digitar nada - ver scraper.
@@ -657,17 +672,36 @@ def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf):
     do backfill).
 
     Nao limpa os filtros - quem chama decide (ver _limpar_filtro_slicer).
+
+    pasta_registro (12/09/2026, pedido direto da Maria depois do achado do
+    "pbi-overlay-caret" - ela quer ver o passo a passo visual completo, nao
+    so o diagnostico do momento da falha): se informada, grava um print
+    depois de cada acao (ver scraper.registrar_passo) - so pros primeiros
+    REGISTRO_PASSO_A_PASSO_MAX_PEDIDOS pedidos de uma rodada (ver chamador).
     """
+    passo = [0]
+
+    def registrar(nome):
+        if pasta_registro is not None:
+            passo[0] += 1
+            scraper.registrar_passo(frame, pasta_registro, passo[0], nome)
+
+    registrar("00_antes_de_filtrar_nf")
     scraper.filtrar(frame, nf=numero_nf)
+    registrar("01_nf_filtrada")
     scraper.abrir_dropdown_filtro(frame, "Número do pedido")
+    registrar("02_dropdown_numero_pedido_aberto")
     time.sleep(1)
     opcao_pedido = scraper.primeira_opcao_real(frame, timeout_ms=10000)
     opcao_pedido.click()
+    registrar("03_opcao_numero_pedido_marcada")
     time.sleep(0.5)
     frame.page.keyboard.press("Escape")
     time.sleep(1)
+    registrar("04_dropdown_numero_pedido_fechado")
     eventos = scraper.extrair_eventos(frame)
     itens = scraper.extrair_itens_pedido(frame)
+    registrar("05_eventos_itens_lidos")
     return eventos, itens
 
 
@@ -714,16 +748,27 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
         return 0
 
     print(f"{len(alvo)} pedido(s) desta janela sem eventos/itens - completando (orcamento {orcamento_segundos}s)...")
+    if REGISTRO_PASSO_A_PASSO_MAX_PEDIDOS > 0:
+        print(f"  Registro passo a passo (print de cada acao) dos primeiros "
+              f"{min(REGISTRO_PASSO_A_PASSO_MAX_PEDIDOS, len(alvo))} pedido(s) em "
+              f"{PASTA_REGISTRO_PASSO_A_PASSO}/ (pedido direto da Maria).")
     inicio = time.monotonic()
     completados = 0
-    for p in alvo:
+    for idx, p in enumerate(alvo):
         if time.monotonic() - inicio > orcamento_segundos:
             print(f"  orcamento de tempo esgotado - {completados}/{len(alvo)} completado(s), resto fica pra proxima rodada.")
             break
         numero_nf = p["numero_nf"]
         marca = p["marca"]
+        # Registro passo a passo (12/09/2026, pedido direto da Maria) - so
+        # pros primeiros N pedidos desta rodada, ver constante no topo do
+        # arquivo pro motivo de nao gravar pra todos.
+        pasta_deste_pedido = None
+        if idx < REGISTRO_PASSO_A_PASSO_MAX_PEDIDOS:
+            nome_marca = re.sub(r"\W+", "_", marca).strip("_")
+            pasta_deste_pedido = PASTA_REGISTRO_PASSO_A_PASSO / f"{idx:03d}_{numero_nf}_{nome_marca}"
         try:
-            p["eventos"], p["itens"] = _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf)
+            p["eventos"], p["itens"] = _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, pasta_registro=pasta_deste_pedido)
             completados += 1
         except Exception as e:
             print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
@@ -743,11 +788,11 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
             # tentar, entao o pior caso deixa so 1 dos 2 filtros sujo (nao os
             # 2), e o proximo pedido tem chance real de achar sua NF.
             try:
-                _limpar_filtro_slicer(frame, "Número do pedido")
+                _limpar_filtro_slicer(frame, "Número do pedido", pasta_registro=pasta_deste_pedido, indice_passo=6)
             except Exception as e:
                 print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Numero do pedido' pro proximo pedido: {e}", file=sys.stderr)
             try:
-                _limpar_filtro_slicer(frame, "Nota Fiscal de Saída")
+                _limpar_filtro_slicer(frame, "Nota Fiscal de Saída", pasta_registro=pasta_deste_pedido, indice_passo=7)
             except Exception as e:
                 print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Nota Fiscal de Saida' pro proximo pedido: {e}", file=sys.stderr)
     print(f"Eventos/Itens completados pra {completados}/{len(alvo)} pedido(s).")

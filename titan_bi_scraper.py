@@ -87,6 +87,31 @@ def salvar_diagnostico(alvo, etapa):
     print("Manda esses dois arquivos que eu ajusto o seletor.", file=sys.stderr)
 
 
+def registrar_passo(alvo, pasta, indice, nome_passo):
+    """
+    Grava so o PRINT (sem HTML, pra nao pesar) de UM passo qualquer do
+    fluxo - nao so quando falha (isso ja e salvar_diagnostico). Pedido
+    direto da Maria (12/09/2026, depois do achado do "pbi-overlay-caret"):
+    ela quer ver o passo a passo visual completo de cada acao (abrir
+    dropdown, digitar NF, marcar item, ler eventos/itens, limpar filtro)
+    pra acompanhar exatamente o que o robo esta fazendo, nao so o
+    diagnostico do momento da falha.
+
+    So chamado com uma `pasta` de verdade pelos primeiros N pedidos de uma
+    rodada (ver REGISTRO_PASSO_A_PASSO_MAX_PEDIDOS em titan_backfill.py) -
+    gravar isso pra TODOS os pedidos de uma janela com dezenas de milhares
+    geraria centenas de milhares de imagens e deixaria o job bem mais
+    lento.
+    """
+    pasta.mkdir(parents=True, exist_ok=True)
+    pagina = alvo.page if hasattr(alvo, "page") else alvo  # frame ou page
+    nome = f"{indice:02d}_{nome_passo}.png"
+    try:
+        pagina.screenshot(path=str(pasta / nome))
+    except Exception as e:
+        print(f"  (nao consegui gravar o passo '{nome_passo}': {e})", file=sys.stderr)
+
+
 def elemento_visivel(locator_multi, timeout_ms=30000, intervalo=0.3):
     """
     Confirmado (18/08/2026, com print real): o Titan BI e um embed do
