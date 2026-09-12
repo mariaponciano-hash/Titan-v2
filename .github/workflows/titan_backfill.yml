@@ -3,13 +3,17 @@ name: Titan backfill diario
 # Roda o titan_backfill.py duas vezes por dia (06h e 20h horario de Brasilia,
 # = 09h e 23h UTC - Brasil nao tem horario de verao desde 2019, entao esse
 # offset fixo de -3h nao muda ao longo do ano) pra uma janela deslizante dos
-# ultimos 5 dias ate hoje, sem depender do PC da Ivna estar ligado - mesmo
+# ultimos 2 dias ate hoje, sem depender do PC da Ivna estar ligado - mesmo
 # motivo do titan_watcher.py ter virado titan_cf_worker. Substitui a Tarefa
 # Agendada "TitanBackfillDiario" do Windows (ver rodar_titan_backfill_diario.ps1)
 # - desativar essa tarefa localmente depois de confirmar que isso funciona,
 # pra nao rodar em duplicidade (upsert e idempotente, mas gasta tempo/execucao
-# a toa). 5 dias e folga de sobra pra cobrir qualquer falha/skip de uma
-# rodada ate a proxima pegar de novo, rodando 2x/dia.
+# a toa).
+#
+# 2 dias (era 5, 11/09/2026, pedido direto da Maria): reduzido junto com a
+# adaptacao do backfill pra completar Eventos/Itens dos pedidos da propria
+# janela (ver _completar_eventos_itens em titan_backfill.py) - janela menor
+# = menos pedidos novos por rodada pra completar, dentro do timeout do job.
 on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
@@ -21,8 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     # titan_backfill.py faz UM export do painel 'Informação Pedido' pra
     # janela inteira (ate 3min so esperando o download, ver expect_download
-    # em titan_bi_scraper.exportar_dados_do_painel) somado aos 40min dos
-    # dois rechecks (10min situacao presa + 30min eventos/itens). 60min da
+    # em titan_bi_scraper.exportar_dados_do_painel), completa Eventos/Itens
+    # dos pedidos novos desta janela (ate 10min, ver EVENTOS_JANELA_
+    # ORCAMENTO_SEGUNDOS) e por fim o recheck amplo de eventos/itens de todo
+    # o site (ate 30min, EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS). 60min da
     # folga real pro pior caso.
     timeout-minutes: 60
     steps:
@@ -37,10 +43,10 @@ jobs:
           pip install playwright openpyxl
           playwright install --with-deps chromium
 
-      - name: Calcular janela de 5 dias
+      - name: Calcular janela de 2 dias
         id: janela
         run: |
-          echo "inicial=$(date -d '-5 days' +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
+          echo "inicial=$(date -d '-2 days' +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
           echo "final=$(date +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
 
       - name: Rodar backfill
@@ -56,9 +62,10 @@ jobs:
       # O runner some ao fim do job - sem isso, o print/HTML que
       # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel
       # (diferente de rodar no PC, onde a pasta fica ali pra abrir direto).
-      # "always()" em vez de "failure()" (28/08/2026, achado real): o passo
-      # de recheck (rechecar_situacoes_presas) engole excecao por item -
-      # o job inteiro "tem sucesso" mesmo com 100% dos itens falhando, entao
+      # "always()" em vez de "failure()" (28/08/2026, achado real): os
+      # passos de recheck/completar (eventos/itens, ambos) engolem excecao
+      # por item - o job inteiro "tem sucesso" mesmo com 100% dos itens
+      # falhando, entao
       # "if: failure()" nunca disparava e os prints/HTML ficavam perdidos
       # quando o runner terminava. if-no-files-found:ignore evita o passo
       # falhar sozinho na rodada normal (sem nenhum diagnostico salvo).
