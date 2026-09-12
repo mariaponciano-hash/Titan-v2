@@ -111,6 +111,35 @@ def elemento_visivel(locator_multi, timeout_ms=30000, intervalo=0.3):
     raise PWTimeout(f"Nenhum elemento visivel encontrado dentro de {timeout_ms}ms (so achou versoes escondidas/tooltip)")
 
 
+def primeira_opcao_real(frame, ignorar=("Select all", "Selecionar tudo"), timeout_ms=10000, intervalo=0.3):
+    """
+    Primeira opcao role="option" visivel de um dropdown ja aberto, pulando
+    "Select all"/"Selecionar tudo" (12/09/2026, mesmo HTML real de
+    titan_debug/filtro_nao_encontrado.html que motivou o exact=False em
+    marcar_item_da_lista, enviado pela Maria - o dropdown "Numero do
+    pedido" tinha exatamente 2 role="option": "Select all" no
+    aria-posinset=1 e o pedido de verdade no aria-posinset=2). Usado por
+    titan_backfill._completar_eventos_itens, que abre esse dropdown SEM
+    digitar nada e antes so pegava a 1a opcao visivel - isso clicava em
+    "Select all" (selecionando TODOS os pedidos cross-filtrados por essa NF
+    em vez do pedido certo) sempre que ele aparecesse antes na lista.
+    """
+    limite = time.time() + timeout_ms / 1000
+    while time.time() < limite:
+        for el in frame.get_by_role("option").all():
+            try:
+                if not el.is_visible():
+                    continue
+                nome = (el.get_attribute("title") or el.inner_text() or "").strip()
+                if nome in ignorar:
+                    continue
+                return el
+            except Exception:
+                continue
+        time.sleep(intervalo)
+    raise PWTimeout(f"Nenhuma opcao real encontrada dentro de {timeout_ms}ms (so achou 'Select all'/vazio)")
+
+
 def preencher_primeiro_que_existir(page, estrategias, valor, timeout_cada=4000):
     """
     Tenta cada estrategia de localizador em ordem (get_by_label so funciona se
@@ -304,7 +333,7 @@ def abrir_dropdown_filtro(frame, rotulo):
     frame.page.mouse.click(x, y)
 
 
-def marcar_item_da_lista(frame, campo_busca, valor, tentativas=3):
+def marcar_item_da_lista(frame, campo_busca, valor, tentativas=3, exact=True):
     """
     CORRIGIDO (24/08/2026): a causa raiz do filtro nao aplicar era o
     campo.fill() usado antes - ele seta o valor do input direto via JS, sem
@@ -322,13 +351,29 @@ def marcar_item_da_lista(frame, campo_busca, valor, tentativas=3):
     folga a cada tentativa) ate 'tentativas' vezes antes de propagar o erro
     de verdade - o Titan/Power BI as vezes demora um instante a mais pra
     popular a lista de opcoes depois do Enter.
+
+    exact=False (12/09/2026, achado real - HTML de titan_debug/
+    filtro_nao_encontrado.html enviado pela Maria): usado pra filtrar()
+    (nf=..., numero_pedido=...). O "numero_pedido" gravado no Supabase e o
+    ID BRUTO da Torre (ex: "1254848"), mas o slicer "Numero do pedido" no
+    Titan sempre mostra o texto completo original ("SH1254848RT1147557" -
+    prefixo SH + o id da Torre + RT + a NF colada no final, ver
+    scraper.extrair_numero_pedido_torre). exact=True nunca bate ("1254848"
+    != "SH1254848RT1147557"), mesmo com a opcao certa (e unica) ja filtrada
+    e visivel na tela - o filtro ficava preso pra sempre em
+    "filtro_nao_encontrado" e o pedido nunca tinha Eventos/Itens
+    exportados. exact=False usa contains (comportamento padrao do
+    Playwright pra `name=` sem exact) - a busca por texto ja estreita a
+    lista pra so a opcao certa mesmo quando duas NFs iguais tem numero_
+    pedido diferente, so o MATCH final que precisava parar de exigir
+    igualdade estrita.
     """
     ultimo_erro = None
     for tentativa in range(tentativas):
         campo_busca.press("Enter")
         time.sleep(1 + tentativa * 1.5)  # da mais folga a cada nova tentativa
         try:
-            opcao = elemento_visivel(frame.get_by_role("option", name=str(valor), exact=True), timeout_ms=8000)
+            opcao = elemento_visivel(frame.get_by_role("option", name=str(valor), exact=exact), timeout_ms=8000)
             opcao.click()
             return
         except PWTimeout as e:
@@ -542,6 +587,11 @@ def filtrar(frame, nf=None, numero_pedido=None):
     """
     Abre o combobox do filtro, digita a busca de verdade (tecla por tecla),
     confirma com Enter e clica no item resultante pra de fato marcar o filtro.
+
+    numero_pedido usa exact=False (ver docstring de marcar_item_da_lista) -
+    o valor gravado no Supabase e so o ID da Torre, mas a opcao no Titan
+    mostra o texto completo original ("SH<id>RT<nf>") - contains, nao
+    igualdade estrita.
     """
     try:
         if nf:
@@ -556,7 +606,7 @@ def filtrar(frame, nf=None, numero_pedido=None):
             campo = _abrir_dropdown_e_pegar_campo_busca(frame, "Número do pedido")
             digitar_busca(campo, numero_pedido)
             time.sleep(1)
-            marcar_item_da_lista(frame, campo, numero_pedido)
+            marcar_item_da_lista(frame, campo, numero_pedido, exact=False)
             time.sleep(1)
             frame.page.keyboard.press("Escape")
             _esperar_tabela_refletir_filtro(frame, numero_pedido)

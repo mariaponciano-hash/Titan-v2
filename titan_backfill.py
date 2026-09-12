@@ -630,7 +630,13 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
     2. Abre o dropdown "Número do pedido" SEM digitar nada - ja vem
        filtrado so pelas opcoes validas pra essa NF - marca a PRIMEIRA
        opcao que aparecer (se tiver mais de uma, nao desambigua por marca -
-       pega a primeira mesmo, decisao direta da Maria).
+       pega a primeira mesmo, decisao direta da Maria). CORRIGIDO
+       (12/09/2026, mesmo HTML real que motivou o exact=False em
+       marcar_item_da_lista): "primeira opcao" tem que pular "Select all" -
+       ele SEMPRE aparece como a 1a opcao de um slicer com selecao
+       multipla; clicar nele cegamente (como era antes, so pegando a 1a
+       visivel) selecionava TODOS os pedidos cross-filtrados por essa NF em
+       vez do pedido de verdade - ver scraper.primeira_opcao_real.
     3. Eventos/Itens ja vem cross-filtrados so pelos dois slicers acima -
        NAO precisa clicar em nenhuma linha da tabela "Informação Pedido"
        (confirmado pela Maria - diferente do fluxo de titan_watcher.py).
@@ -661,7 +667,7 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
 
             scraper.abrir_dropdown_filtro(frame, "Número do pedido")
             time.sleep(1)
-            opcao_pedido = scraper.elemento_visivel(frame.get_by_role("option"), timeout_ms=10000)
+            opcao_pedido = scraper.primeira_opcao_real(frame, timeout_ms=10000)
             opcao_pedido.click()
             time.sleep(0.5)
             frame.page.keyboard.press("Escape")
