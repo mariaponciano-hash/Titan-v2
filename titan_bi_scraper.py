@@ -651,8 +651,41 @@ def localizar_painel(frame, titulo):
     as linhas da tabela (elas ficam em outra ramificacao da arvore). Usar o
     proprio role="group" com aria-label prefixado pelo titulo e a forma
     correta e estavel de achar o painel inteiro.
+
+    NAO FUNCIONA PRA SLICERS (12/09/2026, achado real - run #39, HTML
+    confirmado): esse padrao vale pros paineis de dados ("Informação
+    Pedido", "Eventos", "Itens do pedido", etc.), cujo role="group" TEM
+    aria-label direto. Os slicers ("Nota Fiscal de Saída", "Numero do
+    pedido", ...) sao um tipo de visual DIFERENTE (aria-roledescription=
+    "Slicer") cujo role="group" externo NAO tem aria-label nenhum - o
+    titulo so existe num <h3 class="slicer-header-text" title="..."> bem
+    mais fundo. Ou seja, localizar_painel(frame, "Nota Fiscal de Saída")
+    NUNCA achou nada - `_limpar_filtro_slicer` usava esta funcao por
+    engano; ver localizar_slicer_por_titulo pro jeito certo de achar um
+    slicer especifico.
     """
     return frame.locator(f'[role="group"][aria-label^="{titulo}"]').first
+
+
+def localizar_slicer_por_titulo(frame, rotulo):
+    """
+    Acha o visual do slicer (role="group", aria-roledescription="Slicer")
+    a partir do seu titulo visivel - diferente de localizar_painel (que so
+    funciona pros paineis de dados, cujo role="group" tem aria-label
+    direto - ver docstring la pro porque NAO da pra reusar aqui).
+
+    Estrutura real confirmada em titan_debug/filtro_nao_encontrado.html
+    (12/09/2026): o titulo mora num <h3 class="slicer-header-text"
+    title="<Titulo>" aria-label="<Titulo>">, irmao do botao "Clear
+    selections"/"Limpar selecoes" (<span class="slicer-header-clear
+    enable-hover">), ambos dentro de um <div class="slicer-header-title">
+    - que por sua vez fica dentro do role="group" do slicer inteiro. Subir
+    ate esse role="group" (em vez de so pegar o <div class="slicer-header-
+    title">) da margem pra escolher COMO achar o botao (por role, por
+    classe) sem depender de mais uma camada de estrutura fragil.
+    """
+    titulo = frame.locator(f'h3.slicer-header-text[title="{rotulo}"]')
+    return titulo.locator('xpath=ancestor::*[@role="group"][1]')
 
 
 def esperar_slicer_limpo(frame, rotulo, timeout_ms=8000, intervalo=0.3):
@@ -674,8 +707,13 @@ def esperar_slicer_limpo(frame, rotulo, timeout_ms=8000, intervalo=0.3):
     de NF. So aceita "all"/"todos" (minusculo, sem acento) - texto de UI do
     proprio Power BI, mesmo padrao ja visto no placeholder de busca
     ("Pesquisar"/"Search") que segue o locale do navegador.
+
+    CORRIGIDO (12/09/2026, mesmo achado real de localizar_slicer_por_
+    titulo): usava localizar_painel, que NUNCA acha nada pra slicers (ver
+    docstring de localizar_painel) - essa funcao so nunca chegava a rodar
+    de verdade porque _limpar_filtro_slicer ja falhava um passo antes.
     """
-    painel = localizar_painel(frame, rotulo)
+    painel = localizar_slicer_por_titulo(frame, rotulo)
     limite = time.time() + timeout_ms / 1000
     while time.time() < limite:
         try:

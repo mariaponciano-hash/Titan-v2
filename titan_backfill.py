@@ -602,11 +602,8 @@ def _limpar_filtro_slicer(frame, rotulo):
     tentava reabrir o dropdown e marcar "Selecionar tudo" na lista de
     opcoes, mas isso nunca achava o elemento (timeout toda vez) - mesmo
     assim o pedido seguinte completava certo, porque marcar_item_da_lista
-    troca a selecao ao inves de adicionar. Usa "Clear selections" (aria-
-    label confirmado em HTML real de titan_debug/ mais cedo nesta mesma
-    investigacao) - um botao dedicado no proprio visual do slicer,
-    localizado do mesmo jeito que localizar_painel acha qualquer visual
-    (role="group" com aria-label prefixado pelo titulo).
+    troca a selecao ao inves de adicionar. Usa "Clear selections" - um
+    botao dedicado no proprio visual do slicer.
 
     CONFIRMA VISUALMENTE (12/09/2026, pedido direto da Maria apos o
     achado real do run #34): so clicar no botao nao era garantia - o clique
@@ -616,33 +613,32 @@ def _limpar_filtro_slicer(frame, rotulo):
     limpo) antes de devolver - se nao confirmar dentro do timeout, propaga
     o erro (quem chama decide o que fazer, ver _completar_eventos_itens).
 
-    FECHA O DROPDOWN ANTES DE PROCURAR O BOTAO (12/09/2026) - tentativa
-    anterior de causa raiz, mantida por seguranca mas NAO era a causa real:
-    a hipotese de que "Clear selections" ficava escondido enquanto o
-    proprio popup do slicer estava aberto se mostrou ERRADA na pratica (run
-    #38, ainda com a mesma cascata mesmo com o Escape aplicado e o HTML
-    confirmando aria-expanded="false" - dropdown ja fechado, botao AINDA
-    display:none).
+    DUAS HIPOTESES DE CAUSA RAIZ TESTADAS E DESCARTADAS NO MEIO DO CAMINHO
+    (12/09/2026) - registradas aqui pra nao repetir o mesmo caminho: (1)
+    "o dropdown fica aberto e o Power BI esconde o botao enquanto isso" -
+    testado com Escape antes de procurar o botao (run #38), mesma cascata
+    continuou, HTML confirmou aria-expanded="false" com o botao AINDA
+    escondido; (2) "o botao so aparece com hover" (achado real comparando
+    com "a borrachinha" que a Maria usa manualmente) - true, mas
+    _limpar_filtro_slicer usava scraper.localizar_painel(frame, rotulo)
+    pra achar o slicer, e essa funcao NUNCA achou nada pros slicers (ela
+    exige role="group" com aria-label direto - e o role="group" do slicer
+    nao tem aria-label nenhum, so um <h3> bem mais fundo tem - ver docstring
+    de localizar_painel). O hover() dava "Timeout 30000ms exceeded" porque
+    o locator de entrada ja estava vazio, nao por causa do proprio hover.
 
-    CAUSA RAIZ DE VERDADE (12/09/2026, achada pela Maria comparando com o
-    icone real que ela usa manualmente - "a borrachinha"): o elemento tem
-    classe CSS "slicer-header-clear enable-hover" - ele SO fica visivel
-    (display:block) quando o MOUSE PASSA POR CIMA do slicer (hover), sem
-    nenhuma relacao com o popup estar aberto ou fechado. O Playwright nunca
-    move o mouse pra cima do slicer antes de procurar o botao, entao ele
-    fica cego a esse elemento pra sempre (display:none) ate alguem passar o
-    mouse ali - exatamente o que a Maria faz manualmente (confirmado pelo
-    tooltip "Limpar selecoes" aparecendo nos prints dela, que so mostra com
-    o mouse em cima). Fix real: dar hover no painel antes de procurar o
-    botao.
+    CAUSA RAIZ DE VERDADE: usa scraper.localizar_slicer_por_titulo (acha o
+    slicer pelo <h3 title="..."> e sobe ate o role="group" certo, em vez de
+    depender de um aria-label que nunca existiu pros slicers) - so DEPOIS
+    disso o hover() e a busca do botao fazem sentido.
     """
     frame.page.keyboard.press("Escape")
     time.sleep(0.3)
-    painel = scraper.localizar_painel(frame, rotulo)
-    painel.hover()
+    slicer = scraper.localizar_slicer_por_titulo(frame, rotulo)
+    slicer.hover()
     time.sleep(0.3)
     botao = scraper.elemento_visivel(
-        painel.get_by_role("button", name=re.compile("Clear selections|Limpar sele", re.IGNORECASE)),
+        slicer.get_by_role("button", name=re.compile("Clear selections|Limpar sele", re.IGNORECASE)),
         timeout_ms=8000,
     )
     botao.click()
