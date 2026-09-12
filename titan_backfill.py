@@ -69,6 +69,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -584,22 +585,51 @@ def _buscar_pares_sem_eventos_itens(nfs):
     return pares
 
 
-def _completar_eventos_itens(page, payloads, pares_alvo, orcamento_segundos):
+def _limpar_filtro_slicer(frame, rotulo):
+    """
+    Reabre o dropdown do slicer (ex: "Nota Fiscal de Saída", "Número do
+    pedido") e marca "Selecionar tudo" de novo - devolve o filtro pra
+    "Todos" SEM sair do periodo de datas atual (bem mais rapido que um
+    reload completo da pagina, que resetaria o periodo tambem).
+    """
+    scraper.abrir_dropdown_filtro(frame, rotulo)
+    time.sleep(0.5)
+    opcao = scraper.elemento_visivel(
+        frame.get_by_role("option", name=re.compile("Selecionar tudo|Select all", re.IGNORECASE)),
+        timeout_ms=8000,
+    )
+    opcao.click()
+    time.sleep(0.3)
+    frame.page.keyboard.press("Escape")
+    time.sleep(0.3)
+
+
+def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
     """
     Pra cada payload cujo (numero_nf, marca) esteja em pares_alvo (ja existe
     no Supabase com eventos/itens nulos - ver _buscar_pares_sem_eventos_itens),
-    repete o mesmo fluxo de titan_watcher.processar_pedido - recarrega o
-    dashboard do zero, filtra pela NF, clica na linha (o unico jeito de
-    cross-filtrar os paineis "Eventos"/"Itens do pedido" pra um pedido
-    especifico - ver docstring de processar_pedido) e le os dois - e enche
-    "eventos"/"itens" no proprio dict do payload, ANTES do upsert em lote
-    seguir normal logo depois (mesma linha, um upsert so, sem PATCH extra).
+    enche "eventos"/"itens" no proprio dict do payload - o upsert em lote
+    logo depois grava tudo junto, sem precisar de um PATCH extra por pedido.
 
-    So adiciona numero_pedido no filtro quando a MESMA NF aparece com mais
-    de um "Numero do Pedido" distinto nesta janela (pedido direto da Maria -
-    ambiguidade real quando a mesma NF aparece pra mais de uma marca/pedido,
-    ver aviso grande no topo de titan_bi_scraper.py) - filtrar so por NF
-    basta no caso comum (mais rapido, um filtro a menos pra aplicar).
+    Fluxo confirmado pela Maria com prints reais (11/09/2026, filtrando
+    manualmente no Titan) - reaproveita o MESMO frame ja aberto no periodo
+    desta janela (NAO recarrega o dashboard do zero por pedido, ao contrario
+    de titan_watcher.processar_pedido - um reload voltaria pro periodo
+    padrao estreito do Titan, que foi exatamente o motivo de "Nenhum
+    elemento visivel encontrado" em quase todo pedido numa tentativa
+    anterior; o periodo desta janela ja fica valendo o tempo todo aqui):
+    1. Abre o dropdown "Nota Fiscal de Saída", digita a NF, marca o item
+       (scraper.filtrar cuida disso).
+    2. Abre o dropdown "Número do pedido" SEM digitar nada - ja vem
+       filtrado so pelas opcoes validas pra essa NF - marca a PRIMEIRA
+       opcao que aparecer (se tiver mais de uma, nao desambigua por marca -
+       pega a primeira mesmo, decisao direta da Maria).
+    3. Eventos/Itens ja vem cross-filtrados so pelos dois slicers acima -
+       NAO precisa clicar em nenhuma linha da tabela "Informação Pedido"
+       (confirmado pela Maria - diferente do fluxo de titan_watcher.py).
+    4. Le os dois paineis, depois LIMPA os dois filtros (volta pra "Todos",
+       sem sair do periodo) antes do proximo pedido - ver
+       _limpar_filtro_slicer.
 
     Orcamento de tempo (nao so contagem) - o resto fica pra proxima rodada
     do backfill, mesmo padrao ja usado em rechecar_situacoes_presas/
@@ -610,10 +640,6 @@ def _completar_eventos_itens(page, payloads, pares_alvo, orcamento_segundos):
         print("Nenhum pedido desta janela precisa completar eventos/itens (ja completos, ou pedido novo demais pra ja ter chegado no Supabase).")
         return 0
 
-    pedidos_por_nf = {}
-    for p in payloads:
-        pedidos_por_nf.setdefault(p["numero_nf"], set()).add(p.get("numero_pedido") or "")
-
     print(f"{len(alvo)} pedido(s) desta janela sem eventos/itens - completando (orcamento {orcamento_segundos}s)...")
     inicio = time.monotonic()
     completados = 0
@@ -623,27 +649,33 @@ def _completar_eventos_itens(page, payloads, pares_alvo, orcamento_segundos):
             break
         numero_nf = p["numero_nf"]
         marca = p["marca"]
-        numero_pedido = p.get("numero_pedido") or None
-        ambiguo = len(pedidos_por_nf.get(numero_nf, set())) > 1
         try:
-            frame = scraper.get_dashboard_frame(page)
-            scraper.filtrar(frame, nf=numero_nf, numero_pedido=numero_pedido if ambiguo else None)
-            scraper.rolar_tabela_ate_o_fim(frame)
-            pedido_data = scraper.extrair_linha_por_pedido(frame, numero_nf, marca_esperada=marca)
-            if pedido_data is None:
-                print(f"  [NF {numero_nf} / marca {marca}] nao encontrada pra completar eventos/itens - fica pra proxima rodada.", file=sys.stderr)
-                continue
-            scraper.clicar_na_linha(frame, numero_nf, marca_esperada=marca)
+            scraper.filtrar(frame, nf=numero_nf)
+
+            scraper.abrir_dropdown_filtro(frame, "Número do pedido")
+            time.sleep(1)
+            opcao_pedido = scraper.elemento_visivel(frame.get_by_role("option"), timeout_ms=10000)
+            opcao_pedido.click()
+            time.sleep(0.5)
+            frame.page.keyboard.press("Escape")
+            time.sleep(1)
+
             p["eventos"] = scraper.extrair_eventos(frame)
             p["itens"] = scraper.extrair_itens_pedido(frame)
             completados += 1
         except Exception as e:
             print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
+        finally:
+            try:
+                _limpar_filtro_slicer(frame, "Número do pedido")
+                _limpar_filtro_slicer(frame, "Nota Fiscal de Saída")
+            except Exception as e:
+                print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar os filtros pro proximo pedido: {e}", file=sys.stderr)
     print(f"Eventos/Itens completados pra {completados}/{len(alvo)} pedido(s).")
     return completados
 
 
-def exportar_e_gravar_periodo(page, frame, data_inicial, data_final, tentativas=2, orcamento_eventos_segundos=EVENTOS_JANELA_ORCAMENTO_SEGUNDOS):
+def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2, orcamento_eventos_segundos=EVENTOS_JANELA_ORCAMENTO_SEGUNDOS):
     """
     Faz um export + upsert de 'Informação Pedido' pro periodo
     (data_inicial, data_final) inteiro, e completa eventos/itens dos
@@ -751,7 +783,7 @@ def exportar_e_gravar_periodo(page, frame, data_inicial, data_final, tentativas=
     # dicts de payloads - o upsert logo abaixo ja grava tudo junto, sem
     # precisar de um PATCH extra por pedido.
     pares_alvo = _buscar_pares_sem_eventos_itens(p["numero_nf"] for p in payloads)
-    _completar_eventos_itens(page, payloads, pares_alvo, orcamento_eventos_segundos)
+    _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_eventos_segundos)
 
     lote = []
     gravados = 0
@@ -839,7 +871,7 @@ def main():
             # devolvendo (0, 0, 0) sem gravar nada errado.
             print(f"Exportando periodo {args.data_inicial} - {args.data_final}...")
             gravados_total, ignorados_total, lotes_com_erro_total = exportar_e_gravar_periodo(
-                page, frame, args.data_inicial, args.data_final
+                frame, args.data_inicial, args.data_final
             )
 
             print(f"\nConcluido - {gravados_total} pedido(s) gravados no Supabase.")
