@@ -216,7 +216,8 @@ def processar_pedido(page, item, permitir_limpar_dados=True):
     # no Supabase nem pra desambiguar no Titan.
     numero_nf = (item.get("numero_nf") or "").strip()
     marca = (item.get("marca") or "").strip()
-    numero_pedido = item.get("numero_pedido") or "(sem numero_pedido)"
+    numero_pedido_bruto = (item.get("numero_pedido") or "").strip()
+    numero_pedido = numero_pedido_bruto or "(sem numero_pedido)"
     if not numero_nf:
         print(f"[{numero_pedido}] linha na fila sem NF - nao deveria ter chegado aqui (server.ts ja bloqueia isso).")
         return
@@ -226,16 +227,16 @@ def processar_pedido(page, item, permitir_limpar_dados=True):
 
     print(f"[NF {numero_nf} / marca {marca} / pedido {numero_pedido}] consultando no Titan BI...")
     frame = scraper.get_dashboard_frame(page)  # recarrega o relatorio do zero
-    # Achado real (01/09/2026, print salvo em titan_debug/filtro_nao_encontrado.png):
-    # um reload NAO volta pro "sem filtro nenhum" - o Titan carrega o
-    # dashboard com um filtro de periodo estreito ja aplicado por padrao
-    # (visto "6/1/2026" numa captura e "7/1/2026" no dia seguinte - parece
-    # relativo a data de hoje). Sem abrir bem essa janela antes, uma busca
-    # por NF de outro periodo dava "No results found" no proprio Power BI -
-    # nao era bug de seletor. Ver scraper.definir_periodo/PERIODO_AMPLO_INICIAL.
-    hoje = datetime.datetime.now().strftime("%d/%m/%Y")
-    scraper.definir_periodo(frame, scraper.PERIODO_AMPLO_INICIAL, hoje)
-    scraper.filtrar(frame, nf=numero_nf)
+    # REVERTIDO (11/09/2026, pedido direto da Maria): so filtra por NF (+
+    # numero_pedido quando ja tiver um gravado - os dois campos ja vem
+    # prontos no item da fila, sem precisar de nenhuma consulta extra),
+    # sem mexer no periodo antes - like era antes do ajuste de 01/09/2026
+    # (que abria PERIODO_AMPLO_INICIAL a hoje pra "garantir" a NF dentro da
+    # janela). Esse ajuste acabou sendo a causa real dos timeouts/"nao
+    # encontrado" no recheck (Power BI demorando pra reindexar/renderizar
+    # um periodo largo) - sem ele, busca por NF (+pedido) direto volta a
+    # rodar normal, com o bonus de desambiguar melhor (ver filtrar).
+    scraper.filtrar(frame, nf=numero_nf, numero_pedido=numero_pedido_bruto or None)
     scraper.rolar_tabela_ate_o_fim(frame)
 
     # marca_esperada desambigua quando a mesma NF aparece pra mais de uma

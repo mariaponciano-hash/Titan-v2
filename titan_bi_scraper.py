@@ -50,7 +50,6 @@ da Torre ja achar tudo pronto em vez de esperar uma consulta avulsa. Chave =
 Nota Fiscal (nao o "Numero do Pedido" do Titan, que e interno do armazem).
 """
 import argparse
-import datetime
 import json
 import os
 import re
@@ -305,7 +304,7 @@ def abrir_dropdown_filtro(frame, rotulo):
     frame.page.mouse.click(x, y)
 
 
-def marcar_item_da_lista(frame, campo_busca, valor, tentativas=5):
+def marcar_item_da_lista(frame, campo_busca, valor, tentativas=3):
     """
     CORRIGIDO (24/08/2026): a causa raiz do filtro nao aplicar era o
     campo.fill() usado antes - ele seta o valor do input direto via JS, sem
@@ -319,31 +318,17 @@ def marcar_item_da_lista(frame, campo_busca, valor, tentativas=5):
     com o texto certo na arvore de acessibilidade - por isso da pra usar
     get_by_role em vez de coordenada de pixel.
 
-    CORRIGIDO (02/09/2026, achado real - titan_debug/filtro_nao_encontrado.png):
-    com definir_periodo agora abrindo um periodo bem mais largo (ver
-    PERIODO_AMPLO_INICIAL) antes de buscar por NF, o Power BI as vezes ainda
-    esta reindexando os valores disponiveis deste slicer pro periodo novo
-    (bem maior que o padrao estreito) no instante exato da busca - o popup
-    mostrou "No results found" pra uma NF que existia de verdade (confirmado:
-    ja tinha romaneio/situacao gravados de uma consulta bem-sucedida
-    anterior). Em vez de desistir na primeira, repete a busca (Enter de
-    novo, com mais folga a cada tentativa) ate 'tentativas' vezes antes de
-    propagar o erro de verdade.
-
-    tentativas=5, timeout_ms=15000 (era 3/8000 - achado real, 11/09/2026,
-    HTML real de titan_debug/filtro_nao_encontrado.html confirmando as datas
-    do periodo largo aplicadas CERTAS, so a tabela/lista ainda nao tinha
-    renderizado): mesmo com PERIODO_AMPLO_INICIAL reduzido pra 60 dias (era
-    "desde 2020"), 60 dias de pedidos ainda e um volume bem maior que a
-    janela estreita de 5 dias do backfill - o Power BI continua demorando
-    mais pra reindexar/renderizar do que os 3x8s davam de margem.
+    Em vez de desistir na primeira, repete a busca (Enter de novo, com mais
+    folga a cada tentativa) ate 'tentativas' vezes antes de propagar o erro
+    de verdade - o Titan/Power BI as vezes demora um instante a mais pra
+    popular a lista de opcoes depois do Enter.
     """
     ultimo_erro = None
     for tentativa in range(tentativas):
         campo_busca.press("Enter")
         time.sleep(1 + tentativa * 1.5)  # da mais folga a cada nova tentativa
         try:
-            opcao = elemento_visivel(frame.get_by_role("option", name=str(valor), exact=True), timeout_ms=15000)
+            opcao = elemento_visivel(frame.get_by_role("option", name=str(valor), exact=True), timeout_ms=8000)
             opcao.click()
             return
         except PWTimeout as e:
@@ -396,7 +381,7 @@ def _abrir_dropdown_e_pegar_campo_busca(frame, rotulo, tentativas=3):
     raise ultimo_erro
 
 
-def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=30000):
+def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=15000):
     """
     Espera o painel "Informacao Pedido" realmente mostrar o valor filtrado,
     em vez de confiar num sleep fixo. CORRIGIDO (31/08/2026, HTML real salvo
@@ -408,10 +393,6 @@ def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=30000):
     GitHub Actions do que no PC (mesma classe de lentidao ja vista no slicer
     de periodo e no token do dashboard). Sem essa espera,
     _achar_linha_pedido rodava cedo demais contra uma tabela desatualizada.
-
-    30000 (era 15000, 11/09/2026, achado real): a janela ampla do recheck
-    (PERIODO_AMPLO_INICIAL, hoje 60 dias) consulta bem mais dado que a
-    janela estreita do backfill - o painel demora mais pra re-renderizar.
 
     Se o valor nunca aparecer (NF que genuinamente nao existe pra essa
     marca), so retorna sem erro - _achar_linha_pedido/extrair_linha_por_pedido
@@ -452,24 +433,6 @@ def fechar_popup_calendario(frame, tentativas=5):
         raise PWTimeout("cdk-overlay-backdrop nao fechou depois de varias tentativas")
 
 
-# Janela usada por buscas avulsas (titan_watcher.processar_pedido) pra
-# garantir que o filtro "Data Inicial - Data Final" nao exclua o pedido
-# procurado - ver definir_periodo abaixo pro porque isso e necessario.
-#
-# Ultimos 60 dias (era fixo em "01/01/2020", 11/09/2026, a pedido da Maria):
-# um periodo de anos faz o Power BI reindexar um volume enorme de valores
-# pro slicer de NF/pedido, e essa reindexacao as vezes ainda esta rolando
-# no instante exato da busca (mesmo motivo documentado em
-# marcar_item_da_lista, so que pior quanto maior a janela) - achado real
-# rodando o recheck em producao: varias buscas seguidas falhando com
-# "Nenhum elemento visivel encontrado"/"tabela_linha_nao_encontrada" logo
-# apos abrir a janela ampla. 60 dias cobre de sobra qualquer pedido que o
-# recheck realmente precisa reencontrar (ver rechecar_situacoes_presas/
-# rechecar_concluidos_sem_eventos em titan_backfill.py) com uma janela bem
-# menor pro Power BI reindexar.
-PERIODO_AMPLO_INICIAL = (datetime.date.today() - datetime.timedelta(days=60)).strftime("%d/%m/%Y")
-
-
 def _formatar_data_para_titan(data_str):
     """
     Converte 'dd/mm/yyyy' (formato usado no resto deste projeto) pro
@@ -508,13 +471,10 @@ def definir_periodo(frame, data_inicial, data_final):
     salvo em titan_debug/filtro_nao_encontrado.png): o Titan carrega o
     dashboard com um filtro de periodo padrao ja aplicado (nao "todas as
     datas"; visto "6/1/2026" numa captura e "7/1/2026" no dia seguinte -
-    parece ser relativo a data de hoje, nao fixo), entao uma busca avulsa
-    por NF (titan_watcher.processar_pedido, que nunca chamava esta funcao)
-    podia legitimamente dar "No results found" no proprio Power BI se a NF
-    procurada nao caisse dentro dessa janela padrao estreita - nao era bug
-    de seletor nenhum. Generalizada aqui pra processar_pedido tambem poder
-    abrir bem mais o periodo (ver PERIODO_AMPLO_INICIAL) antes de buscar por
-    NF, do mesmo jeito que o backfill ja fazia pra sua janela especifica.
+    parece ser relativo a data de hoje, nao fixo). Usada so pelo backfill
+    pra sua janela especifica - titan_watcher.processar_pedido busca por NF
+    direto, sem chamar esta funcao (ver seu proprio historico: chegou a
+    chamar, foi revertido em 11/09/2026 a pedido da Maria).
 
     REESCRITO (11/09/2026, achado real - ver docstring de
     _formatar_data_para_titan pra causa raiz completa, com HTML real de
@@ -558,12 +518,7 @@ def definir_periodo(frame, data_inicial, data_final):
         fechar_popup_calendario(frame)
 
         painel = localizar_painel(frame, "Informação Pedido")
-        # timeout=60000 (era 30000, 11/09/2026, achado real - HTML de
-        # titan_debug/set_filtro_data_nao_encontrado.html confirmou a data
-        # certa aplicada, so a tabela ainda vazia apos 30s): a janela ampla
-        # do recheck (PERIODO_AMPLO_INICIAL, 60 dias) consulta bem mais dado
-        # que a janela estreita do backfill - demora mais pra renderizar.
-        painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=60000)
+        painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
         time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
     except PWTimeout:
         salvar_diagnostico(frame, "set_filtro_data_nao_encontrado")
