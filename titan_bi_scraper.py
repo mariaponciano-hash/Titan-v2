@@ -305,7 +305,7 @@ def abrir_dropdown_filtro(frame, rotulo):
     frame.page.mouse.click(x, y)
 
 
-def marcar_item_da_lista(frame, campo_busca, valor, tentativas=3):
+def marcar_item_da_lista(frame, campo_busca, valor, tentativas=5):
     """
     CORRIGIDO (24/08/2026): a causa raiz do filtro nao aplicar era o
     campo.fill() usado antes - ele seta o valor do input direto via JS, sem
@@ -329,13 +329,21 @@ def marcar_item_da_lista(frame, campo_busca, valor, tentativas=3):
     anterior). Em vez de desistir na primeira, repete a busca (Enter de
     novo, com mais folga a cada tentativa) ate 'tentativas' vezes antes de
     propagar o erro de verdade.
+
+    tentativas=5, timeout_ms=15000 (era 3/8000 - achado real, 11/09/2026,
+    HTML real de titan_debug/filtro_nao_encontrado.html confirmando as datas
+    do periodo largo aplicadas CERTAS, so a tabela/lista ainda nao tinha
+    renderizado): mesmo com PERIODO_AMPLO_INICIAL reduzido pra 60 dias (era
+    "desde 2020"), 60 dias de pedidos ainda e um volume bem maior que a
+    janela estreita de 5 dias do backfill - o Power BI continua demorando
+    mais pra reindexar/renderizar do que os 3x8s davam de margem.
     """
     ultimo_erro = None
     for tentativa in range(tentativas):
         campo_busca.press("Enter")
         time.sleep(1 + tentativa * 1.5)  # da mais folga a cada nova tentativa
         try:
-            opcao = elemento_visivel(frame.get_by_role("option", name=str(valor), exact=True), timeout_ms=8000)
+            opcao = elemento_visivel(frame.get_by_role("option", name=str(valor), exact=True), timeout_ms=15000)
             opcao.click()
             return
         except PWTimeout as e:
@@ -388,7 +396,7 @@ def _abrir_dropdown_e_pegar_campo_busca(frame, rotulo, tentativas=3):
     raise ultimo_erro
 
 
-def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=15000):
+def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=30000):
     """
     Espera o painel "Informacao Pedido" realmente mostrar o valor filtrado,
     em vez de confiar num sleep fixo. CORRIGIDO (31/08/2026, HTML real salvo
@@ -400,6 +408,11 @@ def _esperar_tabela_refletir_filtro(frame, valor, timeout_ms=15000):
     GitHub Actions do que no PC (mesma classe de lentidao ja vista no slicer
     de periodo e no token do dashboard). Sem essa espera,
     _achar_linha_pedido rodava cedo demais contra uma tabela desatualizada.
+
+    30000 (era 15000, 11/09/2026, achado real): a janela ampla do recheck
+    (PERIODO_AMPLO_INICIAL, hoje 60 dias) consulta bem mais dado que a
+    janela estreita do backfill - o painel demora mais pra re-renderizar.
+
     Se o valor nunca aparecer (NF que genuinamente nao existe pra essa
     marca), so retorna sem erro - _achar_linha_pedido/extrair_linha_por_pedido
     decidem "nao encontrado" do jeito de sempre.
@@ -545,7 +558,12 @@ def definir_periodo(frame, data_inicial, data_final):
         fechar_popup_calendario(frame)
 
         painel = localizar_painel(frame, "Informação Pedido")
-        painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
+        # timeout=60000 (era 30000, 11/09/2026, achado real - HTML de
+        # titan_debug/set_filtro_data_nao_encontrado.html confirmou a data
+        # certa aplicada, so a tabela ainda vazia apos 30s): a janela ampla
+        # do recheck (PERIODO_AMPLO_INICIAL, 60 dias) consulta bem mais dado
+        # que a janela estreita do backfill - demora mais pra renderizar.
+        painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=60000)
         time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
     except PWTimeout:
         salvar_diagnostico(frame, "set_filtro_data_nao_encontrado")
