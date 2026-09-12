@@ -643,6 +643,20 @@ def _limpar_filtro_slicer(frame, rotulo, pasta_registro=None, indice_passo=None)
     pasta_registro/indice_passo (12/09/2026, pedido direto da Maria): se
     informados, grava um print depois de confirmar a limpeza - ver
     scraper.registrar_passo.
+
+    CORRIGIDO (12/09/2026, achado real via o print do proprio passo a
+    passo - a Maria viu o tooltip "Clear selections" grudado na tela por
+    cima do campo de Nota Fiscal de Saida): o hover() acima revela o botao
+    de verdade, mas o TOOLTIP que aparece junto com ele (a mesma classe
+    "enable-hover") nao desaparece sozinho so por seguir em frente no
+    codigo - ele fica ali, um "pbi-overlay-caret"/"cdk-overlay-container"
+    de verdade, ate o mouse sair de cima do slicer. Sem isso, o proximo
+    pedido tentava clicar no dropdown da NF bem onde esse tooltip ainda
+    estava, e o clique era interceptado ("Locator.click: Timeout 10000ms
+    exceeded ... subtree intercepts pointer events") - a causa raiz real
+    dos 47 erros/141 ocorrencias de pbi-overlay-caret no run #40. Move o
+    mouse pra um canto neutro da pagina depois de confirmar a limpeza, pra
+    tirar o hover do slicer e o tooltip sumir antes do proximo pedido.
     """
     frame.page.keyboard.press("Escape")
     time.sleep(0.3)
@@ -656,6 +670,8 @@ def _limpar_filtro_slicer(frame, rotulo, pasta_registro=None, indice_passo=None)
     botao.click()
     time.sleep(0.3)
     scraper.esperar_slicer_limpo(frame, rotulo, timeout_ms=8000)
+    frame.page.mouse.move(0, 0)
+    time.sleep(0.3)
     if pasta_registro is not None:
         nome_rotulo = re.sub(r"\W+", "_", rotulo).strip("_").lower()
         scraper.registrar_passo(frame, pasta_registro, indice_passo, f"limpou_{nome_rotulo}")
@@ -746,6 +762,13 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
     if not alvo:
         print("Nenhum pedido desta janela precisa completar eventos/itens (ja completos, ou pedido novo demais pra ja ter chegado no Supabase).")
         return 0
+
+    # Desmarca qualquer linha com selecao residual em "Informacao Pedido"
+    # ANTES de comecar a filtrar o 1o pedido - achado real da Maria via o
+    # print do registro passo a passo (12/09/2026, ver scraper.
+    # limpar_linha_selecionada). So roda uma vez por rodada, aqui - o resto
+    # do loop continua filtrando so por NF/Numero do pedido como ja estava.
+    scraper.limpar_linha_selecionada(frame, "Informação Pedido")
 
     print(f"{len(alvo)} pedido(s) desta janela sem eventos/itens - completando (orcamento {orcamento_segundos}s)...")
     if REGISTRO_PASSO_A_PASSO_MAX_PEDIDOS > 0:

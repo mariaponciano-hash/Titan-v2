@@ -692,6 +692,30 @@ def localizar_painel(frame, titulo):
     return frame.locator(f'[role="group"][aria-label^="{titulo}"]').first
 
 
+def limpar_linha_selecionada(frame, titulo_painel):
+    """
+    Desmarca qualquer linha com selecao residual num painel de tabela
+    (role="gridcell" com classe "cell-selected") - achado real da Maria
+    (12/09/2026), via o print do proprio registro passo a passo: a linha
+    "Rosana Bravin Klein" em "Informação Pedido" aparecia destacada mesmo
+    ANTES de qualquer filtro de NF ser aplicado, o que ela identificou
+    como um filtro/selecao real ja ativo no Power BI (confirmado no HTML:
+    as celulas dessa linha tinham classe "cell-selected", as outras
+    "cell-unselected" - a tabela e renderizada como "pivotTable", nao
+    canvas puro, entao da pra achar isso de verdade via DOM).
+
+    Clica na 1a celula selecionada que achar - Power BI DESSELECIONA ao
+    clicar de novo no mesmo ponto ja selecionado (mesmo padrao de
+    marcar_item_da_lista trocar a selecao de um slicer). Se nao houver
+    nenhuma linha selecionada, nao faz nada (nada pra desmarcar).
+    """
+    painel = localizar_painel(frame, titulo_painel)
+    celulas_selecionadas = painel.locator('[role="gridcell"].cell-selected')
+    if celulas_selecionadas.count() > 0:
+        celulas_selecionadas.first.click()
+        time.sleep(0.5)
+
+
 def localizar_slicer_por_titulo(frame, rotulo):
     """
     Acha o visual do slicer (role="group", aria-roledescription="Slicer")
