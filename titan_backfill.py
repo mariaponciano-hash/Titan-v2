@@ -616,21 +616,31 @@ def _limpar_filtro_slicer(frame, rotulo):
     limpo) antes de devolver - se nao confirmar dentro do timeout, propaga
     o erro (quem chama decide o que fazer, ver _completar_eventos_itens).
 
-    FECHA O DROPDOWN ANTES DE PROCURAR O BOTAO (12/09/2026, causa raiz
-    achada pela Maria com HTML real - ver docstring de scraper.filtrar):
-    o Power BI esconde "Clear selections" (style="display: none",
-    confirmado no HTML) enquanto o PROPRIO popup do slicer esta aberto -
-    se o passo anterior (scraper.filtrar ou a selecao de "Numero do
-    pedido" em _ler_eventos_itens_via_filtro_cruzado) tiver deixado o
-    dropdown aberto por causa de um timeout, elemento_visivel nunca acha
-    o botao e a limpeza falha, travando o pedido seguinte na mesma
-    cascata. Um Escape aqui (idempotente - nao faz nada se ja estiver
-    fechado) garante que o botao esteja visivel antes de procura-lo,
-    nao importa qual passo anterior deixou o popup aberto.
+    FECHA O DROPDOWN ANTES DE PROCURAR O BOTAO (12/09/2026) - tentativa
+    anterior de causa raiz, mantida por seguranca mas NAO era a causa real:
+    a hipotese de que "Clear selections" ficava escondido enquanto o
+    proprio popup do slicer estava aberto se mostrou ERRADA na pratica (run
+    #38, ainda com a mesma cascata mesmo com o Escape aplicado e o HTML
+    confirmando aria-expanded="false" - dropdown ja fechado, botao AINDA
+    display:none).
+
+    CAUSA RAIZ DE VERDADE (12/09/2026, achada pela Maria comparando com o
+    icone real que ela usa manualmente - "a borrachinha"): o elemento tem
+    classe CSS "slicer-header-clear enable-hover" - ele SO fica visivel
+    (display:block) quando o MOUSE PASSA POR CIMA do slicer (hover), sem
+    nenhuma relacao com o popup estar aberto ou fechado. O Playwright nunca
+    move o mouse pra cima do slicer antes de procurar o botao, entao ele
+    fica cego a esse elemento pra sempre (display:none) ate alguem passar o
+    mouse ali - exatamente o que a Maria faz manualmente (confirmado pelo
+    tooltip "Limpar selecoes" aparecendo nos prints dela, que so mostra com
+    o mouse em cima). Fix real: dar hover no painel antes de procurar o
+    botao.
     """
     frame.page.keyboard.press("Escape")
     time.sleep(0.3)
     painel = scraper.localizar_painel(frame, rotulo)
+    painel.hover()
+    time.sleep(0.3)
     botao = scraper.elemento_visivel(
         painel.get_by_role("button", name=re.compile("Clear selections|Limpar sele", re.IGNORECASE)),
         timeout_ms=8000,
