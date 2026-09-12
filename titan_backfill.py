@@ -27,13 +27,18 @@ seletor mas nao era:
    transparente que intercepta todo clique/hover seguinte. Precisa clicar no
    proprio backdrop (ver fechar_popup_calendario) e confirmar que sumiu.
 
-LIMITACAO DE PROPOSITO: por velocidade, o backfill so pega os campos da
-tabela "Informacao Pedido" (Romaneio, Situacao, datas etc.) - nao clica
-pedido por pedido pra puxar Eventos/Itens tambem (isso levaria uma consulta
-inteira por pedido, inviavel pra um periodo grande). Eventos/Itens de um
-pedido especifico continuam vindo do jeito de sempre: titan_watcher.py, sob
-demanda, so quando a Torre realmente precisar montar o ticket completo
-daquele pedido.
+EVENTOS/ITENS (adaptado em 11/09/2026, pedido direto da Maria): a maior
+parte do backfill continua so a exportacao em massa de "Informacao Pedido"
+(Romaneio, Situacao, datas etc.) - clicar pedido por pedido em TODOS eles
+seria inviavel (~15-20s cada, ver _completar_eventos_itens). Mas logo apos
+a exportacao, o backfill AGORA completa Eventos/Itens dos pedidos DESTA
+MESMA janela que ja existem no Supabase com as duas colunas nulas (ver
+_buscar_pares_sem_eventos_itens) - volume baixo por rodada, ja que a
+janela e deslizante e a maioria dos pedidos ja foi completada numa rodada
+anterior. O resto (pedidos fora da janela atual, ou que estouraram o
+orcamento de tempo desta rodada) continua vindo do jeito de sempre:
+titan_watcher.py, sob demanda, quando a Torre precisar montar o ticket
+completo daquele pedido.
 
 COLETA VIA EXPORTACAO NATIVA, NAO SCROLL (25/08/2026, achado real pela
 Ivna): a versao anterior lia a tabela "Informacao Pedido" rolando (ela e
@@ -120,6 +125,13 @@ RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - deixa margem dentro do timeout do jo
 # sobrar margem real (exportacao principal + recheck de situacao presa +
 # este recheck, todos dentro do mesmo job).
 EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 1800  # 30min
+
+# Orcamento pra _completar_eventos_itens (11/09/2026, pedido direto da
+# Maria): so cobre os pedidos DESTA janela do backfill que ainda estao com
+# eventos/itens nulos - volume bem menor que o recheck amplo acima (esse
+# cobre qualquer pedido concluido do site inteiro), entao um orcamento
+# menor ja basta na pratica.
+EVENTOS_JANELA_ORCAMENTO_SEGUNDOS = 600  # 10min
 
 # Achado real (11/09/2026, pedido da Maria): ordenar a fila so por
 # atualizado_em.asc (mais antigo primeiro) colocava um pedido RECEM-criado
@@ -310,12 +322,14 @@ def _supabase_upsert_lote(registros):
     """
     Upsert em lote, on_conflict=numero_nf,marca. O Postgres/PostgREST so
     atualiza as colunas presentes no JSON enviado quando ha conflito
-    (resolution=merge-duplicates) - como este script NAO envia numero_pedido/
-    eventos/itens, um pedido que ja tenha esses campos preenchidos por uma
-    consulta avulsa anterior (titan_watcher.py) NAO tem esses campos apagados
-    por um backfill rodado depois. So romaneio/situacao/datas/etc. sao
-    sobrescritos (o que e o esperado - o backfill sempre traz o dado mais
-    recente do Titan pra esses campos).
+    (resolution=merge-duplicates) - quando numero_pedido/eventos/itens nao
+    entram no dict (nao deu pra derivar, ou o pedido nao precisava de
+    completar eventos/itens nesta rodada - ver registro_para_supabase/
+    _completar_eventos_itens), um valor ja gravado antes (por uma consulta
+    avulsa do titan_watcher.py ou por uma rodada anterior do backfill) NAO
+    e apagado. So romaneio/situacao/datas/etc. sao sobrescritos sempre (o
+    que e o esperado - o backfill sempre traz o dado mais recente do Titan
+    pra esses campos).
 
     O PostgREST exige que TODOS os objetos de um mesmo array de upsert tenham
     exatamente as mesmas chaves - senao rejeita o POST inteiro com
@@ -547,10 +561,94 @@ def _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_fina
     return True
 
 
-def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
+def _buscar_pares_sem_eventos_itens(nfs):
+    """
+    Consulta o Supabase em lotes (por numero_nf, ate 200 por vez - mesmo
+    tamanho de TAMANHO_LOTE) pra achar, dentro das NFs desta janela de
+    backfill, quais (numero_nf, marca) ja existem na tabela com eventos E
+    itens ainda NULOS (pedido direto da Maria, 11/09/2026) - so esses
+    precisam do clique-por-linha (ver _completar_eventos_itens). Volume
+    baixo por rodada: a maioria dos pedidos de uma janela de poucos dias ja
+    foi vista e completada numa rodada anterior (a janela e deslizante e se
+    repete a cada backfill).
+    """
+    pares = set()
+    nfs_unicas = sorted({str(nf) for nf in nfs if nf})
+    for i in range(0, len(nfs_unicas), TAMANHO_LOTE):
+        lote_nfs = nfs_unicas[i:i + TAMANHO_LOTE]
+        lista = ",".join(urllib.parse.quote(nf) for nf in lote_nfs)
+        path = f"{TABELA}?numero_nf=in.({lista})&eventos=is.null&itens=is.null&select=numero_nf,marca"
+        linhas = titan_watcher._supabase_request("GET", path) or []
+        for linha in linhas:
+            pares.add((linha["numero_nf"], linha["marca"]))
+    return pares
+
+
+def _completar_eventos_itens(page, payloads, pares_alvo, orcamento_segundos):
+    """
+    Pra cada payload cujo (numero_nf, marca) esteja em pares_alvo (ja existe
+    no Supabase com eventos/itens nulos - ver _buscar_pares_sem_eventos_itens),
+    repete o mesmo fluxo de titan_watcher.processar_pedido - recarrega o
+    dashboard do zero, filtra pela NF, clica na linha (o unico jeito de
+    cross-filtrar os paineis "Eventos"/"Itens do pedido" pra um pedido
+    especifico - ver docstring de processar_pedido) e le os dois - e enche
+    "eventos"/"itens" no proprio dict do payload, ANTES do upsert em lote
+    seguir normal logo depois (mesma linha, um upsert so, sem PATCH extra).
+
+    So adiciona numero_pedido no filtro quando a MESMA NF aparece com mais
+    de um "Numero do Pedido" distinto nesta janela (pedido direto da Maria -
+    ambiguidade real quando a mesma NF aparece pra mais de uma marca/pedido,
+    ver aviso grande no topo de titan_bi_scraper.py) - filtrar so por NF
+    basta no caso comum (mais rapido, um filtro a menos pra aplicar).
+
+    Orcamento de tempo (nao so contagem) - o resto fica pra proxima rodada
+    do backfill, mesmo padrao ja usado em rechecar_situacoes_presas/
+    rechecar_concluidos_sem_eventos.
+    """
+    alvo = [p for p in payloads if (p["numero_nf"], p["marca"]) in pares_alvo]
+    if not alvo:
+        print("Nenhum pedido desta janela precisa completar eventos/itens (ja completos, ou pedido novo demais pra ja ter chegado no Supabase).")
+        return 0
+
+    pedidos_por_nf = {}
+    for p in payloads:
+        pedidos_por_nf.setdefault(p["numero_nf"], set()).add(p.get("numero_pedido") or "")
+
+    print(f"{len(alvo)} pedido(s) desta janela sem eventos/itens - completando (orcamento {orcamento_segundos}s)...")
+    inicio = time.monotonic()
+    completados = 0
+    for p in alvo:
+        if time.monotonic() - inicio > orcamento_segundos:
+            print(f"  orcamento de tempo esgotado - {completados}/{len(alvo)} completado(s), resto fica pra proxima rodada.")
+            break
+        numero_nf = p["numero_nf"]
+        marca = p["marca"]
+        numero_pedido = p.get("numero_pedido") or None
+        ambiguo = len(pedidos_por_nf.get(numero_nf, set())) > 1
+        try:
+            frame = scraper.get_dashboard_frame(page)
+            scraper.filtrar(frame, nf=numero_nf, numero_pedido=numero_pedido if ambiguo else None)
+            scraper.rolar_tabela_ate_o_fim(frame)
+            pedido_data = scraper.extrair_linha_por_pedido(frame, numero_nf, marca_esperada=marca)
+            if pedido_data is None:
+                print(f"  [NF {numero_nf} / marca {marca}] nao encontrada pra completar eventos/itens - fica pra proxima rodada.", file=sys.stderr)
+                continue
+            scraper.clicar_na_linha(frame, numero_nf, marca_esperada=marca)
+            p["eventos"] = scraper.extrair_eventos(frame)
+            p["itens"] = scraper.extrair_itens_pedido(frame)
+            completados += 1
+        except Exception as e:
+            print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
+    print(f"Eventos/Itens completados pra {completados}/{len(alvo)} pedido(s).")
+    return completados
+
+
+def exportar_e_gravar_periodo(page, frame, data_inicial, data_final, tentativas=2, orcamento_eventos_segundos=EVENTOS_JANELA_ORCAMENTO_SEGUNDOS):
     """
     Faz um export + upsert de 'Informação Pedido' pro periodo
-    (data_inicial, data_final) inteiro. Devolve (gravados, ignorados,
+    (data_inicial, data_final) inteiro, e completa eventos/itens dos
+    pedidos desta mesma janela que ainda estao nulos (ver
+    _completar_eventos_itens). Devolve (gravados, ignorados,
     lotes_com_erro) - (0, 0, 0) se o filtro de periodo nunca bater mesmo
     apos `tentativas` (ver _validar_filtro_aplicado - melhor pular esta
     rodada e tentar de novo na proxima do que arriscar gravar dado de um
@@ -626,11 +724,9 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
         registros = [r for r in registros if not any(LINHA_TRUNCAMENTO in str(v) for v in r.values())]
         print(f"  ({antes - len(registros)} linha(s) de aviso de truncamento removida(s) antes de gravar)", file=sys.stderr)
 
-    lote = []
+    payloads = []
     ignorados_lote = []
-    gravados = 0
     ignorados = 0
-    lotes_com_erro = 0
     for r in registros:
         payload = registro_para_supabase(r)
         if payload is None:
@@ -644,6 +740,23 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
                 _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
                 ignorados_lote = []
             continue
+        payloads.append(payload)
+    if ignorados_lote:
+        _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
+
+    # Completa eventos/itens ANTES do upsert em lote (pedido direto da
+    # Maria, 11/09/2026) - so pros pedidos desta mesma janela que ja
+    # existem no Supabase com as duas colunas nulas (ver
+    # _buscar_pares_sem_eventos_itens). Enche "eventos"/"itens" direto nos
+    # dicts de payloads - o upsert logo abaixo ja grava tudo junto, sem
+    # precisar de um PATCH extra por pedido.
+    pares_alvo = _buscar_pares_sem_eventos_itens(p["numero_nf"] for p in payloads)
+    _completar_eventos_itens(page, payloads, pares_alvo, orcamento_eventos_segundos)
+
+    lote = []
+    gravados = 0
+    lotes_com_erro = 0
+    for payload in payloads:
         lote.append(payload)
         if len(lote) >= TAMANHO_LOTE:
             try:
@@ -665,8 +778,6 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
         except Exception as e:
             lotes_com_erro += 1
             print(f"  ERRO no ultimo lote ({len(lote)} linha(s)), pulando: {e}", file=sys.stderr)
-    if ignorados_lote:
-        _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
 
     return gravados, ignorados, lotes_com_erro
 
@@ -721,14 +832,14 @@ def main():
             # filtro de data nao aplicar direito (ja corrigido em
             # scraper.definir_periodo), nao o tamanho do periodo em si.
             # Conferido direto no Supabase: o total REAL e distinto de uma
-            # janela de 5 dias fica bem abaixo do teto de ~150 mil linhas -
-            # exportar por dia so multiplicava o tempo do job sem
+            # janela de poucos dias fica bem abaixo do teto de ~150 mil
+            # linhas - exportar por dia so multiplicava o tempo do job sem
             # necessidade. _validar_filtro_aplicado ainda pega qualquer
             # truncamento de verdade (volume real crescendo no futuro),
             # devolvendo (0, 0, 0) sem gravar nada errado.
             print(f"Exportando periodo {args.data_inicial} - {args.data_final}...")
             gravados_total, ignorados_total, lotes_com_erro_total = exportar_e_gravar_periodo(
-                frame, args.data_inicial, args.data_final
+                page, frame, args.data_inicial, args.data_final
             )
 
             print(f"\nConcluido - {gravados_total} pedido(s) gravados no Supabase.")
@@ -740,11 +851,6 @@ def main():
                 print(f"{ignorados_total} linha(s) ignoradas por falta de Nota Fiscal ou de \"Nome Projeto\" "
                       f"(marca) - sem os dois, nao da pra identificar com seguranca. Gravadas em "
                       f"{TABELA_FALHAS} pra revisao manual, em vez de so descartadas.")
-            print("Eventos/Itens NAO foram trazidos por este backfill (ver LIMITACAO no topo do arquivo) - "
-                  "continuam vindo via titan_watcher.py quando a Torre precisar de um pedido especifico.")
-
-            print("\nReconferindo pedidos presos em situacao intermediaria fora da janela do backfill...")
-            rechecar_situacoes_presas(page)
 
             print("\nCompletando Eventos/Itens de pedidos que o backfill deixou concluidos sem essa informacao...")
             rechecar_concluidos_sem_eventos(page)
