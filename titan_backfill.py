@@ -185,7 +185,20 @@ def rechecar_situacoes_presas(page, orcamento_segundos=RECHECK_ORCAMENTO_SEGUNDO
     titan_recheck_eventos.yml, e passa um orcamento proprio maior que o do
     job diario (que reparte tempo com a exportacao principal).
     """
-    presos = buscar_situacao_presa()
+    # Busca protegida por try/except (11/09/2026, achado real - erro visto em
+    # producao): buscar_situacao_presa/buscar_concluidos_sem_eventos chamam o
+    # Supabase direto via urllib, que joga excecao (nao devolve so um valor de
+    # erro) em qualquer falha HTTP (ex: 500 transitorio do lado do Supabase).
+    # Sem este try/except, isso derrubava o processo INTEIRO com
+    # sys.exit(1) antes mesmo de reconferir um unico pedido - mesmo padrao
+    # ja usado no loop abaixo pra cada item individual, so que faltava aqui
+    # pra chamada inicial.
+    try:
+        presos = buscar_situacao_presa()
+    except Exception as e:
+        print(f"Nao consegui buscar pedidos presos em situacao intermediaria: {e} - "
+              f"pulando este recheck, tenta de novo na proxima rodada.", file=sys.stderr)
+        return
     if not presos:
         print("Nenhum pedido preso em situacao intermediaria fora da janela do backfill.")
         return
@@ -263,7 +276,13 @@ def rechecar_concluidos_sem_eventos(page, orcamento_segundos=EVENTOS_NULOS_RECHE
     rodar SO isto varias vezes por hora com um orcamento proprio, em vez de
     competir por tempo com a exportacao principal 2x/dia.
     """
-    pendentes = buscar_concluidos_sem_eventos()
+    # Mesma protecao de rechecar_situacoes_presas acima, mesmo motivo real.
+    try:
+        pendentes = buscar_concluidos_sem_eventos()
+    except Exception as e:
+        print(f"Nao consegui buscar pedidos concluidos sem Eventos/Itens: {e} - "
+              f"pulando este recheck, tenta de novo na proxima rodada.", file=sys.stderr)
+        return
     if not pendentes:
         print("Nenhum pedido concluido sem Eventos/Itens.")
         return
