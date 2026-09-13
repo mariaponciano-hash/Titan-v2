@@ -1018,7 +1018,7 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     return gravados, ignorados, lotes_com_erro
 
 
-def _adquirir_lock_login(lease_segundos=90, timeout_segundos=300, intervalo_segundos=3):
+def _adquirir_lock_login(lease_segundos=90, timeout_segundos=1500, intervalo_segundos=3):
     """
     Lock atomico no Supabase (tabela titan_login_lock, RPC adquirir_lock_
     login - mesmo padrao de UPDATE...WHERE condicional ja usado em
@@ -1040,8 +1040,13 @@ def _adquirir_lock_login(lease_segundos=90, timeout_segundos=300, intervalo_segu
     caminho normal e sempre liberar explicitamente logo depois do login
     (sucesso ou falha), bem mais rapido que o lease. timeout_segundos e
     quanto este worker aceita esperar a vez antes de desistir e propagar
-    erro (com 20 workers e login levando poucos segundos cada, 5min de
-    espera maxima e folga generosa).
+    erro - AUMENTADO de 5min pra 25min (13/09/2026, achado real na run #47
+    manual: com 20 workers na fila, 5min nao foi suficiente pros ultimos
+    da fila - varios derrubaram com "Nao consegui adquirir o lock" antes
+    mesmo de conseguir logar uma vez. Pior caso teorico (todo mundo na
+    frente demorando o lease inteiro de 90s antes de liberar) e ~19*90s =
+    28,5min - 25min fica perto disso com folga, ainda deixando tempo real
+    de processamento antes do timeout-minutes:60 do job no workflow).
     """
     inicio = time.monotonic()
     while True:
@@ -1097,6 +1102,18 @@ def _marcar_eventos_itens(numero_nf, marca, eventos, itens):
     )
 
 
+def _erro_de_frame_invalido(erro):
+    """
+    True quando a excecao e o Power BI tendo trocado/recarregado o iframe
+    do relatorio por baixo do frame que o worker guardou (ver achado real
+    na docstring de _completar_eventos_itens_worker) - o Playwright reporta
+    isso como "Frame was detached" dentro da mensagem de varios metodos de
+    Locator diferentes (count/all/hover/etc.), entao confere so a
+    substring em vez de tentar listar cada metodo.
+    """
+    return "Frame was detached" in str(erro)
+
+
 def _completar_eventos_itens_worker(page, orcamento_segundos, tamanho_lote=20, lease_minutos=30):
     """
     Modo standalone (--completar-eventos-worker) pensado pra rodar em
@@ -1115,10 +1132,16 @@ def _completar_eventos_itens_worker(page, orcamento_segundos, tamanho_lote=20, l
     lease (recheck_reservado_ate) que impede outra instancia de pegar a
     MESMA linha ao mesmo tempo, e AUTO-RECUPERA sozinha se esta instancia
     cair no meio (a linha volta a ficar disponivel quando o lease expira).
-    Prioriza "recentes primeiro" (dentro da propria RPC) - concluido +
-    eventos nulo, de QUALQUER data, nao so da janela deste backfill - ou
-    seja, isto tambem ajuda a zerar o backlog antigo (ex: NF 771869, de
-    julho) como efeito colateral, nao so os pedidos novos de hoje.
+    Concluido + eventos nulo, de QUALQUER data, nao so da janela deste
+    backfill - ou seja, isto tambem ajuda a zerar o backlog antigo (ex: NF
+    771869, de julho) como efeito colateral, nao so os pedidos novos de
+    hoje. ORDER BY dentro da RPC e so atualizado_em asc (13/09/2026,
+    achado real na run #46 manual: a versao anterior priorizava tambem
+    solicitado_em, mas essa expressao usa now() e nao deixava o Postgres
+    usar o indice existente - forcava um Seq Scan + sort em disco sobre
+    1,37 milhao de linhas, ~6,3s, estourando o timeout de 3s do PostgREST
+    e devolvendo HTTP 500 pra TODO worker. So atualizado_em asc usa o
+    indice (infos_titan_recheck_sem_eventos) e cai pra ~5ms).
 
     Usa a MESMA _ler_eventos_itens_via_filtro_cruzado do fluxo antigo, so
     que reivindicando o proximo pedido via a RPC em vez de uma lista fixa
@@ -1127,6 +1150,21 @@ def _completar_eventos_itens_worker(page, orcamento_segundos, tamanho_lote=20, l
     volta pra filtrar por NF quando o pedido reivindicado nao tem
     numero_pedido gravado (ver docstring de _ler_eventos_itens_via_filtro_
     cruzado).
+
+    RECUPERACAO DE FRAME (13/09/2026, achado real na run #47 manual, com
+    login e RPC ja corrigidos): o MESMO frame e reaproveitado pra todos os
+    pedidos do turno (ver comentario acima sobre nao recarregar a pagina),
+    entao se o Power BI trocar/recarregar o iframe do relatorio em algum
+    momento (observado: refresh de token, sessao expirando etc.), esse
+    frame fica "detached" pra sempre - TODO pedido seguinte falhava
+    instantaneamente com "Locator.count/all: Frame was detached" pelo
+    resto do orcamento (6.503 falhas identicas em sequencia, 0 pedidos
+    completados, numa unica instancia). Ao detectar esse erro especifico
+    (ver _erro_de_frame_invalido), busca o frame de novo (scraper.
+    get_dashboard_frame) e tenta o MESMO pedido mais uma vez antes de
+    desistir - a variavel `frame` e reatribuida no escopo desta funcao,
+    entao os pedidos SEGUINTES do loop tambem usam o frame novo
+    automaticamente, sem precisar de nenhum tratamento especial neles.
     """
     frame = scraper.get_dashboard_frame(page)
     inicio = time.monotonic()
@@ -1168,17 +1206,40 @@ def _completar_eventos_itens_worker(page, orcamento_segundos, tamanho_lote=20, l
                 _marcar_eventos_itens(numero_nf, marca, eventos, itens)
                 completados += 1
             except Exception as e:
-                print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
-                titan_watcher.marcar_erro(numero_nf, marca, str(e))
+                if _erro_de_frame_invalido(e):
+                    print(f"  [NF {numero_nf} / marca {marca}] frame do Power BI ficou invalido - buscando de "
+                          f"novo e tentando este pedido mais uma vez: {e}", file=sys.stderr)
+                    try:
+                        frame = scraper.get_dashboard_frame(page)
+                        eventos, itens = _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, numero_pedido=numero_pedido)
+                        _marcar_eventos_itens(numero_nf, marca, eventos, itens)
+                        completados += 1
+                    except Exception as e2:
+                        print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens (apos "
+                              f"recuperar o frame): {e2}", file=sys.stderr)
+                        titan_watcher.marcar_erro(numero_nf, marca, str(e2))
+                else:
+                    print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
+                    titan_watcher.marcar_erro(numero_nf, marca, str(e))
             finally:
+                # Mesma recuperacao de frame na limpeza - se o frame so
+                # detached AQUI (leitura deste pedido deu certo, mas a
+                # troca de iframe do Power BI aconteceu bem nesta janela),
+                # busca de novo pro PROXIMO pedido do loop nao herdar um
+                # frame morto (nao tenta limpar de novo agora - o proximo
+                # pedido ja aplica seu proprio filtro fresco por cima).
                 if usou_nf:
                     try:
                         _limpar_filtro_slicer(frame, "Nota Fiscal de Saída")
                     except Exception as e:
+                        if _erro_de_frame_invalido(e):
+                            frame = scraper.get_dashboard_frame(page)
                         print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Nota Fiscal de Saida' pro proximo pedido: {e}", file=sys.stderr)
                 try:
                     _limpar_filtro_slicer(frame, "Número do pedido")
                 except Exception as e:
+                    if _erro_de_frame_invalido(e):
+                        frame = scraper.get_dashboard_frame(page)
                     print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Numero do pedido' pro proximo pedido: {e}", file=sys.stderr)
     print(f"Worker de eventos/itens concluido: {completados}/{tentados} pedido(s) completado(s).")
 
