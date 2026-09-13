@@ -27,18 +27,24 @@ seletor mas nao era:
    transparente que intercepta todo clique/hover seguinte. Precisa clicar no
    proprio backdrop (ver fechar_popup_calendario) e confirmar que sumiu.
 
-EVENTOS/ITENS (adaptado em 11/09/2026, pedido direto da Maria): a maior
-parte do backfill continua so a exportacao em massa de "Informacao Pedido"
-(Romaneio, Situacao, datas etc.) - clicar pedido por pedido em TODOS eles
-seria inviavel (~15-20s cada, ver _completar_eventos_itens). Mas logo apos
-a exportacao, o backfill AGORA completa Eventos/Itens dos pedidos DESTA
-MESMA janela que ja existem no Supabase com as duas colunas nulas (ver
-_buscar_pares_sem_eventos_itens) - volume baixo por rodada, ja que a
-janela e deslizante e a maioria dos pedidos ja foi completada numa rodada
-anterior. O resto (pedidos fora da janela atual, ou que estouraram o
-orcamento de tempo desta rodada) continua vindo do jeito de sempre:
-titan_watcher.py, sob demanda, quando a Torre precisar montar o ticket
-completo daquele pedido.
+EVENTOS/ITENS - EXPORT + WORKERS PARALELOS (13/09/2026, pedido direto da
+Maria: "preciso que todos os pedidos sejam processados em uma unica
+rodada"): a exportacao em massa de "Informacao Pedido" (Romaneio,
+Situacao, datas etc.) continua um passo UNICO e rapido (ver
+exportar_e_gravar_periodo). Completar Eventos/Itens (clicar pedido por
+pedido, ~11s cada - ver _ler_eventos_itens_via_filtro_cruzado) NAO roda
+mais dentro deste mesmo passo sequencial - uma unica instancia nunca
+daria conta de milhares de pedidos dentro de um timeout de job razoavel.
+Em vez disso, --completar-eventos-worker roda em N instancias em
+PARALELO (ver strategy.matrix no workflow, hoje N=20), cada uma logada
+separadamente no Titan, reivindicando lotes via a RPC
+reivindicar_recheck_eventos (reserva atomica SELECT FOR UPDATE SKIP
+LOCKED - nenhuma instancia reivindica o mesmo pedido que outra) ate
+esgotar seu proprio orcamento de tempo ou nao sobrar mais nada pra
+reivindicar. Como a RPC prioriza "recentes primeiro" mas cobre QUALQUER
+pedido concluido com eventos nulo (nao so desta janela), isto tambem
+ajuda a zerar backlog antigo (ex: pedidos de meses atras) como efeito
+colateral.
 
 COLETA VIA EXPORTACAO NATIVA, NAO SCROLL (25/08/2026, achado real pela
 Ivna): a versao anterior lia a tabela "Informacao Pedido" rolando (ela e
@@ -127,20 +133,18 @@ RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - deixa margem dentro do timeout do jo
 # este recheck, todos dentro do mesmo job).
 EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 1800  # 30min
 
-# Orcamento pra _completar_eventos_itens (11/09/2026, pedido direto da
-# Maria): so cobre os pedidos DESTA janela do backfill que ainda estao com
-# eventos/itens nulos.
-#
-# AUMENTADO de 600 pra 2400 (13/09/2026, achado real - run #44: o job
-# INTEIRO terminou em 13m24s, sendo que o timeout-minutes do workflow e 60
-# - ~47min de folga nao usada, porque o orcamento de eventos/itens (o
-# unico gargalo real, ver _completar_eventos_itens) sempre esgotava
-# primeiro, batendo o teto de 600s antes do job chegar perto do limite de
-# verdade. A pedido da Maria: 40min (2400s) da ~4x mais throughput por
-# rodada (~54 -> ~218 pedidos, no ritmo de ~11s/pedido) sem mexer em
-# nenhuma logica, so nesse numero - ainda deixa ampla margem antes do
-# timeout-minutes:60 do job.
-EVENTOS_JANELA_ORCAMENTO_SEGUNDOS = 2400  # 40min
+# Orcamento padrao de CADA instancia do worker paralelo de eventos/itens
+# (--completar-eventos-worker, ver _completar_eventos_itens_worker) -
+# substituiu o antigo EVENTOS_JANELA_ORCAMENTO_SEGUNDOS (11/09/2026, so
+# uma instancia sequencial dentro do proprio job de export - REMOVIDO em
+# 13/09/2026, pedido direto da Maria: "preciso que todos os pedidos sejam
+# processados em uma unica rodada". No ritmo de ~11s/pedido, uma unica
+# instancia sequencial nunca daria conta de uma janela inteira - so
+# paralelizar de verdade (N instancias simultaneas, ver strategy.matrix no
+# workflow) multiplica o throughput por N. 55min (3300s) deixa margem
+# real dentro do timeout-minutes do job paralelo (60min) pro login,
+# reivindicar o ultimo lote e desligar o browser de forma limpa.
+EVENTOS_WORKER_ORCAMENTO_SEGUNDOS_PADRAO = 3300  # 55min
 
 # Registro passo a passo visual (12/09/2026, pedido direto da Maria depois
 # do achado do "pbi-overlay-caret"): print de CADA acao (nao so do momento
@@ -685,28 +689,39 @@ def _limpar_filtro_slicer(frame, rotulo, pasta_registro=None, indice_passo=None)
         scraper.registrar_passo(frame, pasta_registro, indice_passo, f"limpou_{nome_rotulo}")
 
 
-def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, pasta_registro=None):
+def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, numero_pedido=None, pasta_registro=None):
     """
     Passo a passo OFICIAL do loop, ditado direto pela Maria (12/09/2026,
     depois de eu ter tentado 3 causas raiz diferentes pro pbi-overlay-caret
     e ainda ter passado por cima de um passo que ela ja tinha dito antes -
-    "voce esta tentando muito e esta errando bastante"). Ordem que NAO pode
-    mudar, pra cada NF do loop:
+    "voce esta tentando muito e esta errando bastante"), SIMPLIFICADO em
+    13/09/2026 (tambem pedido direto da Maria - "nao precisa filtrar pela
+    nf, somente pelo numero do pedido"). Ordem que NAO pode mudar, pra cada
+    pedido do loop:
     1. Verifica/limpa linha residual destacada em "Informação Pedido" (ver
        scraper.limpar_linha_selecionada) - EM TODA NF, nao so na primeira
        (achado real: o destaque volta a aparecer entre um pedido e outro,
        nao e algo que se resolve so uma vez por rodada).
-    2. Filtra a NF (scraper.filtrar).
-    3. Filtra "Numero do pedido" (abre o dropdown, ja vem so com as opcoes
-       validas pra essa NF - sem digitar nada -, marca a 1a opcao real).
-    4. Le "Itens do pedido" (scraper.extrair_itens_pedido - mesma funcao
+    2. Filtra direto por "Numero do pedido" (scraper.filtrar(numero_pedido=...),
+       exact=False - contains, ja que o valor gravado no Supabase e so o ID
+       da Torre e a opcao no Titan mostra o texto completo "SH<id>RT<nf>").
+       SO cai de volta pro fluxo antigo (filtrar a NF, abrir o dropdown de
+       "Numero do pedido" sem digitar nada, marcar a 1a opcao real) quando
+       numero_pedido vem vazio/nulo pra este pedido - confirmado pela Maria
+       ("Nesse caso, cai de volta pro filtro por NF") como o unico caso em
+       que factivelmente nao tem outro jeito de achar o pedido certo.
+    3. Le "Itens do pedido" (scraper.extrair_itens_pedido - mesma funcao
        que o titan_watcher.py usa, SEM clicar em nenhuma linha da tabela -
-       confirmado pela Maria, os paineis ja vem cross-filtrados so pelos
-       passos 2 e 3 acima).
-    5. Le "Eventos" (scraper.extrair_eventos - idem).
-    Os passos 6-7 (limpar os dois filtros) ficam no finally de quem chama
-    (_completar_eventos_itens) - o passo 8 (proxima NF) e so o loop
-    continuar.
+       confirmado pela Maria, o painel ja vem cross-filtrado so pelo passo
+       2 acima).
+    4. Le "Eventos" (scraper.extrair_eventos - idem).
+    A limpeza dos filtros fica no finally de quem chama - IMPORTANTE: quem
+    chama precisa saber se o passo 2 usou o fluxo direto (so "Numero do
+    pedido" foi aplicado) ou o fluxo de fallback (NF TAMBEM foi aplicada),
+    pra limpar so o(s) filtro(s) que realmente foram usados. Isso e
+    determinado so pela presenca de numero_pedido NO MOMENTO DA CHAMADA
+    (nao pelo resultado/sucesso desta funcao) - `not numero_pedido` antes
+    de chamar ja da essa resposta pro chamador.
 
     pasta_registro (12/09/2026, pedido direto da Maria depois do achado do
     "pbi-overlay-caret" - ela quer ver o passo a passo visual completo, nao
@@ -722,23 +737,27 @@ def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, pasta_registro=None)
             scraper.registrar_passo(frame, pasta_registro, passo[0], nome)
 
     scraper.limpar_linha_selecionada(frame, "Informação Pedido")
-    registrar("00_linha_residual_verificada")
-    scraper.filtrar(frame, nf=numero_nf)
-    registrar("01_nf_filtrada")
-    scraper.abrir_dropdown_filtro(frame, "Número do pedido")
-    registrar("02_dropdown_numero_pedido_aberto")
-    time.sleep(1)
-    opcao_pedido = scraper.primeira_opcao_real(frame, timeout_ms=10000)
-    opcao_pedido.click()
-    registrar("03_opcao_numero_pedido_marcada")
-    time.sleep(0.5)
-    frame.page.keyboard.press("Escape")
-    time.sleep(1)
-    registrar("04_dropdown_numero_pedido_fechado")
+    registrar("linha_residual_verificada")
+    if numero_pedido:
+        scraper.filtrar(frame, numero_pedido=numero_pedido)
+        registrar("pedido_filtrado_direto")
+    else:
+        scraper.filtrar(frame, nf=numero_nf)
+        registrar("nf_filtrada_fallback")
+        scraper.abrir_dropdown_filtro(frame, "Número do pedido")
+        registrar("dropdown_numero_pedido_aberto")
+        time.sleep(1)
+        opcao_pedido = scraper.primeira_opcao_real(frame, timeout_ms=10000)
+        opcao_pedido.click()
+        registrar("opcao_numero_pedido_marcada")
+        time.sleep(0.5)
+        frame.page.keyboard.press("Escape")
+        time.sleep(1)
+        registrar("dropdown_numero_pedido_fechado")
     itens = scraper.extrair_itens_pedido(frame)
-    registrar("05_itens_lidos")
+    registrar("itens_lidos")
     eventos = scraper.extrair_eventos(frame)
-    registrar("06_eventos_lidos")
+    registrar("eventos_lidos")
     return eventos, itens
 
 
@@ -783,6 +802,14 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
             break
         numero_nf = p["numero_nf"]
         marca = p["marca"]
+        numero_pedido = p.get("numero_pedido")
+        # Determinado ANTES da chamada (13/09/2026, pedido direto da Maria -
+        # "nao precisa filtrar pela nf, somente pelo numero do pedido") - so
+        # depende do dado do pedido, nao do resultado/sucesso da chamada
+        # abaixo, entao da pra saber com seguranca no finally quais filtros
+        # realmente foram aplicados e precisam ser limpos (ver docstring de
+        # _ler_eventos_itens_via_filtro_cruzado).
+        usou_nf = not numero_pedido
         # Registro passo a passo (12/09/2026, pedido direto da Maria) - so
         # pros primeiros N pedidos desta rodada, ver constante no topo do
         # arquivo pro motivo de nao gravar pra todos.
@@ -791,7 +818,9 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
             nome_marca = re.sub(r"\W+", "_", marca).strip("_")
             pasta_deste_pedido = PASTA_REGISTRO_PASSO_A_PASSO / f"{idx:03d}_{numero_nf}_{nome_marca}"
         try:
-            p["eventos"], p["itens"] = _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, pasta_registro=pasta_deste_pedido)
+            p["eventos"], p["itens"] = _ler_eventos_itens_via_filtro_cruzado(
+                frame, numero_nf, numero_pedido=numero_pedido, pasta_registro=pasta_deste_pedido
+            )
             completados += 1
         except Exception as e:
             print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
@@ -810,12 +839,15 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
             # seu proprio try/except - uma falhar nao impede a outra de
             # tentar, entao o pior caso deixa so 1 dos 2 filtros sujo (nao os
             # 2), e o proximo pedido tem chance real de achar sua NF.
-            # Ordem 6-7 conforme o passo a passo oficial da Maria (12/09/2026):
-            # limpar a NF PRIMEIRO, depois o Numero do pedido.
-            try:
-                _limpar_filtro_slicer(frame, "Nota Fiscal de Saída", pasta_registro=pasta_deste_pedido, indice_passo=7)
-            except Exception as e:
-                print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Nota Fiscal de Saida' pro proximo pedido: {e}", file=sys.stderr)
+            # So limpa "Nota Fiscal de Saida" quando ela foi de fato usada
+            # (fallback, numero_pedido vazio - 13/09/2026, ver usou_nf acima)
+            # - no fluxo direto (a maioria dos pedidos) a NF nunca foi
+            # filtrada, entao tentar limpa-la so custaria tempo a toa.
+            if usou_nf:
+                try:
+                    _limpar_filtro_slicer(frame, "Nota Fiscal de Saída", pasta_registro=pasta_deste_pedido, indice_passo=7)
+                except Exception as e:
+                    print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Nota Fiscal de Saida' pro proximo pedido: {e}", file=sys.stderr)
             try:
                 _limpar_filtro_slicer(frame, "Número do pedido", pasta_registro=pasta_deste_pedido, indice_passo=8)
             except Exception as e:
@@ -824,16 +856,18 @@ def _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_segundos):
     return completados
 
 
-def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2, orcamento_eventos_segundos=EVENTOS_JANELA_ORCAMENTO_SEGUNDOS):
+def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     """
     Faz um export + upsert de 'Informação Pedido' pro periodo
-    (data_inicial, data_final) inteiro, e completa eventos/itens dos
-    pedidos desta mesma janela que ainda estao nulos (ver
-    _completar_eventos_itens). Devolve (gravados, ignorados,
+    (data_inicial, data_final) inteiro. Devolve (gravados, ignorados,
     lotes_com_erro) - (0, 0, 0) se o filtro de periodo nunca bater mesmo
     apos `tentativas` (ver _validar_filtro_aplicado - melhor pular esta
     rodada e tentar de novo na proxima do que arriscar gravar dado de um
     periodo errado ou incompleto).
+
+    NAO completa mais eventos/itens aqui (13/09/2026) - ver
+    _completar_eventos_itens_worker, que roda depois disso num job
+    paralelo separado (strategy.matrix no workflow).
     """
     registros = []
     filtro_ok = False
@@ -939,14 +973,21 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2, orc
     if ignorados_lote:
         _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
 
-    # Completa eventos/itens ANTES do upsert em lote (pedido direto da
-    # Maria, 11/09/2026) - so pros pedidos desta mesma janela que ja
-    # existem no Supabase com as duas colunas nulas (ver
-    # _buscar_pares_sem_eventos_itens). Enche "eventos"/"itens" direto nos
-    # dicts de payloads - o upsert logo abaixo ja grava tudo junto, sem
-    # precisar de um PATCH extra por pedido.
-    pares_alvo = _buscar_pares_sem_eventos_itens(p["numero_nf"] for p in payloads)
-    _completar_eventos_itens(frame, payloads, pares_alvo, orcamento_eventos_segundos)
+    # REMOVIDO daqui (13/09/2026, pedido direto da Maria - "preciso que
+    # todos os pedidos sejam processados em uma unica rodada"): completar
+    # eventos/itens inline (_buscar_pares_sem_eventos_itens +
+    # _completar_eventos_itens) rodava DENTRO deste job, com um orcamento
+    # de tempo unico, sequencial - matematicamente incapaz de dar conta do
+    # volume de uma janela inteira (~11s/pedido x milhares de pedidos).
+    # Virou um job PARALELO separado no workflow (20 instancias via
+    # strategy.matrix, ver .github/workflows/titan_backfill.yml e
+    # _completar_eventos_itens_worker abaixo) que roda DEPOIS deste export,
+    # reivindicando lotes via a RPC reivindicar_recheck_eventos (mesma
+    # reserva atomica SELECT FOR UPDATE SKIP LOCKED do recheck amplo
+    # antigo) - sem essa chamada aqui, o export fica rapido (so a
+    # exportacao nativa + upsert) e os workers comecam a trabalhar mais
+    # cedo, com o tempo todo do job deles disponivel (nao competindo pelo
+    # mesmo orcamento do export).
 
     lote = []
     gravados = 0
@@ -977,6 +1018,109 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2, orc
     return gravados, ignorados, lotes_com_erro
 
 
+def _marcar_eventos_itens(numero_nf, marca, eventos, itens):
+    """
+    PATCH minimo - so eventos/itens/atualizado_em, SEM tocar em situacao/
+    romaneio/valor_pedido/etc (diferente de titan_watcher.marcar_concluido,
+    que sobrescreve o registro inteiro a partir de um pedido_data lido de
+    novo). Estes pedidos ja estao 'concluido' com esses outros campos
+    corretos - o unico motivo de terem sido reivindicados e eventos/itens
+    nulos - reescrever tudo de novo so arriscaria degradar dado bom sem
+    necessidade nenhuma.
+    """
+    titan_watcher._supabase_request(
+        "PATCH",
+        f"{TABELA}?numero_nf=eq.{urllib.parse.quote(numero_nf)}&marca=eq.{urllib.parse.quote(marca)}",
+        {"eventos": eventos or [], "itens": itens or [], "atualizado_em": _agora_iso()},
+    )
+
+
+def _completar_eventos_itens_worker(page, orcamento_segundos, tamanho_lote=20, lease_minutos=30):
+    """
+    Modo standalone (--completar-eventos-worker) pensado pra rodar em
+    VARIAS instancias em paralelo ao mesmo tempo (ver strategy.matrix no
+    workflow) - pedido direto da Maria (13/09/2026): "preciso que todos os
+    pedidos sejam processados em uma unica rodada". No ritmo de ~11s por
+    pedido, uma unica instancia sequencial NUNCA daria conta de uma janela
+    inteira (milhares de pedidos) dentro de um timeout de job razoavel -
+    so paralelizar de verdade (N instancias simultaneas, cada uma logada
+    separadamente no Titan) multiplica o throughput por N.
+
+    Reivindica lotes via a RPC reivindicar_recheck_eventos (SELECT ... FOR
+    UPDATE SKIP LOCKED por baixo, mesma reserva atomica ja usada pelo
+    recheck amplo antigo em rechecar_concluidos_sem_eventos/
+    buscar_concluidos_sem_eventos) - cada linha reivindicada fica com um
+    lease (recheck_reservado_ate) que impede outra instancia de pegar a
+    MESMA linha ao mesmo tempo, e AUTO-RECUPERA sozinha se esta instancia
+    cair no meio (a linha volta a ficar disponivel quando o lease expira).
+    Prioriza "recentes primeiro" (dentro da propria RPC) - concluido +
+    eventos nulo, de QUALQUER data, nao so da janela deste backfill - ou
+    seja, isto tambem ajuda a zerar o backlog antigo (ex: NF 771869, de
+    julho) como efeito colateral, nao so os pedidos novos de hoje.
+
+    Usa a MESMA _ler_eventos_itens_via_filtro_cruzado do fluxo antigo, so
+    que reivindicando o proximo pedido via a RPC em vez de uma lista fixa
+    (`alvo`) construida so a partir do export desta janela. Filtra direto
+    por "Numero do pedido" (13/09/2026, pedido direto da Maria) - so cai de
+    volta pra filtrar por NF quando o pedido reivindicado nao tem
+    numero_pedido gravado (ver docstring de _ler_eventos_itens_via_filtro_
+    cruzado).
+    """
+    frame = scraper.get_dashboard_frame(page)
+    inicio = time.monotonic()
+    completados = 0
+    tentados = 0
+    while True:
+        restante = orcamento_segundos - (time.monotonic() - inicio)
+        if restante < 20:  # nao vale a pena reivindicar um lote novo tao perto do fim
+            print(f"  orcamento de tempo esgotado - {completados}/{tentados} completado(s) nesta instancia.")
+            break
+        try:
+            lote_itens = titan_watcher._supabase_request(
+                "POST", "rpc/reivindicar_recheck_eventos", {"qtd": tamanho_lote, "lease_minutos": lease_minutos}
+            ) or []
+        except Exception as e:
+            print(f"Nao consegui reivindicar lote de pedidos: {e} - encerrando esta instancia.", file=sys.stderr)
+            break
+        if not lote_itens:
+            print("Nenhum pedido concluido sem eventos/itens sobrando pra reivindicar - encerrando esta instancia.")
+            break
+        for item in lote_itens:
+            if time.monotonic() - inicio > orcamento_segundos:
+                print(f"  orcamento de tempo esgotado no meio do lote - {completados}/{tentados} completado(s) nesta instancia.")
+                return
+            numero_nf = (item.get("numero_nf") or "").strip()
+            marca = (item.get("marca") or "").strip()
+            numero_pedido = (item.get("numero_pedido") or "").strip()
+            if not numero_nf or not marca:
+                continue
+            tentados += 1
+            # Ver docstring de _ler_eventos_itens_via_filtro_cruzado e o
+            # comentario espelho em _completar_eventos_itens (13/09/2026,
+            # pedido direto da Maria) - determinado ANTES da chamada, so a
+            # partir do dado do pedido, pra saber no finally qual(is)
+            # filtro(s) realmente foi(ram) aplicado(s).
+            usou_nf = not numero_pedido
+            try:
+                eventos, itens = _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, numero_pedido=numero_pedido)
+                _marcar_eventos_itens(numero_nf, marca, eventos, itens)
+                completados += 1
+            except Exception as e:
+                print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
+                titan_watcher.marcar_erro(numero_nf, marca, str(e))
+            finally:
+                if usou_nf:
+                    try:
+                        _limpar_filtro_slicer(frame, "Nota Fiscal de Saída")
+                    except Exception as e:
+                        print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Nota Fiscal de Saida' pro proximo pedido: {e}", file=sys.stderr)
+                try:
+                    _limpar_filtro_slicer(frame, "Número do pedido")
+                except Exception as e:
+                    print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Numero do pedido' pro proximo pedido: {e}", file=sys.stderr)
+    print(f"Worker de eventos/itens concluido: {completados}/{tentados} pedido(s) completado(s).")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-inicial", help="formato DD/MM/AAAA, ex: 01/06/2026 (obrigatorio, exceto com --so-recheck)")
@@ -996,9 +1140,20 @@ def main():
                          help=f"orcamento pro recheck de situacao presa (padrao {RECHECK_ORCAMENTO_SEGUNDOS}s)")
     parser.add_argument("--recheck-orcamento-eventos-segundos", type=int, default=EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS,
                          help=f"orcamento pro recheck de eventos/itens faltando (padrao {EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS}s)")
+    # --completar-eventos-worker (13/09/2026, pedido direto da Maria -
+    # "preciso que todos os pedidos sejam processados em uma unica
+    # rodada") - modo standalone pensado pra rodar em N instancias
+    # paralelas ao mesmo tempo (ver strategy.matrix no workflow e
+    # _completar_eventos_itens_worker) - cada uma reivindica seu proprio
+    # lote via a RPC reivindicar_recheck_eventos, sem duplicar trabalho
+    # entre si.
+    parser.add_argument("--completar-eventos-worker", action="store_true", default=False,
+                         help="modo worker - reivindica e completa lotes de eventos/itens via RPC, pensado pra rodar em paralelo (varias instancias ao mesmo tempo)")
+    parser.add_argument("--completar-eventos-worker-orcamento-segundos", type=int, default=EVENTOS_WORKER_ORCAMENTO_SEGUNDOS_PADRAO,
+                         help=f"orcamento de tempo desta instancia do worker (padrao {EVENTOS_WORKER_ORCAMENTO_SEGUNDOS_PADRAO}s)")
     args = parser.parse_args()
-    if not args.so_recheck and (not args.data_inicial or not args.data_final):
-        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck)")
+    if not args.so_recheck and not args.completar_eventos_worker and (not args.data_inicial or not args.data_final):
+        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck ou --completar-eventos-worker)")
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")
@@ -1017,6 +1172,12 @@ def main():
                 print("\n--so-recheck: pulando exportacao em massa, so reconferindo pedidos presos e sem eventos...")
                 rechecar_situacoes_presas(page, orcamento_segundos=args.recheck_orcamento_situacao_segundos)
                 rechecar_concluidos_sem_eventos(page, orcamento_segundos=args.recheck_orcamento_eventos_segundos)
+                return
+
+            if args.completar_eventos_worker:
+                print(f"\n--completar-eventos-worker: reivindicando e completando lotes "
+                      f"(orcamento {args.completar_eventos_worker_orcamento_segundos}s)...")
+                _completar_eventos_itens_worker(page, orcamento_segundos=args.completar_eventos_worker_orcamento_segundos)
                 return
 
             frame = scraper.get_dashboard_frame(page)

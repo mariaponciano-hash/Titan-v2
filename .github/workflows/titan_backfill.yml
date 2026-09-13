@@ -12,11 +12,11 @@ name: Titan backfill diario
 #
 # 1 dia (era 2, depois de ter sido 5 - 13/09/2026, pedido direto da Maria):
 # reduz ainda mais o volume novo de pedidos por rodada precisando completar
-# Eventos/Itens (ver _completar_eventos_itens em titan_backfill.py) - um
-# pedido so tem no maximo 2 chances (as 2 rodadas do mesmo dia) antes da
-# janela avancar e ele sair do escopo pra sempre; janela menor por si so
-# nao muda esse limite de chances, so reduz quantos pedidos novos competem
-# pelo orcamento de tempo em cada rodada.
+# Eventos/Itens (ver job completar-eventos abaixo) - um pedido so tem no
+# maximo 2 chances (as 2 rodadas do mesmo dia) antes da janela avancar e
+# ele sair do escopo pra sempre; janela menor por si so nao muda esse
+# limite de chances, so reduz quantos pedidos novos competem pelos workers
+# em cada rodada.
 on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
@@ -24,20 +24,14 @@ on:
   workflow_dispatch: {}   # permite rodar manualmente pela aba Actions, pra testar
 
 jobs:
-  backfill:
+  export:
     runs-on: ubuntu-latest
-    # titan_backfill.py faz UM export do painel 'Informação Pedido' pra
-    # janela inteira (ate 3min so esperando o download, ver expect_download
-    # em titan_bi_scraper.exportar_dados_do_painel) e completa Eventos/Itens
-    # dos pedidos novos desta janela (ate 40min, ver EVENTOS_JANELA_
-    # ORCAMENTO_SEGUNDOS - AUMENTADO de 10 pra 40min em 13/09/2026, achado
-    # real: o job inteiro terminava em ~13min com o orcamento antigo de
-    # 10min, sobrando ~47min nao usados antes deste timeout-minutes de 60).
-    # O recheck amplo de qualquer pedido concluido do site inteiro
-    # (EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS) NAO roda mais aqui - saiu
-    # do fluxo principal a pedido da Maria (12/09/2026), so existe hoje via
-    # --so-recheck, acionado pelo titan_recheck_eventos.yml (desativado).
-    timeout-minutes: 60
+    # So a exportacao nativa de 'Informação Pedido' pra janela inteira +
+    # upsert no Supabase - rapido (~3-13min nos testes reais). Completar
+    # Eventos/Itens NAO roda mais aqui (13/09/2026, pedido direto da Maria)
+    # - virou o job paralelo completar-eventos abaixo, pra nao competir
+    # pelo mesmo orcamento de tempo sequencial.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -69,18 +63,62 @@ jobs:
       # O runner some ao fim do job - sem isso, o print/HTML que
       # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel
       # (diferente de rodar no PC, onde a pasta fica ali pra abrir direto).
-      # "always()" em vez de "failure()" (28/08/2026, achado real): os
-      # passos de recheck/completar (eventos/itens, ambos) engolem excecao
-      # por item - o job inteiro "tem sucesso" mesmo com 100% dos itens
-      # falhando, entao
-      # "if: failure()" nunca disparava e os prints/HTML ficavam perdidos
-      # quando o runner terminava. if-no-files-found:ignore evita o passo
-      # falhar sozinho na rodada normal (sem nenhum diagnostico salvo).
+      # if-no-files-found:ignore evita o passo falhar sozinho na rodada
+      # normal (sem nenhum diagnostico salvo).
       - name: Subir diagnostico (se tiver)
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: titan_debug
+          name: titan_debug_export
+          path: titan_debug/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  completar-eventos:
+    needs: export
+    runs-on: ubuntu-latest
+    # PARALELISMO REAL (13/09/2026, pedido direto da Maria: "preciso que
+    # todos os pedidos sejam processados em uma unica rodada") - no ritmo
+    # de ~11s por pedido, uma unica instancia sequencial nunca daria conta
+    # de uma janela inteira (milhares de pedidos) dentro de um timeout de
+    # job razoavel. 20 instancias rodando ao mesmo tempo (limite de jobs
+    # simultaneos de uma conta gratuita/pro do GitHub - o repo e publico,
+    # entao os minutos de Actions em si sao gratis/ilimitados, so o
+    # PARALELISMO tem teto) multiplicam o throughput por 20 - cada uma loga
+    # separadamente no Titan e reivindica seu proprio lote via a RPC
+    # reivindicar_recheck_eventos (SELECT FOR UPDATE SKIP LOCKED - nenhuma
+    # instancia pega o mesmo pedido que outra, ver _completar_eventos_
+    # itens_worker em titan_backfill.py). fail-fast:false pra uma instancia
+    # com erro nao cancelar as outras 19.
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: |
+          pip install playwright openpyxl
+          playwright install --with-deps chromium
+
+      - name: Completar eventos/itens (worker ${{ matrix.worker }}/20)
+        env:
+          TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
+          TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
+        run: |
+          python titan_backfill.py --completar-eventos-worker --headless
+
+      - name: Subir diagnostico (se tiver)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: titan_debug_worker_${{ matrix.worker }}
           path: titan_debug/
           retention-days: 7
           if-no-files-found: ignore
