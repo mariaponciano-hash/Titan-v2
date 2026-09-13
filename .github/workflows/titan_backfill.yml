@@ -2,18 +2,21 @@ name: Titan backfill diario
 
 # Roda o titan_backfill.py duas vezes por dia (06h e 20h horario de Brasilia,
 # = 09h e 23h UTC - Brasil nao tem horario de verao desde 2019, entao esse
-# offset fixo de -3h nao muda ao longo do ano) pra uma janela deslizante dos
-# ultimos 2 dias ate hoje, sem depender do PC da Ivna estar ligado - mesmo
+# offset fixo de -3h nao muda ao longo do ano) pra uma janela deslizante do
+# ultimo dia ate hoje, sem depender do PC da Ivna estar ligado - mesmo
 # motivo do titan_watcher.py ter virado titan_cf_worker. Substitui a Tarefa
 # Agendada "TitanBackfillDiario" do Windows (ver rodar_titan_backfill_diario.ps1)
 # - desativar essa tarefa localmente depois de confirmar que isso funciona,
 # pra nao rodar em duplicidade (upsert e idempotente, mas gasta tempo/execucao
 # a toa).
 #
-# 2 dias (era 5, 11/09/2026, pedido direto da Maria): reduzido junto com a
-# adaptacao do backfill pra completar Eventos/Itens dos pedidos da propria
-# janela (ver _completar_eventos_itens em titan_backfill.py) - janela menor
-# = menos pedidos novos por rodada pra completar, dentro do timeout do job.
+# 1 dia (era 2, depois de ter sido 5 - 13/09/2026, pedido direto da Maria):
+# reduz ainda mais o volume novo de pedidos por rodada precisando completar
+# Eventos/Itens (ver _completar_eventos_itens em titan_backfill.py) - um
+# pedido so tem no maximo 2 chances (as 2 rodadas do mesmo dia) antes da
+# janela avancar e ele sair do escopo pra sempre; janela menor por si so
+# nao muda esse limite de chances, so reduz quantos pedidos novos competem
+# pelo orcamento de tempo em cada rodada.
 on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
@@ -25,11 +28,15 @@ jobs:
     runs-on: ubuntu-latest
     # titan_backfill.py faz UM export do painel 'Informação Pedido' pra
     # janela inteira (ate 3min so esperando o download, ver expect_download
-    # em titan_bi_scraper.exportar_dados_do_painel), completa Eventos/Itens
-    # dos pedidos novos desta janela (ate 10min, ver EVENTOS_JANELA_
-    # ORCAMENTO_SEGUNDOS) e por fim o recheck amplo de eventos/itens de todo
-    # o site (ate 30min, EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS). 60min da
-    # folga real pro pior caso.
+    # em titan_bi_scraper.exportar_dados_do_painel) e completa Eventos/Itens
+    # dos pedidos novos desta janela (ate 40min, ver EVENTOS_JANELA_
+    # ORCAMENTO_SEGUNDOS - AUMENTADO de 10 pra 40min em 13/09/2026, achado
+    # real: o job inteiro terminava em ~13min com o orcamento antigo de
+    # 10min, sobrando ~47min nao usados antes deste timeout-minutes de 60).
+    # O recheck amplo de qualquer pedido concluido do site inteiro
+    # (EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS) NAO roda mais aqui - saiu
+    # do fluxo principal a pedido da Maria (12/09/2026), so existe hoje via
+    # --so-recheck, acionado pelo titan_recheck_eventos.yml (desativado).
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -43,10 +50,10 @@ jobs:
           pip install playwright openpyxl
           playwright install --with-deps chromium
 
-      - name: Calcular janela de 2 dias
+      - name: Calcular janela de 1 dia
         id: janela
         run: |
-          echo "inicial=$(date -d '-2 days' +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
+          echo "inicial=$(date -d '-1 days' +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
           echo "final=$(date +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
 
       - name: Rodar backfill

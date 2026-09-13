@@ -129,10 +129,18 @@ EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 1800  # 30min
 
 # Orcamento pra _completar_eventos_itens (11/09/2026, pedido direto da
 # Maria): so cobre os pedidos DESTA janela do backfill que ainda estao com
-# eventos/itens nulos - volume bem menor que o recheck amplo acima (esse
-# cobre qualquer pedido concluido do site inteiro), entao um orcamento
-# menor ja basta na pratica.
-EVENTOS_JANELA_ORCAMENTO_SEGUNDOS = 600  # 10min
+# eventos/itens nulos.
+#
+# AUMENTADO de 600 pra 2400 (13/09/2026, achado real - run #44: o job
+# INTEIRO terminou em 13m24s, sendo que o timeout-minutes do workflow e 60
+# - ~47min de folga nao usada, porque o orcamento de eventos/itens (o
+# unico gargalo real, ver _completar_eventos_itens) sempre esgotava
+# primeiro, batendo o teto de 600s antes do job chegar perto do limite de
+# verdade. A pedido da Maria: 40min (2400s) da ~4x mais throughput por
+# rodada (~54 -> ~218 pedidos, no ritmo de ~11s/pedido) sem mexer em
+# nenhuma logica, so nesse numero - ainda deixa ampla margem antes do
+# timeout-minutes:60 do job.
+EVENTOS_JANELA_ORCAMENTO_SEGUNDOS = 2400  # 40min
 
 # Registro passo a passo visual (12/09/2026, pedido direto da Maria depois
 # do achado do "pbi-overlay-caret"): print de CADA acao (nao so do momento
