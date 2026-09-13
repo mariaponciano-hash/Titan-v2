@@ -84,12 +84,22 @@ jobs:
     # job razoavel. 20 instancias rodando ao mesmo tempo (limite de jobs
     # simultaneos de uma conta gratuita/pro do GitHub - o repo e publico,
     # entao os minutos de Actions em si sao gratis/ilimitados, so o
-    # PARALELISMO tem teto) multiplicam o throughput por 20 - cada uma loga
-    # separadamente no Titan e reivindica seu proprio lote via a RPC
-    # reivindicar_recheck_eventos (SELECT FOR UPDATE SKIP LOCKED - nenhuma
-    # instancia pega o mesmo pedido que outra, ver _completar_eventos_
-    # itens_worker em titan_backfill.py). fail-fast:false pra uma instancia
-    # com erro nao cancelar as outras 19.
+    # PARALELISMO tem teto) multiplicam o throughput por 20 - cada uma
+    # reivindica seu proprio lote via a RPC reivindicar_recheck_eventos
+    # (SELECT FOR UPDATE SKIP LOCKED - nenhuma instancia pega o mesmo
+    # pedido que outra, ver _completar_eventos_itens_worker em
+    # titan_backfill.py). fail-fast:false pra uma instancia com erro nao
+    # cancelar as outras 19.
+    #
+    # Login SERIALIZADO entre as 20 instancias (achado real na run #45
+    # manual - 14 dos 20 workers falharam de uma vez com "Ainda na tela de
+    # login depois de tentar entrar": o Titan nao aceita bem varios logins
+    # concorrentes da MESMA conta - unica credencial que existe, Maria
+    # confirmou) - so o login em si espera a vez (lock curto no Supabase,
+    # ver _adquirir_lock_login/_liberar_lock_login em titan_backfill.py), o
+    # processamento de pedidos depois de logado continua em paralelo
+    # normalmente - serializar o worker INTEIRO devolveria o mesmo problema
+    # de throughput que a paralelizacao resolveu.
     strategy:
       fail-fast: false
       matrix:

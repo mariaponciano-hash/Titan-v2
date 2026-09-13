@@ -1018,6 +1018,68 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     return gravados, ignorados, lotes_com_erro
 
 
+def _adquirir_lock_login(lease_segundos=90, timeout_segundos=300, intervalo_segundos=3):
+    """
+    Lock atomico no Supabase (tabela titan_login_lock, RPC adquirir_lock_
+    login - mesmo padrao de UPDATE...WHERE condicional ja usado em
+    reivindicar_recheck_eventos, so que pra uma unica linha/lease em vez de
+    um lote) - SO serializa o LOGIN em si, nao o worker inteiro (13/09/2026,
+    achado real na run #45 manual: 14 dos 20 workers falharam com "Ainda na
+    tela de login depois de tentar entrar" - o Titan nao aceita bem varios
+    logins concorrentes da mesma conta, unica credencial que a Maria
+    confirmou existir). Serializar o worker INTEIRO (esperar um terminar
+    todo o processamento pra o proximo comecar) devolveria o mesmo problema
+    de throughput que a paralelizacao resolveu (~11s/pedido, sequencial,
+    nunca daria conta da janela numa rodada so) - por isso o lock cobre so
+    a janela curta do login, liberado logo em seguida (ver
+    _liberar_lock_login), deixando o processamento de pedidos em si rodar
+    em paralelo normalmente nos 20 workers.
+
+    lease_segundos e so uma rede de seguranca (o lock expira sozinho se
+    este worker cair/travar no meio do login sem chegar a liberar) - o
+    caminho normal e sempre liberar explicitamente logo depois do login
+    (sucesso ou falha), bem mais rapido que o lease. timeout_segundos e
+    quanto este worker aceita esperar a vez antes de desistir e propagar
+    erro (com 20 workers e login levando poucos segundos cada, 5min de
+    espera maxima e folga generosa).
+    """
+    inicio = time.monotonic()
+    while True:
+        try:
+            adquirido = titan_watcher._supabase_request(
+                "POST", "rpc/adquirir_lock_login", {"lease_segundos": lease_segundos}
+            )
+        except Exception as e:
+            # Falha de rede/timeout NA CHAMADA em si (nao "lock ocupado") -
+            # trata como "tenta de novo", nao desiste na 1a soletrada, ja
+            # que o timeout_segundos geral abaixo ja cobre o caso de ficar
+            # tentando pra sempre.
+            adquirido = False
+            print(f"Aviso: erro tentando adquirir o lock de login, tentando de novo: {e}", file=sys.stderr)
+        if adquirido:
+            return
+        if time.monotonic() - inicio > timeout_segundos:
+            raise RuntimeError(
+                f"Nao consegui adquirir o lock de login em {timeout_segundos}s - "
+                f"outro worker deve estar com o lock preso (lease de {lease_segundos}s "
+                f"deveria ter expirado sozinho nesse meio tempo)."
+            )
+        time.sleep(intervalo_segundos)
+
+
+def _liberar_lock_login():
+    """
+    Libera o lock ANTES do lease expirar (ver _adquirir_lock_login) - chamado
+    sempre num finally, tanto no sucesso quanto na falha do login, pro
+    proximo worker na fila nao precisar esperar o lease inteiro (~90s) so
+    porque este worker ja terminou de logar ha muito tempo.
+    """
+    try:
+        titan_watcher._supabase_request("POST", "rpc/liberar_lock_login", {})
+    except Exception as e:
+        print(f"Aviso: nao consegui liberar o lock de login (vai expirar sozinho pelo lease): {e}", file=sys.stderr)
+
+
 def _marcar_eventos_itens(numero_nf, marca, eventos, itens):
     """
     PATCH minimo - so eventos/itens/atualizado_em, SEM tocar em situacao/
@@ -1166,7 +1228,17 @@ def main():
         page = browser.new_page()
         try:
             print("Entrando no Titan BI...")
-            scraper.login(page, email, senha)
+            if args.completar_eventos_worker:
+                # So serializa o login quando roda como worker paralelo (ver
+                # _adquirir_lock_login) - export e --so-recheck rodam sempre
+                # como instancia unica, sem risco de login concorrente.
+                _adquirir_lock_login()
+                try:
+                    scraper.login(page, email, senha)
+                finally:
+                    _liberar_lock_login()
+            else:
+                scraper.login(page, email, senha)
 
             if args.so_recheck:
                 print("\n--so-recheck: pulando exportacao em massa, so reconferindo pedidos presos e sem eventos...")
