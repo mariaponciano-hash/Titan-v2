@@ -1265,6 +1265,23 @@ def main():
                 # So serializa o login quando roda como worker paralelo (ver
                 # _adquirir_lock_login) - export e --so-recheck rodam sempre
                 # como instancia unica, sem risco de login concorrente.
+                #
+                # AVALIADO E DESCARTADO (14/09/2026, pedido direto da Maria -
+                # "os workers devem partir dessa tela que ja foi logada sem
+                # precisar acessar novamente"): reaproveitar a sessao logada
+                # do job export (Playwright context.storage_state) num
+                # arquivo compartilhado via artifact - tecnicamente funciona,
+                # mas o repo e PUBLICO, e artifacts de workflow de repo
+                # publico podem ser baixados por qualquer conta do GitHub, nao
+                # so por quem tem acesso ao repo. Um arquivo de sessao contem
+                # os cookies de autenticacao REAIS - vazar isso e bem mais
+                # grave que vazar um log (da acesso de verdade ao Titan, sem
+                # precisar da senha). A propria Maria confirmou depois: os
+                # workers ja usam TITAN_EMAIL/TITAN_SENHA (Secrets do GitHub,
+                # nunca expostos em log/artifact) pra logar direto - nao
+                # precisa de um mecanismo novo com esse risco. A fila abaixo
+                # (login serializado) continua sendo o jeito de evitar o
+                # problema de login concorrente descoberto na run #45.
                 _adquirir_lock_login()
                 try:
                     scraper.login(page, email, senha)
