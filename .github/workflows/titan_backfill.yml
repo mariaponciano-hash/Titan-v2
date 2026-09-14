@@ -29,8 +29,9 @@ jobs:
     # So a exportacao nativa de 'Informação Pedido' pra janela inteira +
     # upsert no Supabase - rapido (~3-13min nos testes reais). Completar
     # Eventos/Itens NAO roda mais aqui (13/09/2026, pedido direto da Maria)
-    # - virou o job paralelo completar-eventos abaixo, pra nao competir
-    # pelo mesmo orcamento de tempo sequencial.
+    # - virou o job completar-eventos abaixo (20 instancias em SEQUENCIA,
+    # ver strategy.max-parallel nesse job pro porque deixou de ser
+    # paralelo), pra nao competir pelo mesmo orcamento de tempo deste job.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -90,33 +91,35 @@ jobs:
   completar-eventos:
     needs: export
     runs-on: ubuntu-latest
-    # PARALELISMO REAL (13/09/2026, pedido direto da Maria: "preciso que
-    # todos os pedidos sejam processados em uma unica rodada") - no ritmo
-    # de ~11s por pedido, uma unica instancia sequencial nunca daria conta
-    # de uma janela inteira (milhares de pedidos) dentro de um timeout de
-    # job razoavel. 20 instancias rodando ao mesmo tempo (limite de jobs
-    # simultaneos de uma conta gratuita/pro do GitHub - o repo e publico,
-    # entao os minutos de Actions em si sao gratis/ilimitados, so o
-    # PARALELISMO tem teto) multiplicam o throughput por 20 - cada uma
-    # processa so a sua FATIA fixa da lista de pendentes desta janela
-    # (baixada do job export acima via artifact, dividida por posicao - ver
-    # _fatia_do_worker em titan_backfill.py, 14/09/2026, pedido direto da
-    # Maria). Sem consultar o banco pra "pegar o proximo lote" e sem risco
-    # de duas instancias pegarem o mesmo pedido (fatias disjuntas por
-    # construcao). fail-fast:false pra uma instancia com erro nao cancelar
-    # as outras 19.
+    # UM WORKER POR VEZ (14/09/2026, pedido direto da Maria: "um worker so
+    # deve comecar a rodar quando o outro finalizar, fazendo um por vez") -
+    # max-parallel: 1 faz os 20 "workers" do matrix rodarem em SEQUENCIA,
+    # nao em paralelo, apesar do nome. Cada um processa so a sua FATIA fixa
+    # da lista de pendentes desta janela (baixada do job export via
+    # artifact, dividida por posicao - ver _fatia_do_worker em
+    # titan_backfill.py) - a divisao em 20 fatias continua so pra dar
+    # checkpoints/orcamentos de tempo (timeout-minutes:60 cada) em vez de 1
+    # job so gigante, nao pra paralelizar de verdade.
     #
-    # Login SERIALIZADO entre as 20 instancias (achado real na run #45
-    # manual - 14 dos 20 workers falharam de uma vez com "Ainda na tela de
-    # login depois de tentar entrar": o Titan nao aceita bem varios logins
-    # concorrentes da MESMA conta - unica credencial que existe, Maria
-    # confirmou) - so o login em si espera a vez (lock curto no Supabase,
-    # ver _adquirir_lock_login/_liberar_lock_login em titan_backfill.py), o
-    # processamento de pedidos depois de logado continua em paralelo
-    # normalmente - serializar o worker INTEIRO devolveria o mesmo problema
-    # de throughput que a paralelizacao resolveu.
+    # HISTORICO - por que isso deixou de ser paralelo de verdade: a
+    # primeira versao (13/09/2026, "preciso que todos os pedidos sejam
+    # processados em uma unica rodada") rodava as 20 instancias ao mesmo
+    # tempo, cada uma logada separadamente. Descobrimos em sequencia: (1)
+    # 20 logins simultaneos com a MESMA conta derrubavam a maioria com
+    # "Ainda na tela de login" (run #45) - corrigido com um lock de login;
+    # (2) mesmo com o lock, a run #50 mostrou 17 de 20 workers morrendo
+    # logo depois do login, redirecionados sozinhos pra "/login?reason=
+    # noUser" - o Titan parece derrubar a sessao ANTERIOR assim que uma
+    # NOVA sessao loga com a mesma conta, entao so sobrevivia quem abria o
+    # painel antes do proximo da fila logar (~3 de 20 processavam algo de
+    # verdade). Rodar 1 por vez elimina isso de raiz (nunca ha uma 2a
+    # sessao pra derrubar a 1a), ao custo real de throughput (~11s/pedido
+    # de uma unica instancia, nao mais 20x) - a Maria confirmou ciente
+    # desse trade-off. fail-fast:false continua util (um worker com erro
+    # nao cancela os que ainda vao rodar na fila).
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     timeout-minutes: 60

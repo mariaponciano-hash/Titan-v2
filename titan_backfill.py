@@ -27,36 +27,59 @@ seletor mas nao era:
    transparente que intercepta todo clique/hover seguinte. Precisa clicar no
    proprio backdrop (ver fechar_popup_calendario) e confirmar que sumiu.
 
-EVENTOS/ITENS - EXPORT + WORKERS PARALELOS COM FATIA FIXA (13-14/09/2026,
-pedido direto da Maria: "preciso que todos os pedidos sejam processados em
-uma unica rodada"): a exportacao em massa de "Informacao Pedido" (Romaneio,
-Situacao, datas etc.) continua um passo UNICO e rapido (ver
-exportar_e_gravar_periodo). Completar Eventos/Itens (clicar pedido por
-pedido, ~11s cada - ver _ler_eventos_itens_via_filtro_cruzado) NAO roda
-mais dentro deste mesmo passo sequencial - uma unica instancia nunca
-daria conta de milhares de pedidos dentro de um timeout de job razoavel.
-Em vez disso, exportar_e_gravar_periodo levanta a lista de pendentes
-DESTA janela (eventos OU itens nulos - ver _buscar_pendentes_eventos_
-itens) e grava num arquivo (ARQUIVO_PENDENTES_EVENTOS_ITENS); esse arquivo
-viaja via artifact pro job completar-eventos, que roda --completar-
-eventos-worker em N instancias em PARALELO (ver strategy.matrix no
-workflow, hoje N=20) - cada uma logada separadamente no Titan, processando
-so a sua FATIA fixa da lista por posicao (ver _fatia_do_worker), sem
-round-trip nenhum no banco pra "pegar o proximo lote" e sem risco de duas
-instancias pegarem o mesmo pedido (fatias disjuntas por construcao).
+EVENTOS/ITENS - EXPORT + WORKERS EM FATIA FIXA, UM POR VEZ (13-14/09/2026):
+a exportacao em massa de "Informacao Pedido" (Romaneio, Situacao, datas
+etc.) continua um passo UNICO e rapido (ver exportar_e_gravar_periodo).
+Completar Eventos/Itens (clicar pedido por pedido, ~11s cada - ver
+_ler_eventos_itens_via_filtro_cruzado) NAO roda dentro deste mesmo passo -
+exportar_e_gravar_periodo levanta a lista de pendentes DESTA janela
+(eventos OU itens nulos - ver _buscar_pendentes_eventos_itens) e grava num
+arquivo (ARQUIVO_PENDENTES_EVENTOS_ITENS); esse arquivo viaja via artifact
+pro job completar-eventos, que roda --completar-eventos-worker em N
+"instancias" (ver strategy.matrix no workflow, hoje N=20) - cada uma
+processando so a sua FATIA fixa da lista por posicao (ver
+_fatia_do_worker), sem round-trip nenhum no banco pra "pegar o proximo
+lote" e sem risco de duas instancias pegarem o mesmo pedido (fatias
+disjuntas por construcao).
 
-Essa e a 2a versao deste desenho - a 1a (13/09/2026) reivindicava lotes
-via uma RPC (reivindicar_recheck_eventos, SELECT FOR UPDATE SKIP LOCKED)
-que cobria o backlog INTEIRO de pedidos concluidos com eventos nulo
-(qualquer data, nao so desta janela) - bom pra tambem zerar backlog antigo
-como efeito colateral, mas exigia o worker configurar um periodo de datas
-amplo no Titan pra achar pedidos antigos, o que nunca foi implementado
-(achado real na run #48 manual - "Nenhum elemento visivel encontrado" em
-quase todo pedido, porque o periodo padrao do Titan pos-login e estreito/
-recente). A Maria decidiu voltar a escopar isso so pra esta janela
-(14/09/2026) - o backlog antigo fica de fora do escopo automatico de novo,
-mesma situacao de antes de 13/09 (titan_recheck_eventos.yml, que cobre
-esse caso, continua desativado).
+Apesar do nome "workers", elas rodam em SEQUENCIA (strategy.max-parallel:
+1), nao em paralelo - 3a versao deste desenho, depois de duas tentativas
+de paralelismo de verdade que esbarraram no mesmo tipo de problema:
+1. (13/09/2026, pedido direto da Maria: "preciso que todos os pedidos
+   sejam processados em uma unica rodada") 20 instancias rodando ao mesmo
+   tempo, cada uma logada separadamente - 20 logins simultaneos com a
+   MESMA conta derrubavam a maioria com "Ainda na tela de login" (run
+   #45). Corrigido com um lock de login (so o login esperava a vez, o
+   processamento continuava paralelo).
+2. Mesmo com o lock, a run #50 manual mostrou 17 de 20 workers morrendo
+   logo apos o login, redirecionados sozinhos pra "/login?reason=noUser" -
+   o Titan parece derrubar a sessao ANTERIOR assim que uma NOVA sessao
+   loga com a mesma conta (nao so rejeitar logins simultaneos). So
+   sobrevivia quem abria o painel antes do proximo da fila logar (~3 de
+   20 processavam algo de verdade - os outros 17 so gastavam minutos de
+   Actions a toa).
+A Maria decidiu (14/09/2026) rodar 1 worker por vez (strategy.max-
+parallel: 1) - elimina o problema de raiz (nunca ha uma 2a sessao ativa
+pra derrubar a 1a), ciente do trade-off real: throughput volta ao teto de
+~11s/pedido de uma unica instancia, nao mais paralelizado - nao da mais
+pra zerar uma janela de dezenas de milhares de pedidos numa unica rodada,
+mas usa o tempo de Actions de verdade em vez de desperdicar a maioria em
+logins que nunca chegam a processar nada. O lock de login (titan_login_
+lock/_adquirir_lock_login/_liberar_lock_login) virou redundante com
+max-parallel:1 e foi removido.
+
+O escopo tambem ja tinha voltado a ser so esta janela antes disso -
+a 1a versao do desenho (13/09/2026) reivindicava lotes via uma RPC
+(reivindicar_recheck_eventos, SELECT FOR UPDATE SKIP LOCKED) que cobria o
+backlog INTEIRO de pedidos concluidos com eventos nulo (qualquer data),
+bom pra tambem zerar backlog antigo como efeito colateral, mas exigia o
+worker configurar um periodo de datas amplo no Titan pra achar pedidos
+antigos, o que nunca foi implementado (achado real na run #48 manual -
+"Nenhum elemento visivel encontrado" em quase todo pedido, porque o
+periodo padrao do Titan pos-login e estreito/recente). A Maria decidiu
+voltar a escopar isso so pra esta janela (14/09/2026) - o backlog antigo
+fica de fora do escopo automatico, mesma situacao de antes de 13/09
+(titan_recheck_eventos.yml, que cobre esse caso, continua desativado).
 
 COLETA VIA EXPORTACAO NATIVA, NAO SCROLL (25/08/2026, achado real pela
 Ivna): a versao anterior lia a tabela "Informacao Pedido" rolando (ela e
@@ -979,73 +1002,6 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     return gravados, ignorados, lotes_com_erro
 
 
-def _adquirir_lock_login(lease_segundos=90, timeout_segundos=1500, intervalo_segundos=3):
-    """
-    Lock atomico no Supabase (tabela titan_login_lock, RPC adquirir_lock_
-    login - mesmo padrao de UPDATE...WHERE condicional ja usado em
-    reivindicar_recheck_eventos, so que pra uma unica linha/lease em vez de
-    um lote) - SO serializa o LOGIN em si, nao o worker inteiro (13/09/2026,
-    achado real na run #45 manual: 14 dos 20 workers falharam com "Ainda na
-    tela de login depois de tentar entrar" - o Titan nao aceita bem varios
-    logins concorrentes da mesma conta, unica credencial que a Maria
-    confirmou existir). Serializar o worker INTEIRO (esperar um terminar
-    todo o processamento pra o proximo comecar) devolveria o mesmo problema
-    de throughput que a paralelizacao resolveu (~11s/pedido, sequencial,
-    nunca daria conta da janela numa rodada so) - por isso o lock cobre so
-    a janela curta do login, liberado logo em seguida (ver
-    _liberar_lock_login), deixando o processamento de pedidos em si rodar
-    em paralelo normalmente nos 20 workers.
-
-    lease_segundos e so uma rede de seguranca (o lock expira sozinho se
-    este worker cair/travar no meio do login sem chegar a liberar) - o
-    caminho normal e sempre liberar explicitamente logo depois do login
-    (sucesso ou falha), bem mais rapido que o lease. timeout_segundos e
-    quanto este worker aceita esperar a vez antes de desistir e propagar
-    erro - AUMENTADO de 5min pra 25min (13/09/2026, achado real na run #47
-    manual: com 20 workers na fila, 5min nao foi suficiente pros ultimos
-    da fila - varios derrubaram com "Nao consegui adquirir o lock" antes
-    mesmo de conseguir logar uma vez. Pior caso teorico (todo mundo na
-    frente demorando o lease inteiro de 90s antes de liberar) e ~19*90s =
-    28,5min - 25min fica perto disso com folga, ainda deixando tempo real
-    de processamento antes do timeout-minutes:60 do job no workflow).
-    """
-    inicio = time.monotonic()
-    while True:
-        try:
-            adquirido = titan_watcher._supabase_request(
-                "POST", "rpc/adquirir_lock_login", {"lease_segundos": lease_segundos}
-            )
-        except Exception as e:
-            # Falha de rede/timeout NA CHAMADA em si (nao "lock ocupado") -
-            # trata como "tenta de novo", nao desiste na 1a soletrada, ja
-            # que o timeout_segundos geral abaixo ja cobre o caso de ficar
-            # tentando pra sempre.
-            adquirido = False
-            print(f"Aviso: erro tentando adquirir o lock de login, tentando de novo: {e}", file=sys.stderr)
-        if adquirido:
-            return
-        if time.monotonic() - inicio > timeout_segundos:
-            raise RuntimeError(
-                f"Nao consegui adquirir o lock de login em {timeout_segundos}s - "
-                f"outro worker deve estar com o lock preso (lease de {lease_segundos}s "
-                f"deveria ter expirado sozinho nesse meio tempo)."
-            )
-        time.sleep(intervalo_segundos)
-
-
-def _liberar_lock_login():
-    """
-    Libera o lock ANTES do lease expirar (ver _adquirir_lock_login) - chamado
-    sempre num finally, tanto no sucesso quanto na falha do login, pro
-    proximo worker na fila nao precisar esperar o lease inteiro (~90s) so
-    porque este worker ja terminou de logar ha muito tempo.
-    """
-    try:
-        titan_watcher._supabase_request("POST", "rpc/liberar_lock_login", {})
-    except Exception as e:
-        print(f"Aviso: nao consegui liberar o lock de login (vai expirar sozinho pelo lease): {e}", file=sys.stderr)
-
-
 def _marcar_eventos_itens(numero_nf, marca, eventos, itens):
     """
     PATCH minimo - so eventos/itens/atualizado_em, SEM tocar em situacao/
@@ -1102,23 +1058,40 @@ def _fatia_do_worker(lista, worker_index, total_workers):
 def _completar_eventos_itens_worker(page, orcamento_segundos, worker_index, total_workers,
                                      arquivo_pendentes=ARQUIVO_PENDENTES_EVENTOS_ITENS):
     """
-    Modo standalone (--completar-eventos-worker) pensado pra rodar em
-    VARIAS instancias em paralelo ao mesmo tempo (ver strategy.matrix no
-    workflow) - pedido direto da Maria (13/09/2026): "preciso que todos os
-    pedidos sejam processados em uma unica rodada". No ritmo de ~11s por
-    pedido, uma unica instancia sequencial NUNCA daria conta de uma janela
-    inteira (milhares de pedidos) dentro de um timeout de job razoavel -
-    so paralelizar de verdade (N instancias simultaneas, cada uma logada
-    separadamente no Titan) multiplica o throughput por N.
+    Modo standalone (--completar-eventos-worker), pensado originalmente
+    (13/09/2026, pedido direto da Maria: "preciso que todos os pedidos
+    sejam processados em uma unica rodada") pra rodar em VARIAS instancias
+    em paralelo ao mesmo tempo - mas hoje roda uma instancia POR VEZ (ver
+    strategy.max-parallel: 1 no workflow, 14/09/2026, pedido direto da
+    Maria: "um worker so deve comecar a rodar quando o outro finalizar,
+    fazendo um por vez").
+
+    HISTORICO desta mudanca (14/09/2026): run #50 manual, com login e RPC
+    ja corrigidos (ver historico na docstring de exportar_e_gravar_periodo),
+    mostrou 17 dos 20 workers morrendo de cara com o Playwright navegando
+    sozinho pra "titanbi.com.br/login?reason=noUser" bem depois do login ja
+    ter dado certo - ou seja, o Titan parece derrubar a sessao ANTERIOR
+    quando uma NOVA sessao loga com a mesma conta (nao so rejeitar logins
+    simultaneos, que ja tinhamos corrigido com o lock de login). Com 20
+    logins em fila rapida, so sobrevivia quem conseguia abrir o painel
+    antes do proximo da fila logar - so ~3 de 20 workers processavam
+    qualquer coisa de verdade, o resto so gastava minutos de Actions a toa.
+    Rodar 1 worker por vez elimina esse problema de raiz (nunca ha uma
+    2a sessao ativa que possa derrubar a 1a), ao custo real de throughput -
+    a Maria confirmou ciente que isso volta ao teto de ~11s/pedido de uma
+    unica instancia (nao da mais pra zerar uma janela de dezenas de
+    milhares de pedidos numa unica rodada, mas usa o tempo de Actions de
+    verdade em vez de desperdicar a maioria em logins que nunca processam
+    nada). O lock de login (titan_login_lock/_adquirir_lock_login/
+    _liberar_lock_login) virou redundante com max-parallel:1 (nunca ha
+    2 workers rodando ao mesmo tempo pra disputar o lock) e foi removido.
 
     Le a lista de pendentes desta janela (gravada por exportar_e_gravar_
     periodo em `arquivo_pendentes`, baixada via artifact no workflow - ver
     _buscar_pendentes_eventos_itens) e processa SO a fatia correspondente a
     `worker_index` (ver _fatia_do_worker) - lista fixa, dividida por
-    posicao entre os 20 workers, SEM reivindicar nada via banco (14/09/2026,
-    pedido direto da Maria - ver o HISTORICO na docstring de
-    exportar_e_gravar_periodo pro porque isso substituiu a 1a versao via
-    RPC reivindicar_recheck_eventos).
+    posicao entre os 20 workers (agora executados em sequencia, nao em
+    paralelo), SEM reivindicar nada via banco.
 
     Filtra direto por "Numero do pedido" quando o pedido tem esse dado (ver
     _ler_eventos_itens_via_filtro_cruzado) - so cai de volta pra filtrar
@@ -1261,34 +1234,35 @@ def main():
         page = browser.new_page()
         try:
             print("Entrando no Titan BI...")
-            if args.completar_eventos_worker:
-                # So serializa o login quando roda como worker paralelo (ver
-                # _adquirir_lock_login) - export e --so-recheck rodam sempre
-                # como instancia unica, sem risco de login concorrente.
-                #
-                # AVALIADO E DESCARTADO (14/09/2026, pedido direto da Maria -
-                # "os workers devem partir dessa tela que ja foi logada sem
-                # precisar acessar novamente"): reaproveitar a sessao logada
-                # do job export (Playwright context.storage_state) num
-                # arquivo compartilhado via artifact - tecnicamente funciona,
-                # mas o repo e PUBLICO, e artifacts de workflow de repo
-                # publico podem ser baixados por qualquer conta do GitHub, nao
-                # so por quem tem acesso ao repo. Um arquivo de sessao contem
-                # os cookies de autenticacao REAIS - vazar isso e bem mais
-                # grave que vazar um log (da acesso de verdade ao Titan, sem
-                # precisar da senha). A propria Maria confirmou depois: os
-                # workers ja usam TITAN_EMAIL/TITAN_SENHA (Secrets do GitHub,
-                # nunca expostos em log/artifact) pra logar direto - nao
-                # precisa de um mecanismo novo com esse risco. A fila abaixo
-                # (login serializado) continua sendo o jeito de evitar o
-                # problema de login concorrente descoberto na run #45.
-                _adquirir_lock_login()
-                try:
-                    scraper.login(page, email, senha)
-                finally:
-                    _liberar_lock_login()
-            else:
-                scraper.login(page, email, senha)
+            # SEM lock/fila de login (14/09/2026, pedido direto da Maria -
+            # "um worker só deve começar a rodar quando o outro finalizar,
+            # fazendo um por vez"): so pode existir 1 worker do
+            # completar-eventos rodando por vez agora (strategy.max-parallel:
+            # 1 no workflow), entao nunca ha dois logins concorrentes - o
+            # lock atomico no Supabase (titan_login_lock/adquirir_lock_login/
+            # liberar_lock_login) que serializava so o login virou
+            # redundante e foi removido. Ver docstring de
+            # _completar_eventos_itens_worker pro HISTORICO completo de como
+            # chegamos aqui (raiz real: o Titan parece derrubar a sessao
+            # ANTERIOR quando uma nova login com a mesma conta acontece, nao
+            # so rejeitar logins simultaneos - so um worker ativo por vez
+            # evita isso de vez, ao custo de rodar tudo sequencial).
+            #
+            # AVALIADO E DESCARTADO (14/09/2026, pedido direto da Maria -
+            # "os workers devem partir dessa tela que ja foi logada sem
+            # precisar acessar novamente"): reaproveitar a sessao logada
+            # do job export (Playwright context.storage_state) num
+            # arquivo compartilhado via artifact - tecnicamente funciona,
+            # mas o repo e PUBLICO, e artifacts de workflow de repo
+            # publico podem ser baixados por qualquer conta do GitHub, nao
+            # so por quem tem acesso ao repo. Um arquivo de sessao contem
+            # os cookies de autenticacao REAIS - vazar isso e bem mais
+            # grave que vazar um log (da acesso de verdade ao Titan, sem
+            # precisar da senha). A propria Maria confirmou depois: os
+            # workers ja usam TITAN_EMAIL/TITAN_SENHA (Secrets do GitHub,
+            # nunca expostos em log/artifact) pra logar direto - nao
+            # precisa de um mecanismo novo com esse risco.
+            scraper.login(page, email, senha)
 
             if args.so_recheck:
                 print("\n--so-recheck: pulando exportacao em massa, so reconferindo pedidos presos e sem eventos...")
