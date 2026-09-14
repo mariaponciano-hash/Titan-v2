@@ -74,6 +74,19 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      # Lista de pendentes desta janela (14/09/2026, pedido direto da Maria)
+      # - viaja pro job completar-eventos abaixo via artifact, que baixa e
+      # divide entre os 20 workers por posicao (ver ARQUIVO_PENDENTES_
+      # EVENTOS_ITENS/_fatia_do_worker em titan_backfill.py). retention-days
+      # baixo de proposito - so serve pra esta rodada, nao precisa ficar
+      # guardado.
+      - name: Subir lista de pendentes eventos/itens
+        uses: actions/upload-artifact@v7
+        with:
+          name: pendentes_eventos_itens
+          path: pendentes_eventos_itens.json
+          retention-days: 1
+
   completar-eventos:
     needs: export
     runs-on: ubuntu-latest
@@ -85,11 +98,13 @@ jobs:
     # simultaneos de uma conta gratuita/pro do GitHub - o repo e publico,
     # entao os minutos de Actions em si sao gratis/ilimitados, so o
     # PARALELISMO tem teto) multiplicam o throughput por 20 - cada uma
-    # reivindica seu proprio lote via a RPC reivindicar_recheck_eventos
-    # (SELECT FOR UPDATE SKIP LOCKED - nenhuma instancia pega o mesmo
-    # pedido que outra, ver _completar_eventos_itens_worker em
-    # titan_backfill.py). fail-fast:false pra uma instancia com erro nao
-    # cancelar as outras 19.
+    # processa so a sua FATIA fixa da lista de pendentes desta janela
+    # (baixada do job export acima via artifact, dividida por posicao - ver
+    # _fatia_do_worker em titan_backfill.py, 14/09/2026, pedido direto da
+    # Maria). Sem consultar o banco pra "pegar o proximo lote" e sem risco
+    # de duas instancias pegarem o mesmo pedido (fatias disjuntas por
+    # construcao). fail-fast:false pra uma instancia com erro nao cancelar
+    # as outras 19.
     #
     # Login SERIALIZADO entre as 20 instancias (achado real na run #45
     # manual - 14 dos 20 workers falharam de uma vez com "Ainda na tela de
@@ -117,12 +132,18 @@ jobs:
           pip install playwright openpyxl
           playwright install --with-deps chromium
 
+      - name: Baixar lista de pendentes eventos/itens
+        uses: actions/download-artifact@v7
+        with:
+          name: pendentes_eventos_itens
+
       - name: Completar eventos/itens (worker ${{ matrix.worker }}/20)
         env:
           TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
           TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
         run: |
-          python titan_backfill.py --completar-eventos-worker --headless
+          python titan_backfill.py --completar-eventos-worker \
+            --worker-index ${{ matrix.worker }} --total-workers 20 --headless
 
       - name: Subir diagnostico (se tiver)
         if: always()
