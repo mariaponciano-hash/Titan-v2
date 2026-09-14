@@ -832,6 +832,20 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     _completar_eventos_itens_worker, que roda depois disso num job
     paralelo separado (strategy.matrix no workflow).
     """
+    # Garante que o arquivo SEMPRE existe, mesmo vazio, antes de qualquer
+    # "return" antecipado abaixo (14/09/2026, achado real: um re-run manual
+    # da run #51 bateu na instabilidade JA CONHECIDA do filtro de periodo
+    # nao aplicar a tempo - ver _validar_filtro_aplicado - fazendo esta
+    # funcao devolver (0, 0, 0) sem nunca chegar na parte que grava a lista
+    # de pendentes mais abaixo. Sem o arquivo, o passo "Subir lista de
+    # pendentes eventos/itens" do workflow nao tinha nada pra subir, e os
+    # 20 workers do job completar-eventos falhavam de cara com "Artifact
+    # not found" - um erro em cascata sem nenhuma relacao com pedido,
+    # sessao ou periodo, so falta de tratamento pra esta janela nao ter
+    # achado nada pra gravar desta vez). Fica sobrescrito mais abaixo se a
+    # funcao chegar ate la com registros de verdade.
+    ARQUIVO_PENDENTES_EVENTOS_ITENS.write_text("[]", encoding="utf-8")
+
     registros = []
     filtro_ok = False
     for tentativa in range(1, tentativas + 1):
