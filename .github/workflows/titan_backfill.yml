@@ -11,12 +11,12 @@ name: Titan backfill diario
 # a toa).
 #
 # 1 dia (era 2, depois de ter sido 5 - 13/09/2026, pedido direto da Maria):
-# reduz ainda mais o volume novo de pedidos por rodada precisando completar
-# Eventos/Itens (ver job completar-eventos abaixo) - um pedido so tem no
-# maximo 2 chances (as 2 rodadas do mesmo dia) antes da janela avancar e
-# ele sair do escopo pra sempre; janela menor por si so nao muda esse
-# limite de chances, so reduz quantos pedidos novos competem pelos workers
-# em cada rodada.
+# reduz o volume novo de pedidos por rodada - um pedido so tem no maximo 2
+# chances (as 2 rodadas do mesmo dia) antes da janela avancar e ele sair do
+# escopo pra sempre. O motivo original (competir pelos 20 workers do job
+# completar-eventos) nao existe mais desde 16/09/2026 (job removido, itens
+# agora vem de uma consulta em lote ao Metabase - ver ITENS VIA METABASE em
+# titan_backfill.py), mas o tamanho da janela em si nao foi revisto.
 on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
@@ -26,12 +26,13 @@ on:
 jobs:
   export:
     runs-on: ubuntu-latest
-    # So a exportacao nativa de 'Informação Pedido' pra janela inteira +
-    # upsert no Supabase - rapido (~3-13min nos testes reais). Completar
-    # Eventos/Itens NAO roda mais aqui (13/09/2026, pedido direto da Maria)
-    # - virou o job completar-eventos abaixo (20 instancias em SEQUENCIA,
-    # ver strategy.max-parallel nesse job pro porque deixou de ser
-    # paralelo), pra nao competir pelo mesmo orcamento de tempo deste job.
+    # Exportacao nativa de 'Informação Pedido' pra janela inteira + upsert
+    # no Supabase + busca de Itens no Metabase (16/09/2026, ver ITENS VIA
+    # METABASE em titan_backfill.py) - tudo num job so agora. O job
+    # completar-eventos (20 "workers" em sequencia, clique-por-pedido no
+    # Titan) foi REMOVIDO junto com essa mudanca: eventos saiu do escopo do
+    # backfill, e itens agora vem de uma consulta em lote ao Metabase
+    # dentro deste mesmo job, sem precisar de artifact nem de job separado.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -55,6 +56,8 @@ jobs:
         env:
           TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
           TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
+          METABASE_URL: ${{ secrets.METABASE_URL }}
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
         run: |
           python titan_backfill.py \
             --data-inicial "${{ steps.janela.outputs.inicial }}" \
@@ -71,88 +74,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: titan_debug_export
-          path: titan_debug/
-          retention-days: 7
-          if-no-files-found: ignore
-
-      # Lista de pendentes desta janela (14/09/2026, pedido direto da Maria)
-      # - viaja pro job completar-eventos abaixo via artifact, que baixa e
-      # divide entre os 20 workers por posicao (ver ARQUIVO_PENDENTES_
-      # EVENTOS_ITENS/_fatia_do_worker em titan_backfill.py). retention-days
-      # baixo de proposito - so serve pra esta rodada, nao precisa ficar
-      # guardado.
-      - name: Subir lista de pendentes eventos/itens
-        uses: actions/upload-artifact@v7
-        with:
-          name: pendentes_eventos_itens
-          path: pendentes_eventos_itens.json
-          retention-days: 1
-
-  completar-eventos:
-    needs: export
-    runs-on: ubuntu-latest
-    # UM WORKER POR VEZ (14/09/2026, pedido direto da Maria: "um worker so
-    # deve comecar a rodar quando o outro finalizar, fazendo um por vez") -
-    # max-parallel: 1 faz os 20 "workers" do matrix rodarem em SEQUENCIA,
-    # nao em paralelo, apesar do nome. Cada um processa so a sua FATIA fixa
-    # da lista de pendentes desta janela (baixada do job export via
-    # artifact, dividida por posicao - ver _fatia_do_worker em
-    # titan_backfill.py) - a divisao em 20 fatias continua so pra dar
-    # checkpoints/orcamentos de tempo (timeout-minutes:60 cada) em vez de 1
-    # job so gigante, nao pra paralelizar de verdade.
-    #
-    # HISTORICO - por que isso deixou de ser paralelo de verdade: a
-    # primeira versao (13/09/2026, "preciso que todos os pedidos sejam
-    # processados em uma unica rodada") rodava as 20 instancias ao mesmo
-    # tempo, cada uma logada separadamente. Descobrimos em sequencia: (1)
-    # 20 logins simultaneos com a MESMA conta derrubavam a maioria com
-    # "Ainda na tela de login" (run #45) - corrigido com um lock de login;
-    # (2) mesmo com o lock, a run #50 mostrou 17 de 20 workers morrendo
-    # logo depois do login, redirecionados sozinhos pra "/login?reason=
-    # noUser" - o Titan parece derrubar a sessao ANTERIOR assim que uma
-    # NOVA sessao loga com a mesma conta, entao so sobrevivia quem abria o
-    # painel antes do proximo da fila logar (~3 de 20 processavam algo de
-    # verdade). Rodar 1 por vez elimina isso de raiz (nunca ha uma 2a
-    # sessao pra derrubar a 1a), ao custo real de throughput (~11s/pedido
-    # de uma unica instancia, nao mais 20x) - a Maria confirmou ciente
-    # desse trade-off. fail-fast:false continua util (um worker com erro
-    # nao cancela os que ainda vao rodar na fila).
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-
-      - name: Instalar dependencias
-        run: |
-          pip install playwright openpyxl
-          playwright install --with-deps chromium
-
-      - name: Baixar lista de pendentes eventos/itens
-        uses: actions/download-artifact@v7
-        with:
-          name: pendentes_eventos_itens
-
-      - name: Completar eventos/itens (worker ${{ matrix.worker }}/20)
-        env:
-          TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
-          TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
-        run: |
-          python titan_backfill.py --completar-eventos-worker \
-            --worker-index ${{ matrix.worker }} --total-workers 20 --headless
-
-      - name: Subir diagnostico (se tiver)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: titan_debug_worker_${{ matrix.worker }}
           path: titan_debug/
           retention-days: 7
           if-no-files-found: ignore

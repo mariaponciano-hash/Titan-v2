@@ -81,6 +81,32 @@ voltar a escopar isso so pra esta janela (14/09/2026) - o backlog antigo
 fica de fora do escopo automatico, mesma situacao de antes de 13/09
 (titan_recheck_eventos.yml, que cobre esse caso, continua desativado).
 
+ITENS VIA METABASE, EVENTOS SAIU DO ESCOPO (16/09/2026, pedido direto da
+Maria): "backfill nao precisa mais buscar itens e eventos no titan" - todo
+o mecanismo de clique-por-pedido acima (job completar-eventos, 20
+"workers" em sequencia, _ler_eventos_itens_via_filtro_cruzado e toda a
+infraestrutura ao redor) foi REMOVIDO. Eventos deixou de ser
+responsabilidade deste script (nao entrou na lista de colunas que a Maria
+pediu pra manter) - quem ainda tiver eventos=NULL fica assim ate outro
+mecanismo cobrir isso (nenhum decidido ainda). Itens continua sendo
+preenchido, mas agora vem do Metabase (gold.shopify_order_items, banco
+"Data Mart"/database_id 43 - mesma fonte e mesmo schema de JSON usados no
+backfill manual de itens feito em 14-15/09/2026 pra rituaria/barbours/
+kokeshi/apice - ver _buscar_itens_via_metabase) em vez de clicar pedido
+por pedido no Titan: mais rapido (uma query em lote por marca, no mesmo
+job, sem precisar de workers/matrix/artifact) e nao depende mais de
+sessao/navegacao instavel no Power BI pra esse dado especifico. Autenticado
+via API Key (METABASE_API_KEY, Secret do GitHub) - a conta da Maria no
+Metabase nao tinha admin pra criar isso sozinha, uma pessoa com acesso de
+admin gerou a chave e ela foi cadastrada como secret.
+
+numero_pedido virou fill-only-if-empty (16/09/2026, mesmo pedido): antes
+sempre sobrescrevia quando dava pra derivar (ver historico anterior desta
+secao, 04/09/2026); agora so entra no payload quando a linha AINDA nao tem
+numero_pedido no Supabase (ver _buscar_numero_pedido_ja_preenchido) - nunca
+sobrescreve um valor ja gravado por outra fonte (ex: consulta avulsa da
+Torre via titan_watcher.py).
+
 COLETA VIA EXPORTACAO NATIVA, NAO SCROLL (25/08/2026, achado real pela
 Ivna): a versao anterior lia a tabela "Informacao Pedido" rolando (ela e
 virtualizada pelo Power BI - so ~16-20 linhas no DOM por vez) e acumulava por
@@ -110,7 +136,6 @@ import argparse
 import datetime
 import json
 import os
-import re
 import sys
 import time
 import urllib.parse
@@ -134,6 +159,21 @@ TABELA_FALHAS = "infos_titan_falhas_backfill"
 TAMANHO_LOTE = 200  # registros por chamada ao Supabase - evita 1 request por pedido
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabalho - o arquivo e apagado apos o upload
 
+# Metabase (16/09/2026, ver ITENS VIA METABASE no topo do arquivo) - mesmo
+# banco "Data Mart" ja usado no backfill manual de itens (14-15/09/2026).
+# METABASE_API_KEY vem de um Secret do GitHub (a conta da Maria no Metabase
+# nao e admin, entao a chave foi gerada por quem tem acesso de admin e so
+# cadastrada aqui - nunca commitada).
+METABASE_URL = os.environ.get("METABASE_URL", "https://metabase.gobeaute.com.br")
+METABASE_API_KEY = os.environ.get("METABASE_API_KEY")
+METABASE_DATABASE_ID = 43  # "Data Mart"
+
+# "marca" (usado no infos_titan/na Torre) so difere do "brand" do Metabase
+# pra by samia - marca tem espaco, brand tem underscore (mesma pegadinha ja
+# documentada em outros lugares deste projeto). Toda outra marca bate igual
+# (rituaria, barbours, kokeshi, apice, lescent, aua, yenzah).
+MARCA_PARA_BRAND_SHOPIFY = {"by samia": "by_samia"}
+
 # RECHECK DE SITUACAO PRESA (28/08/2026, achado real pela Ivna): a janela do
 # backfill acima e sempre "ultimos 5 dias corridos" - um pedido importado ha
 # mais de 5 dias que AINDA nao chegou em situacao final (EMBARCADO/
@@ -149,48 +189,18 @@ RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - deixa margem dentro do timeout do jo
 # Achado real (01/09/2026, reportado pela Ivna - pedido SH1197313KS/NF
 # 1197313/marca kokeshi sem tabela Eventos na Unilog CD apesar de ja estar
 # EMBARCADO): pedido descoberto so pelo backfill (que de proposito nao
-# coleta Eventos/Itens - ver LIMITACAO no topo do arquivo) fica com
-# eventos=NULL pra sempre se a situacao ja for final - buscar_situacao_presa
-# acima ignora de proposito EMBARCADO/CANCELADO (a situacao em si esta
-# certa, so falta Eventos/Itens). O unico outro caminho (server.ts
-# reenfileirar quando 'concluido' sem eventos, ver commit dad290a) so
-# dispara se alguem repetir a solicitacao daquela NF pela Torre - nao roda
-# sozinho. Confirmado >=1000 pedidos reais nesse estado via query direta no
-# Supabase (bateu o teto de 1000 da API, o numero real pode ser maior).
+# coleta Eventos - ver ITENS VIA METABASE, EVENTOS SAIU DO ESCOPO no topo
+# do arquivo) fica com eventos=NULL pra sempre se a situacao ja for final -
+# buscar_situacao_presa acima ignora de proposito EMBARCADO/CANCELADO (a
+# situacao em si esta certa, so falta Eventos). O unico outro caminho
+# (server.ts reenfileirar quando 'concluido' sem eventos, ver commit
+# dad290a) so dispara se alguem repetir a solicitacao daquela NF pela
+# Torre - nao roda sozinho. Confirmado >=1000 pedidos reais nesse estado
+# via query direta no Supabase (bateu o teto de 1000 da API, o numero real
+# pode ser maior) - eventos ficou fora do escopo do backfill de vez em
+# 16/09/2026, esse backlog nao e mais alvo de nenhum mecanismo automatico
+# aqui.
 #
-# ORCAMENTO AUMENTADO de 600 pra 1800 (08/09/2026, pedido real da Ivna -
-# "muitos pedidos ja embarcados sem eventos"): com 10min (a ~15-20s por
-# pedido, por causa da navegacao real via Playwright) so dava pra reconferir
-# ~30-40 pedidos por rodada, 2x/dia - contra um backlog de 1000+, levaria
-# semanas pra zerar. 30min da ~3x mais throughput por rodada. Aumentado
-# junto com timeout-minutes do job em titan_backfill.yml (50 -> 90) pra
-# sobrar margem real (exportacao principal + recheck de situacao presa +
-# este recheck, todos dentro do mesmo job).
-EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS = 1800  # 30min
-
-# Orcamento padrao de CADA instancia do worker paralelo de eventos/itens
-# (--completar-eventos-worker, ver _completar_eventos_itens_worker) -
-# substituiu o antigo EVENTOS_JANELA_ORCAMENTO_SEGUNDOS (11/09/2026, so
-# uma instancia sequencial dentro do proprio job de export - REMOVIDO em
-# 13/09/2026, pedido direto da Maria: "preciso que todos os pedidos sejam
-# processados em uma unica rodada". No ritmo de ~11s/pedido, uma unica
-# instancia sequencial nunca daria conta de uma janela inteira - so
-# paralelizar de verdade (N instancias simultaneas, ver strategy.matrix no
-# workflow) multiplica o throughput por N. 55min (3300s) deixa margem
-# real dentro do timeout-minutes do job paralelo (60min) pro login,
-# processar sua fatia da lista e desligar o browser de forma limpa.
-EVENTOS_WORKER_ORCAMENTO_SEGUNDOS_PADRAO = 3300  # 55min
-
-# Lista de pedidos desta janela sem eventos/itens, gravada pelo job export
-# e lida pelos 20 workers paralelos do job completar-eventos (14/09/2026,
-# pedido direto da Maria - ver _buscar_pendentes_eventos_itens/
-# _fatia_do_worker/_completar_eventos_itens_worker). Caminho relativo
-# simples de proposito: os dois jobs rodam em checkouts frescos do repo no
-# mesmo diretorio de trabalho, e o arquivo viaja de um job pro outro via
-# upload-artifact/download-artifact (ver titan_backfill.yml) - nao precisa
-# de path absoluto nem sobrevive entre rodadas.
-ARQUIVO_PENDENTES_EVENTOS_ITENS = Path("pendentes_eventos_itens.json")
-
 # Achado real (11/09/2026, pedido da Maria): ordenar a fila so por
 # atualizado_em.asc (mais antigo primeiro) colocava um pedido RECEM-criado
 # pelo backfill no fim de uma fila de ~1,2 milhao de linhas antigas - na
@@ -300,92 +310,11 @@ def rechecar_situacoes_presas(page, orcamento_segundos=RECHECK_ORCAMENTO_SEGUNDO
     print(f"Recheck de situacao concluido: {processados} pedido(s) processado(s).")
 
 
-def buscar_concluidos_sem_eventos(limite=500, lease_minutos=20):
-    """
-    REIVINDICA (nao so le) ate `limite` pedidos status='concluido' com
-    eventos ainda NULL, chamando a funcao reivindicar_recheck_eventos no
-    Supabase (SELECT ... FOR UPDATE SKIP LOCKED por baixo, ver migracao
-    reivindicar_recheck_eventos).
-
-    Achado real (11/09/2026, pedido da Maria pra acelerar o backlog de
-    ~1,2 milhao de linhas de ~400 dias pra semanas): titan_recheck_eventos.
-    yml agora roda VARIAS instancias em paralelo (ver strategy.matrix no
-    workflow). Com um SELECT simples (sem reserva), duas instancias rodando
-    ao mesmo tempo pegariam OS MESMOS pedidos - duplicando trabalho (o
-    dobro de logins/navegacao no Titan pros MESMOS pedidos, cobrindo
-    METADE dos pedidos diferentes que deveria num mesmo intervalo de
-    tempo - o paralelismo inteiro seria desperdicado). A funcao no banco
-    marca cada linha reivindicada com recheck_reservado_ate (lease de
-    `lease_minutos`, default folgado o bastante pra cobrir uma rodada
-    inteira) - outra instancia so pode reivindicar essa linha de novo
-    depois que o lease expirar, o que tambem AUTO-RECUPERA pedidos cuja
-    instancia caiu/travou no meio do processamento, sem precisar de
-    limpeza manual nenhuma.
-
-    A prioridade "recentes primeiro" (achado anterior - pedido novo nao
-    pode ficar preso atras do backlog antigo) ja fica dentro da funcao no
-    banco (janela de 3 dias), nao precisa mais de duas chamadas separadas
-    aqui.
-    """
-    return titan_watcher._supabase_request(
-        "POST", "rpc/reivindicar_recheck_eventos", {"qtd": limite, "lease_minutos": lease_minutos}
-    ) or []
-
-
-def rechecar_concluidos_sem_eventos(page, orcamento_segundos=EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS):
-    """
-    Reconfere um por um (mesma logica do rechecar_situacoes_presas acima -
-    processar_pedido sempre clica na linha e extrai Eventos/Itens) os
-    pedidos que o backfill deixou concluidos mas sem essa informacao.
-    Orcamento de tempo proprio, separado do recheck de situacao presa.
-
-    Achado real (11/09/2026, reportado pela Maria): confirmado por
-    exportacao em massa dos paineis "Eventos"/"Itens do pedido" que NAO da
-    pra trazer isso em lote - sem uma linha de "Informacao Pedido"
-    selecionada, o Power BI devolve os dois paineis AGREGADOS (Eventos vira
-    so Situacao+Horario sem NF nenhuma pra identificar o pedido; Itens vira
-    quantidade somada por SKU no periodo inteiro) - impossivel desagregar de
-    volta pro pedido certo. O clique-por-pedido continua sendo o UNICO jeito
-    (backlog real medido nesse dia: ~1,2 milhao de linhas com eventos=NULL).
-    Como paliativo (nao resolve a raiz, so aumenta o ritmo - ver conversa),
-    orcamento_segundos virou parametro pra titan_recheck_eventos.yml poder
-    rodar SO isto varias vezes por hora com um orcamento proprio, em vez de
-    competir por tempo com a exportacao principal 2x/dia.
-
-    NAO mexido (12/09/2026) quando o clique-de-linha foi tirado do caminho
-    da janela do backfill - a Maria pediu especificamente pra nao alterar
-    este caminho (usado so pelo modo --so-recheck, hoje desativado via
-    titan_recheck_eventos.yml), entao continua chamando
-    titan_watcher.processar_pedido como sempre.
-    """
-    # Mesma protecao de rechecar_situacoes_presas acima, mesmo motivo real.
-    try:
-        pendentes = buscar_concluidos_sem_eventos()
-    except Exception as e:
-        print(f"Nao consegui buscar pedidos concluidos sem Eventos/Itens: {e} - "
-              f"pulando este recheck, tenta de novo na proxima rodada.", file=sys.stderr)
-        return
-    if not pendentes:
-        print("Nenhum pedido concluido sem Eventos/Itens.")
-        return
-    print(f"{len(pendentes)} pedido(s) concluidos sem Eventos/Itens - completando "
-          f"(orcamento {orcamento_segundos}s)...")
-    inicio = time.monotonic()
-    processados = 0
-    for item in pendentes:
-        if time.monotonic() - inicio > orcamento_segundos:
-            print(f"  orcamento de tempo esgotado - {processados}/{len(pendentes)} completado(s), resto fica pra proxima rodada.")
-            break
-        try:
-            # permitir_limpar_dados=False - mesmo motivo de rechecar_situacoes_
-            # presas acima: so roda sobre pedidos ja 'concluido'.
-            titan_watcher.processar_pedido(page, item, permitir_limpar_dados=False)
-        except Exception as e:
-            print(f"  [NF {item.get('numero_nf')} / marca {item.get('marca')}] erro completando eventos/itens: {e}", file=sys.stderr)
-            if item.get("numero_nf") and item.get("marca"):
-                titan_watcher.marcar_erro(item.get("numero_nf"), item.get("marca"), str(e))
-        processados += 1
-    print(f"Recheck de eventos/itens concluido: {processados} pedido(s) processado(s).")
+# REMOVIDAS (16/09/2026, ver ITENS VIA METABASE no topo do arquivo):
+# buscar_concluidos_sem_eventos/rechecar_concluidos_sem_eventos - eventos
+# saiu do escopo do backfill de vez, entao o recheck-por-clique dedicado a
+# eventos (usado so pelo modo --so-recheck, hoje ja desativado via
+# titan_recheck_eventos.yml) nao faz mais sentido existir aqui.
 
 
 def _supabase_upsert_lote(registros):
@@ -591,13 +520,14 @@ def registro_para_supabase(r):
         "cliente": r.get("Cliente"),
         "atualizado_em": _agora_iso(),
     }
-    # So inclui a chave quando conseguimos derivar (ver docstring acima) -
-    # omitir em vez de gravar None preserva, no upsert com merge-duplicates,
-    # um numero_pedido ja existente (ex: vindo de uma solicitacao real pela
-    # Torre) quando essa linha em particular nao permite confirmar o sufixo.
-    numero_pedido_derivado = scraper.extrair_numero_pedido_torre(r)
-    if numero_pedido_derivado:
-        registro["numero_pedido"] = numero_pedido_derivado
+    # NAO promove direto pra "numero_pedido" aqui (16/09/2026, pedido direto
+    # da Maria: "somente para as marcas que nao tem nada") - fica guardado
+    # numa chave privada (nunca mandada ao Supabase, ver o pop() em
+    # exportar_e_gravar_periodo) ate o chamador conferir em lote se a linha
+    # JA tem numero_pedido gravado (ver _buscar_numero_pedido_ja_preenchido)
+    # - so promove quando ainda nao tem. Continua vazio quando o sufixo nao
+    # confirma (ver docstring acima).
+    registro["_numero_pedido_derivado"] = scraper.extrair_numero_pedido_torre(r)
     return registro
 
 
@@ -631,23 +561,26 @@ def _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_fina
     return True
 
 
-def _buscar_pendentes_eventos_itens(nfs):
+def _buscar_pendentes_itens(nfs):
     """
     Consulta o Supabase em lotes (por numero_nf, ate 200 por vez - mesmo
     tamanho de TAMANHO_LOTE) pra achar, dentro das NFs desta janela de
-    backfill, quais pedidos ja existem na tabela com eventos OU itens ainda
-    NULOS - basta faltar UM dos dois campos pra entrar na lista (pedido
-    direto da Maria, 14/09/2026 - "somente precisa checar duas coisas
-    eventos is null e itens is null" / "OU - falta pelo menos um", NAO "E -
-    precisa faltar os dois": um pedido com itens preenchido mas eventos
-    ainda nulo, por exemplo, tambem precisa ser revisitado). NAO filtra por
-    status - antes so pegava 'concluido', mas a Maria pediu pra tirar esse
-    filtro tambem.
+    backfill, quais pedidos ja existem na tabela com itens ainda NULO.
 
-    Devolve numero_pedido junto (usado por _ler_eventos_itens_via_filtro_
-    cruzado pra filtrar direto, sem precisar da NF) - por isso devolve uma
-    LISTA de dicts (um por pedido), nao mais um set de tuplas (numero_nf,
-    marca) como antes.
+    RENOMEADA de _buscar_pendentes_eventos_itens (16/09/2026, ver ITENS VIA
+    METABASE no topo do arquivo) - o "OU eventos.is.null" saiu da condicao
+    porque eventos nao e mais responsabilidade deste script. NAO filtra por
+    status (mesmo comportamento de antes, 14/09/2026 - pedido da Maria).
+
+    Devolve numero_pedido junto (usado por _buscar_itens_via_metabase como
+    chave de match no Shopify) - por isso devolve uma LISTA de dicts (um
+    por pedido), nao um set de tuplas (numero_nf, marca).
+
+    So cobre pedidos que JA EXISTEM na tabela (linha nova desta propria
+    rodada, ainda nao gravada, so entra aqui na PROXIMA rodada do backfill,
+    2x/dia - simplificacao aceita de proposito, evita ter que juntar dois
+    numero_pedido diferentes - o gravado no banco e o derivado nesta mesma
+    exportacao - so pra tentar cobrir o mesmo dia).
 
     Volume baixo por rodada: a maioria dos pedidos de uma janela de poucos
     dias ja foi vista e completada numa rodada anterior (a janela e
@@ -659,164 +592,160 @@ def _buscar_pendentes_eventos_itens(nfs):
         lote_nfs = nfs_unicas[i:i + TAMANHO_LOTE]
         lista = ",".join(urllib.parse.quote(nf) for nf in lote_nfs)
         path = (f"{TABELA}?numero_nf=in.({lista})"
-                f"&or=(eventos.is.null,itens.is.null)"
+                f"&itens=is.null"
                 f"&select=numero_nf,marca,numero_pedido")
         linhas = titan_watcher._supabase_request("GET", path) or []
         pendentes.extend(linhas)
     return pendentes
 
 
-def _limpar_filtro_slicer(frame, rotulo, pasta_registro=None, indice_passo=None):
+def _buscar_numero_pedido_ja_preenchido(nfs):
     """
-    Clica no botao "Clear selections" do slicer especifico (rotulo) -
-    devolve o filtro pra "Todos" SEM sair do periodo de datas atual (bem
-    mais rapido que um reload completo da pagina, que resetaria o periodo
-    tambem).
-
-    CORRIGIDO (11/09/2026, achado real rodando em producao): a 1a versao
-    tentava reabrir o dropdown e marcar "Selecionar tudo" na lista de
-    opcoes, mas isso nunca achava o elemento (timeout toda vez) - mesmo
-    assim o pedido seguinte completava certo, porque marcar_item_da_lista
-    troca a selecao ao inves de adicionar. Usa "Clear selections" - um
-    botao dedicado no proprio visual do slicer.
-
-    CONFIRMA VISUALMENTE (12/09/2026, pedido direto da Maria apos o
-    achado real do run #34): so clicar no botao nao era garantia - o clique
-    podia nao surtir efeito a tempo (ou falhar em silencio), e o chamador
-    seguia pro proximo pedido com o filtro ainda sujo. Agora espera de
-    verdade o slicer mostrar "Todos"/"All" (ver scraper.esperar_slicer_
-    limpo) antes de devolver - se nao confirmar dentro do timeout, propaga
-    o erro (quem chama decide o que fazer, ver _completar_eventos_itens).
-
-    DUAS HIPOTESES DE CAUSA RAIZ TESTADAS E DESCARTADAS NO MEIO DO CAMINHO
-    (12/09/2026) - registradas aqui pra nao repetir o mesmo caminho: (1)
-    "o dropdown fica aberto e o Power BI esconde o botao enquanto isso" -
-    testado com Escape antes de procurar o botao (run #38), mesma cascata
-    continuou, HTML confirmou aria-expanded="false" com o botao AINDA
-    escondido; (2) "o botao so aparece com hover" (achado real comparando
-    com "a borrachinha" que a Maria usa manualmente) - true, mas
-    _limpar_filtro_slicer usava scraper.localizar_painel(frame, rotulo)
-    pra achar o slicer, e essa funcao NUNCA achou nada pros slicers (ela
-    exige role="group" com aria-label direto - e o role="group" do slicer
-    nao tem aria-label nenhum, so um <h3> bem mais fundo tem - ver docstring
-    de localizar_painel). O hover() dava "Timeout 30000ms exceeded" porque
-    o locator de entrada ja estava vazio, nao por causa do proprio hover.
-
-    CAUSA RAIZ DE VERDADE: usa scraper.localizar_slicer_por_titulo (acha o
-    slicer pelo <h3 title="..."> e sobe ate o role="group" certo, em vez de
-    depender de um aria-label que nunca existiu pros slicers) - so DEPOIS
-    disso o hover() e a busca do botao fazem sentido.
-
-    pasta_registro/indice_passo (12/09/2026, pedido direto da Maria): se
-    informados, grava um print depois de confirmar a limpeza - ver
-    scraper.registrar_passo.
-
-    CORRIGIDO (12/09/2026, achado real via o print do proprio passo a
-    passo - a Maria viu o tooltip "Clear selections" grudado na tela por
-    cima do campo de Nota Fiscal de Saida): o hover() acima revela o botao
-    de verdade, mas o TOOLTIP que aparece junto com ele (a mesma classe
-    "enable-hover") nao desaparece sozinho so por seguir em frente no
-    codigo - ele fica ali, um "pbi-overlay-caret"/"cdk-overlay-container"
-    de verdade, ate o mouse sair de cima do slicer. Sem isso, o proximo
-    pedido tentava clicar no dropdown da NF bem onde esse tooltip ainda
-    estava, e o clique era interceptado ("Locator.click: Timeout 10000ms
-    exceeded ... subtree intercepts pointer events") - a causa raiz real
-    dos 47 erros/141 ocorrencias de pbi-overlay-caret no run #40. Move o
-    mouse pra um canto neutro da pagina depois de confirmar a limpeza, pra
-    tirar o hover do slicer e o tooltip sumir antes do proximo pedido.
+    Devolve o subconjunto de (numero_nf, marca), dentro das NFs desta
+    janela, que JA TEM numero_pedido preenchido no Supabase - usado pra so
+    incluir o numero_pedido derivado desta exportacao (ver
+    registro_para_supabase/_numero_pedido_derivado) quando a linha AINDA
+    nao tem nada (pedido direto da Maria, 16/09/2026: "numero_pedido
+    somente para as marcas que nao tem nada"). Uma linha nova (ainda nem
+    existe na tabela) nao aparece aqui - conta como "nao preenchido", e por
+    isso recebe o valor derivado normalmente.
     """
-    frame.page.keyboard.press("Escape")
-    time.sleep(0.3)
-    slicer = scraper.localizar_slicer_por_titulo(frame, rotulo)
-    slicer.hover()
-    time.sleep(0.3)
-    botao = scraper.elemento_visivel(
-        slicer.get_by_role("button", name=re.compile("Clear selections|Limpar sele", re.IGNORECASE)),
-        timeout_ms=8000,
-    )
-    botao.click()
-    time.sleep(0.3)
-    scraper.esperar_slicer_limpo(frame, rotulo, timeout_ms=8000)
-    frame.page.mouse.move(0, 0)
-    time.sleep(0.3)
-    if pasta_registro is not None:
-        nome_rotulo = re.sub(r"\W+", "_", rotulo).strip("_").lower()
-        scraper.registrar_passo(frame, pasta_registro, indice_passo, f"limpou_{nome_rotulo}")
+    preenchidos = set()
+    nfs_unicas = sorted({str(nf) for nf in nfs if nf})
+    for i in range(0, len(nfs_unicas), TAMANHO_LOTE):
+        lote_nfs = nfs_unicas[i:i + TAMANHO_LOTE]
+        lista = ",".join(urllib.parse.quote(nf) for nf in lote_nfs)
+        path = (f"{TABELA}?numero_nf=in.({lista})"
+                f"&numero_pedido=not.is.null"
+                f"&select=numero_nf,marca")
+        linhas = titan_watcher._supabase_request("GET", path) or []
+        for linha in linhas:
+            preenchidos.add((linha["numero_nf"], linha["marca"]))
+    return preenchidos
 
 
-def _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, numero_pedido=None, pasta_registro=None):
+def _brand_shopify(marca):
+    return MARCA_PARA_BRAND_SHOPIFY.get(marca, marca)
+
+
+def _sql_lista_texto(valores):
+    """Monta um IN (...) de literais texto pro Metabase, escapando aspas
+    simples - os valores aqui sao numero_pedido ja validados por
+    scraper.extrair_numero_pedido_torre (formato conhecido), mas escapa do
+    mesmo jeito por seguranca (nunca confia em string concatenada direto em
+    SQL sem escapar, mesmo quando a fonte parece controlada)."""
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in valores)
+
+
+def _metabase_query(sql):
     """
-    Passo a passo OFICIAL do loop, ditado direto pela Maria (12/09/2026,
-    depois de eu ter tentado 3 causas raiz diferentes pro pbi-overlay-caret
-    e ainda ter passado por cima de um passo que ela ja tinha dito antes -
-    "voce esta tentando muito e esta errando bastante"), SIMPLIFICADO em
-    13/09/2026 (tambem pedido direto da Maria - "nao precisa filtrar pela
-    nf, somente pelo numero do pedido"). Ordem que NAO pode mudar, pra cada
-    pedido do loop:
-    1. Verifica/limpa linha residual destacada em "Informação Pedido" (ver
-       scraper.limpar_linha_selecionada) - EM TODA NF, nao so na primeira
-       (achado real: o destaque volta a aparecer entre um pedido e outro,
-       nao e algo que se resolve so uma vez por rodada).
-    2. Filtra direto por "Numero do pedido" (scraper.filtrar(numero_pedido=...),
-       exact=False - contains, ja que o valor gravado no Supabase e so o ID
-       da Torre e a opcao no Titan mostra o texto completo "SH<id>RT<nf>").
-       SO cai de volta pro fluxo antigo (filtrar a NF, abrir o dropdown de
-       "Numero do pedido" sem digitar nada, marcar a 1a opcao real) quando
-       numero_pedido vem vazio/nulo pra este pedido - confirmado pela Maria
-       ("Nesse caso, cai de volta pro filtro por NF") como o unico caso em
-       que factivelmente nao tem outro jeito de achar o pedido certo.
-    3. Le "Itens do pedido" (scraper.extrair_itens_pedido - mesma funcao
-       que o titan_watcher.py usa, SEM clicar em nenhuma linha da tabela -
-       confirmado pela Maria, o painel ja vem cross-filtrado so pelo passo
-       2 acima).
-    4. Le "Eventos" (scraper.extrair_eventos - idem).
-    A limpeza dos filtros fica no finally de quem chama - IMPORTANTE: quem
-    chama precisa saber se o passo 2 usou o fluxo direto (so "Numero do
-    pedido" foi aplicado) ou o fluxo de fallback (NF TAMBEM foi aplicada),
-    pra limpar so o(s) filtro(s) que realmente foram usados. Isso e
-    determinado so pela presenca de numero_pedido NO MOMENTO DA CHAMADA
-    (nao pelo resultado/sucesso desta funcao) - `not numero_pedido` antes
-    de chamar ja da essa resposta pro chamador.
-
-    pasta_registro (12/09/2026, pedido direto da Maria depois do achado do
-    "pbi-overlay-caret" - ela quer ver o passo a passo visual completo, nao
-    so o diagnostico do momento da falha): se informada, grava um print
-    depois de cada acao (ver scraper.registrar_passo). Nenhum chamador
-    atual passa isso (o registro visual por pedido saiu de uso quando a
-    paralelizacao entrou, 13/09/2026) - o parametro fica disponivel pra
-    reativar essa depuracao visual se precisar de novo, sem reescrever a
-    funcao.
+    Roda uma query SQL crua no Metabase (banco "Data Mart", ver
+    METABASE_DATABASE_ID) via API, autenticada por API Key
+    (METABASE_API_KEY - Secret do GitHub). Devolve lista de dicts (uma por
+    linha) - a API crua do Metabase (/api/dataset) nao tem o teto de 500
+    linhas que a ferramenta MCP interativa usada pra explorar o schema tem.
     """
-    passo = [0]
+    body = json.dumps({
+        "database": METABASE_DATABASE_ID,
+        "type": "native",
+        "native": {"query": sql},
+    }).encode("utf-8")
+    req = urllib.request.Request(f"{METABASE_URL}/api/dataset", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("x-api-key", METABASE_API_KEY)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        resultado = json.loads(resp.read())
+    colunas = [c["name"] for c in resultado["data"]["cols"]]
+    return [dict(zip(colunas, linha)) for linha in resultado["data"]["rows"]]
 
-    def registrar(nome):
-        if pasta_registro is not None:
-            passo[0] += 1
-            scraper.registrar_passo(frame, pasta_registro, passo[0], nome)
 
-    scraper.limpar_linha_selecionada(frame, "Informação Pedido")
-    registrar("linha_residual_verificada")
-    if numero_pedido:
-        scraper.filtrar(frame, numero_pedido=numero_pedido)
-        registrar("pedido_filtrado_direto")
-    else:
-        scraper.filtrar(frame, nf=numero_nf)
-        registrar("nf_filtrada_fallback")
-        scraper.abrir_dropdown_filtro(frame, "Número do pedido")
-        registrar("dropdown_numero_pedido_aberto")
-        time.sleep(1)
-        opcao_pedido = scraper.primeira_opcao_real(frame, timeout_ms=10000)
-        opcao_pedido.click()
-        registrar("opcao_numero_pedido_marcada")
-        time.sleep(0.5)
-        frame.page.keyboard.press("Escape")
-        time.sleep(1)
-        registrar("dropdown_numero_pedido_fechado")
-    itens = scraper.extrair_itens_pedido(frame)
-    registrar("itens_lidos")
-    eventos = scraper.extrair_eventos(frame)
-    registrar("eventos_lidos")
-    return eventos, itens
+def _buscar_itens_via_metabase(pendentes):
+    """
+    Busca "Itens do pedido" no Metabase (gold.shopify_order_items) em vez
+    de clicar pedido por pedido no Titan (16/09/2026, pedido direto da
+    Maria - ver ITENS VIA METABASE no topo do arquivo) - mesma fonte e
+    mesma logica de match ja validadas no backfill manual de itens feito
+    em 14-15/09/2026 pra rituaria/barbours/kokeshi/apice.
+
+    Recebe a lista de pendentes desta janela (formato de
+    _buscar_pendentes_itens - numero_nf/marca/numero_pedido) e devolve um
+    dict {(numero_nf, marca): itens} pros que deu pra casar no Shopify.
+
+    CHAVE DE MATCH: apice casa por order_number (bigint, sem "#") ==
+    numero_pedido; as outras marcas casam por order_name (texto,
+    "SH<id><SUFIXO>") == numero_pedido - o proprio numero_pedido gravado no
+    Supabase JA E esse valor (ver scraper.extrair_numero_pedido_torre/
+    registro_para_supabase), sem transformacao nenhuma aqui.
+
+    FORMATO DO JSON: replica o MESMO schema que "Itens do pedido" tem
+    quando vem direto do Titan (Ean/Tipo/Codigo/Quantidade/Descricao/Valor
+    Total/Row Selection/Valor Unitario/Checkout Realizado) - "Row
+    Selection"/"Checkout Realizado" sao so replicados sem significado real
+    (artefato de UI do Titan, mesma convencao ja usada pro schema de
+    eventos), "Ean" repete o SKU do Shopify (o Metabase nao tem EAN de
+    verdade nesta tabela).
+    """
+    if not METABASE_API_KEY:
+        print("METABASE_API_KEY nao configurada - pulando busca de itens via Metabase nesta rodada.", file=sys.stderr)
+        return {}
+
+    por_marca = {}
+    for p in pendentes:
+        marca = (p.get("marca") or "").strip()
+        numero_pedido = (p.get("numero_pedido") or "").strip()
+        if not marca or not numero_pedido:
+            continue
+        por_marca.setdefault(marca, []).append((p["numero_nf"], numero_pedido))
+
+    resultado = {}
+    for marca, pares in por_marca.items():
+        brand = _brand_shopify(marca)
+        pedidos_unicos = sorted({numero_pedido for _, numero_pedido in pares})
+        linhas = []
+        for i in range(0, len(pedidos_unicos), TAMANHO_LOTE):
+            fatia = pedidos_unicos[i:i + TAMANHO_LOTE]
+            if marca == "apice":
+                ids_validos = [v for v in fatia if v.isdigit()]
+                if not ids_validos:
+                    continue
+                condicao = f"order_number in ({', '.join(ids_validos)})"
+                campo_chave = "order_number"
+            else:
+                condicao = f"order_name in ({_sql_lista_texto(fatia)})"
+                campo_chave = "order_name"
+            sql = (
+                f"select {campo_chave} as pedido_chave, sku, title, quantity, price "
+                f"from gold.shopify_order_items "
+                f"where brand = '{brand}' and {condicao}"
+            )
+            try:
+                linhas.extend(_metabase_query(sql))
+            except Exception as e:
+                print(f"  ERRO consultando itens no Metabase pra marca {marca}: {e}", file=sys.stderr)
+
+        itens_por_pedido = {}
+        for linha in linhas:
+            chave = str(linha["pedido_chave"])
+            preco = float(linha.get("price") or 0)
+            quantidade = linha.get("quantity") or 0
+            sku = linha.get("sku") or ""
+            itens_por_pedido.setdefault(chave, []).append({
+                "Ean": sku,
+                "Tipo": "UN",
+                "Código": sku,
+                "Quantidade": str(quantidade),
+                "Descrição": linha.get("title") or "",
+                "Valor Total": f"{preco * float(quantidade):.2f}",
+                "Row Selection": "Select Row",
+                "Valor Unitário": f"{preco:.2f}",
+                "Checkout Realizado": "1",
+            })
+
+        for numero_nf, numero_pedido in pares:
+            itens = itens_por_pedido.get(numero_pedido)
+            if itens:
+                resultado[(numero_nf, marca)] = itens
+    return resultado
 
 
 def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
@@ -828,24 +757,11 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     rodada e tentar de novo na proxima do que arriscar gravar dado de um
     periodo errado ou incompleto).
 
-    NAO completa mais eventos/itens aqui (13/09/2026) - ver
-    _completar_eventos_itens_worker, que roda depois disso num job
-    paralelo separado (strategy.matrix no workflow).
+    Itens vem do Metabase (ver _buscar_itens_via_metabase), consultado
+    aqui mesmo dentro deste job (16/09/2026) - nao precisa mais de um job
+    paralelo separado nem de artifact pra passar lista entre jobs (ver
+    ITENS VIA METABASE no topo do arquivo).
     """
-    # Garante que o arquivo SEMPRE existe, mesmo vazio, antes de qualquer
-    # "return" antecipado abaixo (14/09/2026, achado real: um re-run manual
-    # da run #51 bateu na instabilidade JA CONHECIDA do filtro de periodo
-    # nao aplicar a tempo - ver _validar_filtro_aplicado - fazendo esta
-    # funcao devolver (0, 0, 0) sem nunca chegar na parte que grava a lista
-    # de pendentes mais abaixo. Sem o arquivo, o passo "Subir lista de
-    # pendentes eventos/itens" do workflow nao tinha nada pra subir, e os
-    # 20 workers do job completar-eventos falhavam de cara com "Artifact
-    # not found" - um erro em cascata sem nenhuma relacao com pedido,
-    # sessao ou periodo, so falta de tratamento pra esta janela nao ter
-    # achado nada pra gravar desta vez). Fica sobrescrito mais abaixo se a
-    # funcao chegar ate la com registros de verdade.
-    ARQUIVO_PENDENTES_EVENTOS_ITENS.write_text("[]", encoding="utf-8")
-
     registros = []
     filtro_ok = False
     for tentativa in range(1, tentativas + 1):
@@ -950,42 +866,40 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     if ignorados_lote:
         _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
 
-    # O CLIQUE-POR-PEDIDO de eventos/itens NAO roda mais inline aqui dentro
-    # deste job (13/09/2026, pedido direto da Maria - "preciso que todos os
-    # pedidos sejam processados em uma unica rodada") - virou um job
-    # PARALELO separado no workflow (20 instancias via strategy.matrix, ver
-    # .github/workflows/titan_backfill.yml e _completar_eventos_itens_worker
-    # abaixo) que roda DEPOIS deste export, sem competir pelo mesmo
-    # orcamento de tempo sequencial.
-    #
-    # A lista de quem precisa desse clique-por-pedido, porem, PRECISA ser
-    # levantada AQUI (14/09/2026, pedido direto da Maria: "a lista com os
-    # numeros de pedido e nf ja foi extraida ... precisa dividir o valor
-    # dessa lista pelos 20 workers", em vez do worker reivindicar lotes via
-    # RPC direto no backlog inteiro - ver historico abaixo do porque isso
-    # mudou de novo) - so este job tem o periodo de datas certo desta janela
-    # aberto no navegador; um worker que loga do zero cai no periodo padrao
-    # (estreito/recente) do Titan e nunca acha um pedido fora dele.
-    #
-    # HISTORICO (13-14/09/2026): a 1a versao da paralelizacao fazia os
-    # workers reivindicarem lotes via a RPC reivindicar_recheck_eventos, que
-    # varria o backlog INTEIRO (~1,37 milhao de linhas, de qualquer data) -
-    # bom pra tambem zerar backlog antigo como efeito colateral, mas exigia
-    # o worker configurar um periodo de datas amplo pro Titan achar pedidos
-    # velhos (nunca implementado - achado real na run #48 manual, "Nenhum
-    # elemento visivel encontrado" em quase todo pedido, porque o periodo
-    # padrao do Titan pos-login e estreito). A Maria decidiu voltar a
-    # escopar isso so pra esta janela (sem RPC, sem periodo extra pra
-    # configurar) - o backlog antigo continua fora do escopo automatico,
-    # mesma situacao de antes de 13/09 (titan_recheck_eventos.yml, que
-    # cobria esse caso, continua desativado).
+    # numero_pedido fill-only-if-empty (16/09/2026, pedido direto da Maria -
+    # ver ITENS VIA METABASE/registro_para_supabase): promove o valor
+    # derivado (guardado em "_numero_pedido_derivado") pra "numero_pedido"
+    # de verdade so nas linhas que AINDA nao tem nada gravado - o pop()
+    # tira a chave privada de TODO payload antes de seguir, senao o
+    # PostgREST rejeitaria o upsert com uma coluna que a tabela nao tem.
+    ja_tem_numero_pedido = _buscar_numero_pedido_ja_preenchido([p["numero_nf"] for p in payloads])
+    for payload in payloads:
+        derivado = payload.pop("_numero_pedido_derivado", None)
+        if derivado and (payload["numero_nf"], payload["marca"]) not in ja_tem_numero_pedido:
+            payload["numero_pedido"] = derivado
+
+    # Itens via Metabase (16/09/2026, ver ITENS VIA METABASE no topo do
+    # arquivo) - substitui o clique-por-pedido no Titan que rodava aqui
+    # antes (job completar-eventos separado, removido junto com esta
+    # mudanca). So busca pra quem AINDA esta com itens nulo no Supabase
+    # (_buscar_pendentes_itens so cobre pedidos que ja existem na tabela -
+    # ver docstring dela).
     nfs_desta_janela = [p["numero_nf"] for p in payloads]
-    pendentes = _buscar_pendentes_eventos_itens(nfs_desta_janela)
-    ARQUIVO_PENDENTES_EVENTOS_ITENS.write_text(
-        json.dumps(pendentes, ensure_ascii=False), encoding="utf-8"
-    )
-    print(f"{len(pendentes)} pedido(s) desta janela sem eventos/itens - lista gravada em "
-          f"{ARQUIVO_PENDENTES_EVENTOS_ITENS} pros 20 workers dividirem entre si.")
+    pendentes_itens = _buscar_pendentes_itens(nfs_desta_janela)
+    print(f"{len(pendentes_itens)} pedido(s) desta janela sem itens - buscando no Metabase...")
+    itens_encontrados = _buscar_itens_via_metabase(pendentes_itens)
+    print(f"  {len(itens_encontrados)} casado(s) no Metabase de {len(pendentes_itens)} pendente(s).")
+    if itens_encontrados:
+        # Reconfere bem antes de gravar (mesmo motivo do "ainda_vazio" usado
+        # no backfill manual de itens/eventos - ver upsert_itens.py/
+        # upsert_eventos.py) - evita sobrescrever um itens que
+        # titan_watcher.py (consulta avulsa da Torre) tenha preenchido com
+        # dado real do Titan nesse meio tempo.
+        ainda_sem_itens = {(p["numero_nf"], p["marca"]) for p in _buscar_pendentes_itens(nfs_desta_janela)}
+        for payload in payloads:
+            chave = (payload["numero_nf"], payload["marca"])
+            if chave in itens_encontrados and chave in ainda_sem_itens:
+                payload["itens"] = itens_encontrados[chave]
 
     lote = []
     gravados = 0
@@ -1016,183 +930,13 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     return gravados, ignorados, lotes_com_erro
 
 
-def _marcar_eventos_itens(numero_nf, marca, eventos, itens):
-    """
-    PATCH minimo - so eventos/itens/atualizado_em, SEM tocar em situacao/
-    romaneio/valor_pedido/etc (diferente de titan_watcher.marcar_concluido,
-    que sobrescreve o registro inteiro a partir de um pedido_data lido de
-    novo). Estes pedidos ja estao 'concluido' com esses outros campos
-    corretos - o unico motivo de terem sido reivindicados e eventos/itens
-    nulos - reescrever tudo de novo so arriscaria degradar dado bom sem
-    necessidade nenhuma.
-    """
-    titan_watcher._supabase_request(
-        "PATCH",
-        f"{TABELA}?numero_nf=eq.{urllib.parse.quote(numero_nf)}&marca=eq.{urllib.parse.quote(marca)}",
-        {"eventos": eventos or [], "itens": itens or [], "atualizado_em": _agora_iso()},
-    )
-
-
-def _erro_de_frame_invalido(erro):
-    """
-    True quando a excecao e o Power BI tendo trocado/recarregado o iframe
-    do relatorio por baixo do frame que o worker guardou (ver achado real
-    na docstring de _completar_eventos_itens_worker) - o Playwright reporta
-    isso como "Frame was detached" dentro da mensagem de varios metodos de
-    Locator diferentes (count/all/hover/etc.), entao confere so a
-    substring em vez de tentar listar cada metodo.
-    """
-    return "Frame was detached" in str(erro)
-
-
-def _fatia_do_worker(lista, worker_index, total_workers):
-    """
-    Divide `lista` em `total_workers` pedacos quase iguais e devolve so o
-    pedaco do worker_index (1-based) - pedido direto da Maria (14/09/2026):
-    "a lista com os numeros de pedido e nf ja foi extraida ... precisa
-    dividir o valor dessa lista pelos 20 workers ... os primeiros 3000 da
-    lista fica no worker 1 e assim segue a distribuicao". Substitui a
-    reivindicacao dinamica via RPC (reivindicar_recheck_eventos) desta
-    janela - as fatias sao DISJUNTAS por construcao (cada posicao da lista
-    pertence a exatamente 1 fatia), entao nenhum round-trip no banco e
-    necessario pra evitar dois workers pegando o mesmo pedido.
-
-    Quando `len(lista)` nao divide exato por `total_workers`, o resto vai
-    pros PRIMEIROS pedacos (1 item a mais cada, nao empilhado so no
-    ultimo) - divmod padrao, evita um worker no fim da fila com uma fatia
-    desproporcionalmente maior.
-    """
-    n = len(lista)
-    tamanho_base, resto = divmod(n, total_workers)
-    inicio = (worker_index - 1) * tamanho_base + min(worker_index - 1, resto)
-    tamanho_desta_fatia = tamanho_base + (1 if worker_index <= resto else 0)
-    return lista[inicio:inicio + tamanho_desta_fatia]
-
-
-def _completar_eventos_itens_worker(page, orcamento_segundos, worker_index, total_workers,
-                                     arquivo_pendentes=ARQUIVO_PENDENTES_EVENTOS_ITENS):
-    """
-    Modo standalone (--completar-eventos-worker), pensado originalmente
-    (13/09/2026, pedido direto da Maria: "preciso que todos os pedidos
-    sejam processados em uma unica rodada") pra rodar em VARIAS instancias
-    em paralelo ao mesmo tempo - mas hoje roda uma instancia POR VEZ (ver
-    strategy.max-parallel: 1 no workflow, 14/09/2026, pedido direto da
-    Maria: "um worker so deve comecar a rodar quando o outro finalizar,
-    fazendo um por vez").
-
-    HISTORICO desta mudanca (14/09/2026): run #50 manual, com login e RPC
-    ja corrigidos (ver historico na docstring de exportar_e_gravar_periodo),
-    mostrou 17 dos 20 workers morrendo de cara com o Playwright navegando
-    sozinho pra "titanbi.com.br/login?reason=noUser" bem depois do login ja
-    ter dado certo - ou seja, o Titan parece derrubar a sessao ANTERIOR
-    quando uma NOVA sessao loga com a mesma conta (nao so rejeitar logins
-    simultaneos, que ja tinhamos corrigido com o lock de login). Com 20
-    logins em fila rapida, so sobrevivia quem conseguia abrir o painel
-    antes do proximo da fila logar - so ~3 de 20 workers processavam
-    qualquer coisa de verdade, o resto so gastava minutos de Actions a toa.
-    Rodar 1 worker por vez elimina esse problema de raiz (nunca ha uma
-    2a sessao ativa que possa derrubar a 1a), ao custo real de throughput -
-    a Maria confirmou ciente que isso volta ao teto de ~11s/pedido de uma
-    unica instancia (nao da mais pra zerar uma janela de dezenas de
-    milhares de pedidos numa unica rodada, mas usa o tempo de Actions de
-    verdade em vez de desperdicar a maioria em logins que nunca processam
-    nada). O lock de login (titan_login_lock/_adquirir_lock_login/
-    _liberar_lock_login) virou redundante com max-parallel:1 (nunca ha
-    2 workers rodando ao mesmo tempo pra disputar o lock) e foi removido.
-
-    Le a lista de pendentes desta janela (gravada por exportar_e_gravar_
-    periodo em `arquivo_pendentes`, baixada via artifact no workflow - ver
-    _buscar_pendentes_eventos_itens) e processa SO a fatia correspondente a
-    `worker_index` (ver _fatia_do_worker) - lista fixa, dividida por
-    posicao entre os 20 workers (agora executados em sequencia, nao em
-    paralelo), SEM reivindicar nada via banco.
-
-    Filtra direto por "Numero do pedido" quando o pedido tem esse dado (ver
-    _ler_eventos_itens_via_filtro_cruzado) - so cai de volta pra filtrar
-    por NF no fallback (numero_pedido vazio).
-
-    RECUPERACAO DE FRAME (13/09/2026, achado real na run #47 manual): o
-    MESMO frame e reaproveitado pra todos os pedidos do turno (o periodo de
-    datas certo desta janela ja fica valendo o tempo todo, sem reload), mas
-    se o Power BI trocar/recarregar o iframe do relatorio em algum momento
-    (observado: refresh de token, sessao expirando etc.), esse frame fica
-    "detached" pra sempre - TODO pedido seguinte falhava instantaneamente
-    com "Locator.count/all: Frame was detached" pelo resto do orcamento
-    (6.503 falhas identicas em sequencia, 0 pedidos completados, numa unica
-    instancia). Ao detectar esse erro especifico (ver _erro_de_frame_
-    invalido), busca o frame de novo (scraper.get_dashboard_frame) e tenta
-    o MESMO pedido mais uma vez antes de desistir - a variavel `frame` e
-    reatribuida no escopo desta funcao, entao os pedidos SEGUINTES do loop
-    tambem usam o frame novo automaticamente, sem precisar de nenhum
-    tratamento especial neles.
-    """
-    with open(arquivo_pendentes, encoding="utf-8") as f:
-        pendentes = json.load(f)
-    fatia = _fatia_do_worker(pendentes, worker_index, total_workers)
-    print(f"Worker {worker_index}/{total_workers}: {len(fatia)} de {len(pendentes)} pedido(s) "
-          f"pendente(s) desta janela (orcamento {orcamento_segundos}s).")
-    if not fatia:
-        print("Nenhum pedido nesta fatia - encerrando esta instancia.")
-        return
-
-    frame = scraper.get_dashboard_frame(page)
-    inicio = time.monotonic()
-    completados = 0
-    for item in fatia:
-        if time.monotonic() - inicio > orcamento_segundos:
-            print(f"  orcamento de tempo esgotado - {completados}/{len(fatia)} completado(s) nesta instancia, "
-                  f"resto fica pra proxima rodada.")
-            break
-        numero_nf = (item.get("numero_nf") or "").strip()
-        marca = (item.get("marca") or "").strip()
-        numero_pedido = (item.get("numero_pedido") or "").strip()
-        if not numero_nf or not marca:
-            continue
-        # Ver docstring de _ler_eventos_itens_via_filtro_cruzado - determinado
-        # ANTES da chamada, so a partir do dado do pedido, pra saber no
-        # finally qual(is) filtro(s) realmente foi(ram) aplicado(s).
-        usou_nf = not numero_pedido
-        try:
-            eventos, itens = _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, numero_pedido=numero_pedido)
-            _marcar_eventos_itens(numero_nf, marca, eventos, itens)
-            completados += 1
-        except Exception as e:
-            if _erro_de_frame_invalido(e):
-                print(f"  [NF {numero_nf} / marca {marca}] frame do Power BI ficou invalido - buscando de "
-                      f"novo e tentando este pedido mais uma vez: {e}", file=sys.stderr)
-                try:
-                    frame = scraper.get_dashboard_frame(page)
-                    eventos, itens = _ler_eventos_itens_via_filtro_cruzado(frame, numero_nf, numero_pedido=numero_pedido)
-                    _marcar_eventos_itens(numero_nf, marca, eventos, itens)
-                    completados += 1
-                except Exception as e2:
-                    print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens (apos "
-                          f"recuperar o frame): {e2}", file=sys.stderr)
-                    titan_watcher.marcar_erro(numero_nf, marca, str(e2))
-            else:
-                print(f"  [NF {numero_nf} / marca {marca}] erro completando eventos/itens: {e}", file=sys.stderr)
-                titan_watcher.marcar_erro(numero_nf, marca, str(e))
-        finally:
-            # Mesma recuperacao de frame na limpeza - se o frame so
-            # detached AQUI (leitura deste pedido deu certo, mas a
-            # troca de iframe do Power BI aconteceu bem nesta janela),
-            # busca de novo pro PROXIMO pedido do loop nao herdar um
-            # frame morto (nao tenta limpar de novo agora - o proximo
-            # pedido ja aplica seu proprio filtro fresco por cima).
-            if usou_nf:
-                try:
-                    _limpar_filtro_slicer(frame, "Nota Fiscal de Saída")
-                except Exception as e:
-                    if _erro_de_frame_invalido(e):
-                        frame = scraper.get_dashboard_frame(page)
-                    print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Nota Fiscal de Saida' pro proximo pedido: {e}", file=sys.stderr)
-            try:
-                _limpar_filtro_slicer(frame, "Número do pedido")
-            except Exception as e:
-                if _erro_de_frame_invalido(e):
-                    frame = scraper.get_dashboard_frame(page)
-                print(f"  [NF {numero_nf} / marca {marca}] nao consegui limpar o filtro 'Numero do pedido' pro proximo pedido: {e}", file=sys.stderr)
-    print(f"Worker {worker_index}/{total_workers} concluido: {completados}/{len(fatia)} pedido(s) completado(s).")
+# REMOVIDAS (16/09/2026, ver ITENS VIA METABASE no topo do arquivo):
+# _marcar_eventos_itens/_erro_de_frame_invalido/_fatia_do_worker/
+# _completar_eventos_itens_worker - todo o mecanismo de clique-por-pedido
+# via Playwright (job completar-eventos, matrix de 20 "workers") foi
+# substituido pela consulta em lote ao Metabase (ver
+# _buscar_itens_via_metabase, chamada direto dentro de
+# exportar_e_gravar_periodo).
 
 
 def main():
@@ -1200,42 +944,19 @@ def main():
     parser.add_argument("--data-inicial", help="formato DD/MM/AAAA, ex: 01/06/2026 (obrigatorio, exceto com --so-recheck)")
     parser.add_argument("--data-final", help="formato DD/MM/AAAA, ex: 24/08/2026 (obrigatorio, exceto com --so-recheck)")
     parser.add_argument("--headless", action="store_true", default=False, help="roda sem abrir janela - so use depois de validar visualmente sem esta flag")
-    # --so-recheck (11/09/2026, achado real: backlog de ~1,2 milhao de
-    # pedidos com eventos=NULL - ver docstring de rechecar_concluidos_sem_
-    # eventos pro porque o clique-por-pedido e o unico jeito) - pula a
-    # exportacao em massa (que so roda 2x/dia e tem que repartir tempo com
-    # os dois rechecks) e roda SO os rechecks, com orcamento proprio maior.
-    # Pensado pra rodar isolado, varias vezes por hora, via
-    # titan_recheck_eventos.yml - throughput bem maior que os 2x/dia atuais
-    # sem competir pelo tempo do job de exportacao.
+    # --so-recheck: pula a exportacao em massa e roda so o recheck de
+    # situacao presa (ver rechecar_situacoes_presas). Eventos SAIU do
+    # escopo deste script (16/09/2026, ver ITENS VIA METABASE no topo do
+    # arquivo) - --recheck-orcamento-eventos-segundos e a chamada de
+    # rechecar_concluidos_sem_eventos foram removidos daqui junto com a
+    # funcao em si.
     parser.add_argument("--so-recheck", action="store_true", default=False,
-                         help="pula a exportacao em massa - so roda rechecar_situacoes_presas + rechecar_concluidos_sem_eventos")
+                         help="pula a exportacao em massa - so roda rechecar_situacoes_presas")
     parser.add_argument("--recheck-orcamento-situacao-segundos", type=int, default=RECHECK_ORCAMENTO_SEGUNDOS,
                          help=f"orcamento pro recheck de situacao presa (padrao {RECHECK_ORCAMENTO_SEGUNDOS}s)")
-    parser.add_argument("--recheck-orcamento-eventos-segundos", type=int, default=EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS,
-                         help=f"orcamento pro recheck de eventos/itens faltando (padrao {EVENTOS_NULOS_RECHECK_ORCAMENTO_SEGUNDOS}s)")
-    # --completar-eventos-worker (13/09/2026, pedido direto da Maria -
-    # "preciso que todos os pedidos sejam processados em uma unica
-    # rodada") - modo standalone pensado pra rodar em N instancias
-    # paralelas ao mesmo tempo (ver strategy.matrix no workflow e
-    # _completar_eventos_itens_worker). Cada instancia processa so a sua
-    # FATIA fixa da lista de pendentes desta janela (--worker-index /
-    # --total-workers, ver _fatia_do_worker - 14/09/2026, pedido direto da
-    # Maria, substitui a 1a versao que reivindicava lotes via RPC) - sem
-    # duplicar trabalho entre si, ja que as fatias sao disjuntas.
-    parser.add_argument("--completar-eventos-worker", action="store_true", default=False,
-                         help="modo worker - completa eventos/itens da sua fatia da lista de pendentes desta janela, pensado pra rodar em paralelo (varias instancias ao mesmo tempo)")
-    parser.add_argument("--worker-index", type=int,
-                         help="posicao desta instancia (1-based) - obrigatorio com --completar-eventos-worker, ver strategy.matrix.worker no workflow")
-    parser.add_argument("--total-workers", type=int, default=20,
-                         help="quantidade total de instancias paralelas (padrao 20, ver strategy.matrix no workflow)")
-    parser.add_argument("--completar-eventos-worker-orcamento-segundos", type=int, default=EVENTOS_WORKER_ORCAMENTO_SEGUNDOS_PADRAO,
-                         help=f"orcamento de tempo desta instancia do worker (padrao {EVENTOS_WORKER_ORCAMENTO_SEGUNDOS_PADRAO}s)")
     args = parser.parse_args()
-    if not args.so_recheck and not args.completar_eventos_worker and (not args.data_inicial or not args.data_final):
-        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck ou --completar-eventos-worker)")
-    if args.completar_eventos_worker and not args.worker_index:
-        parser.error("--worker-index e obrigatorio com --completar-eventos-worker")
+    if not args.so_recheck and (not args.data_inicial or not args.data_final):
+        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck)")
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")
@@ -1248,51 +969,11 @@ def main():
         page = browser.new_page()
         try:
             print("Entrando no Titan BI...")
-            # SEM lock/fila de login (14/09/2026, pedido direto da Maria -
-            # "um worker só deve começar a rodar quando o outro finalizar,
-            # fazendo um por vez"): so pode existir 1 worker do
-            # completar-eventos rodando por vez agora (strategy.max-parallel:
-            # 1 no workflow), entao nunca ha dois logins concorrentes - o
-            # lock atomico no Supabase (titan_login_lock/adquirir_lock_login/
-            # liberar_lock_login) que serializava so o login virou
-            # redundante e foi removido. Ver docstring de
-            # _completar_eventos_itens_worker pro HISTORICO completo de como
-            # chegamos aqui (raiz real: o Titan parece derrubar a sessao
-            # ANTERIOR quando uma nova login com a mesma conta acontece, nao
-            # so rejeitar logins simultaneos - so um worker ativo por vez
-            # evita isso de vez, ao custo de rodar tudo sequencial).
-            #
-            # AVALIADO E DESCARTADO (14/09/2026, pedido direto da Maria -
-            # "os workers devem partir dessa tela que ja foi logada sem
-            # precisar acessar novamente"): reaproveitar a sessao logada
-            # do job export (Playwright context.storage_state) num
-            # arquivo compartilhado via artifact - tecnicamente funciona,
-            # mas o repo e PUBLICO, e artifacts de workflow de repo
-            # publico podem ser baixados por qualquer conta do GitHub, nao
-            # so por quem tem acesso ao repo. Um arquivo de sessao contem
-            # os cookies de autenticacao REAIS - vazar isso e bem mais
-            # grave que vazar um log (da acesso de verdade ao Titan, sem
-            # precisar da senha). A propria Maria confirmou depois: os
-            # workers ja usam TITAN_EMAIL/TITAN_SENHA (Secrets do GitHub,
-            # nunca expostos em log/artifact) pra logar direto - nao
-            # precisa de um mecanismo novo com esse risco.
             scraper.login(page, email, senha)
 
             if args.so_recheck:
-                print("\n--so-recheck: pulando exportacao em massa, so reconferindo pedidos presos e sem eventos...")
+                print("\n--so-recheck: pulando exportacao em massa, so reconferindo pedidos presos em situacao intermediaria...")
                 rechecar_situacoes_presas(page, orcamento_segundos=args.recheck_orcamento_situacao_segundos)
-                rechecar_concluidos_sem_eventos(page, orcamento_segundos=args.recheck_orcamento_eventos_segundos)
-                return
-
-            if args.completar_eventos_worker:
-                print(f"\n--completar-eventos-worker: worker {args.worker_index}/{args.total_workers} "
-                      f"(orcamento {args.completar_eventos_worker_orcamento_segundos}s)...")
-                _completar_eventos_itens_worker(
-                    page,
-                    orcamento_segundos=args.completar_eventos_worker_orcamento_segundos,
-                    worker_index=args.worker_index,
-                    total_workers=args.total_workers,
-                )
                 return
 
             frame = scraper.get_dashboard_frame(page)
@@ -1323,13 +1004,6 @@ def main():
                       f"(marca) - sem os dois, nao da pra identificar com seguranca. Gravadas em "
                       f"{TABELA_FALHAS} pra revisao manual, em vez de so descartadas.")
 
-            # REMOVIDO (12/09/2026, pedido direto da Maria): a chamada de
-            # rechecar_concluidos_sem_eventos(page) daqui - o recheck amplo
-            # (qualquer pedido concluido do site inteiro, nao so desta
-            # janela) saiu do fluxo principal do backfill. A funcao continua
-            # existindo (usada pelo modo --so-recheck, hoje so acionado pelo
-            # titan_recheck_eventos.yml, que a Maria ja deixou desativado -
-            # ver "foi eu, deixa desativado por enquanto").
         finally:
             browser.close()
 
