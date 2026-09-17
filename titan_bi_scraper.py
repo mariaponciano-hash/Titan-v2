@@ -540,9 +540,16 @@ def _formatar_data_para_titan(data_str):
     return f"{int(mes)}/{int(dia)}/{ano}"
 
 
-# Abreviacoes de mes exatamente como o "seletor de mes" do Titan mostra
-# (print real, 17/09/2026) - indice 0 = janeiro.
-MESES_ABREV_PT = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+# Abreviacoes de mes do "seletor de mes" do Titan. CORRIGIDO (17/09/2026,
+# run manual #60 - HTML/print reais: titan_debug/
+# set_filtro_data_nao_encontrado.*): a 1a versao desta lista usava
+# abreviacoes em PORTUGUES ("set" pra setembro) por suposicao - o HTML real
+# confirmou que o seletor mostra "Jan Feb Mar Apr / May Jun Jul Aug / Sep
+# Oct Nov Dec", em INGLES, mesmo com o resto do relatorio em portugues -
+# mesmo padrao ja confirmado varias vezes neste arquivo (aria-label de
+# "Start date"/"End date"/"Select all"/"Previous month" etc.). Indice 0 =
+# janeiro.
+MESES_ABREV_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
 def _clicar_seta_calendario(frame, anterior, timeout_ms=5000):
@@ -627,7 +634,7 @@ def _selecionar_mes_ano_calendario(frame, mes, ano):
     else:
         raise PWTimeout(f"Nao consegui navegar ate o ano {ano} no seletor de mes/ano")
 
-    _clicar_celula_calendario(frame, MESES_ABREV_PT[mes - 1])
+    _clicar_celula_calendario(frame, MESES_ABREV_EN[mes - 1])
 
 
 def definir_periodo(frame, data_inicial, data_final):
