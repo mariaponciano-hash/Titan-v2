@@ -943,19 +943,33 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
     visual-container qualquer (a classe/testid e generica, reaproveitada
     por todo visual do relatorio - Angular reusa o mesmo componente pra
     todos, entao nao da pra saber qual visual especifico so pelo erro) fica
-    por cima do botao. Correlaciona no tempo com a tela "Consulta" ter
-    ficado bem mais cheia (Informação Pedido/Eventos/Itens do pedido/Sem
-    saldo juntos, ver print) do que quando esta funcao foi escrita
-    originalmente (so 1-2 paineis) - a suposicao mais provavel e um
-    problema de layout/z-index dessa tela nova, nao algo que o codigo
-    control. click(force=True) ignora a checagem de "recebe eventos de
-    ponteiro" do Playwright e clica direto nas coordenadas do botao mesmo
-    com algo (aparentemente) por cima - resolve na pratica quando o
-    "bloqueio" e um artefato de layout como este, nao um popup de verdade
-    cobrindo o botao (nesse caso o clique iria pro popup por engano).
+    por cima do botao.
+
+    CAUSA RAIZ DE VERDADE (17/09/2026, run manual #63 - achado real
+    comparando o log do Playwright): click(force=True) sozinho NAO
+    resolveu (run #63 passou dessa checagem mas o menu "Exportar dados"
+    nunca abriu depois - o clique forcado foi pro elemento ERRADO, ja que
+    force so pula a checagem do Playwright, o clique de verdade do
+    navegador ainda vai pro que estiver fisicamente por cima daquele
+    pixel). O log da tentativa com force mostrava "scrolling into view if
+    needed" ANTES de reportar o bloqueio - ou seja, o proprio Playwright
+    precisa rolar a pagina pra trazer o botao "..." pra vista antes de
+    clicar (a tela "Consulta" ficou mais cheia - 4 paineis - do que quando
+    esta funcao foi escrita, o botao pode nao caber na viewport inicial).
+    Essa rolagem acontece DEPOIS do painel.hover() de baixo - o mouse fica
+    parado no lugar antigo enquanto o CONTEUDO rola por baixo dele, entao
+    o hover que revela os icones do cabecalho (".../Mais opcoes") se perde
+    bem na hora do clique, sobrando so o painel/visual que ficou por baixo
+    do mouse na posicao antiga. Corrigido garantindo a rolagem ANTES do
+    hover (scroll_into_view_if_needed proprio, sem depender do scroll
+    implicito do .click()) - assim o hover acontece com a pagina ja
+    parada, sem rolar de novo no meio do clique. Mantido force=True como
+    rede de seguranca (nao deveria mais ser necessario com o hover
+    estavel, mas nao faz mal manter).
     """
     try:
         painel = localizar_painel(frame, titulo_painel)
+        painel.scroll_into_view_if_needed()
         painel.hover()
         # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
         # aria-label do botao "..." de "Mais opcoes" pra "More options",
