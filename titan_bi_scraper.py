@@ -736,25 +736,15 @@ def definir_periodo(frame, data_inicial, data_final, pasta_registro=None):
         _clicar_celula_calendario(frame, str(dia), registrar=registrar, nome_passo="dia_selecionado")
 
         # O filtro de data em si aplica certinho (print real confirmou
-        # "9/16/2026" aplicado e a tabela populada) - mas o passo seguinte
-        # (exportar_dados_do_painel) vinha falhando com "subtree intercepts
-        # pointer events" bem na regiao de "Informação Pedido", ate no
-        # cabecalho inteiro (barra larga, nao so o botao "..."). Suspeita
-        # (17/09/2026, run manual #67): o proprio visual-container do
-        # slicer de data fica com uma "pegada" (bounding box) maior do que
-        # o visivel depois de abrir/fechar o calendario - o popup chega a
-        # max-height:400px (ver CSS do pbi-tooltip/calendar), e pode nao
-        # encolher de volta na hora certa, sobrando por cima dos paineis
-        # logo abaixo (Informação Pedido comeca bem perto, y~135). Clicar
-        # de novo na propria aba "Consulta" (ja ativa - nao muda de tela)
-        # forca o Power BI a recalcular o layout da pagina, sem precisar
-        # recarregar o dashboard inteiro (o que perderia o filtro de data
-        # que acabamos de aplicar).
-        aba_consulta = elemento_visivel(frame.get_by_role("tab", name="Consulta", exact=True), timeout_ms=10000)
-        aba_consulta.click()
-        time.sleep(0.5)
-        registrar("aba_consulta_reclicada")
-
+        # "9/16/2026" aplicado e a tabela populada) - o passo seguinte
+        # (exportar_dados_do_painel) e quem lida com o bloqueio de clique
+        # na regiao de "Informação Pedido" (ver seu historico - a causa
+        # de verdade e um visual-container generico sobrepondo o painel,
+        # resolvido la com dispatch_event em vez de click() normal).
+        # Reclicar na aba "Consulta" foi tentado aqui (run #67-#69) como
+        # forma de "resetar" o layout - NAO tinha efeito real nenhum no
+        # bloqueio (mesmo resultado com ou sem), removido pra nao sugerir
+        # um efeito que nao existe.
         painel = localizar_painel(frame, "Informação Pedido")
         painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
         time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
@@ -1031,7 +1021,22 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino, pasta_registro
         time.sleep(0.3)
         registrar("painel_hover")
         cabecalho = elemento_visivel(painel.locator(".vcHeader"), timeout_ms=10000)
-        cabecalho.click()
+        # CORRIGIDO (17/09/2026, run manual #70 - HTML real): de volta ao
+        # MESMO bloqueio de antes ("subtree intercepts pointer events") -
+        # o reclique na aba "Consulta" (fix da run #67-#69) NAO resolvia
+        # isso de verdade, so mudava o sintoma (sem ele, o cabecalho nem
+        # chegava a existir; com ele, existe mas o clique normal continua
+        # sendo interceptado por outro visual-container generico por cima).
+        # click() normal (mesmo com force=True, ja testado e descartado -
+        # ver historico) sempre calcula coordenadas de tela e deixa o
+        # NAVEGADOR decidir quem recebe o evento naquele pixel - se outro
+        # elemento estiver fisicamente por cima, o evento vai pra ele, nao
+        # pro nosso alvo. dispatch_event("click") e diferente: dispara o
+        # evento DIRETO no elemento via JS (Element.dispatchEvent), sem
+        # depender de coordenada nem de quem esta por cima - o handler de
+        # clique do Angular do proprio elemento roda do mesmo jeito,
+        # independente do que estiver sobrepondo visualmente.
+        cabecalho.dispatch_event("click")
         time.sleep(0.3)
         registrar("cabecalho_clicado")
         # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
@@ -1042,7 +1047,7 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino, pasta_registro
         botao_opcoes = elemento_visivel(
             painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
         )
-        botao_opcoes.click()
+        botao_opcoes.dispatch_event("click")  # mesmo motivo do cabecalho acima
         registrar("botao_opcoes_clicado")
 
         # Mesmo idioma trocou aqui tambem (confirmado via titan_debug: o menu
