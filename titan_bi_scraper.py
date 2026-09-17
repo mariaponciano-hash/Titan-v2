@@ -552,7 +552,7 @@ def _formatar_data_para_titan(data_str):
 MESES_ABREV_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
-def _clicar_seta_calendario(frame, anterior, timeout_ms=5000):
+def _clicar_seta_calendario(frame, anterior, timeout_ms=5000, registrar=None):
     """
     As setas de navegacao do calendario (ano anterior/seguinte no seletor de
     mes, mes anterior/seguinte na grade de dias). CORRIGIDO (17/09/2026,
@@ -570,13 +570,20 @@ def _clicar_seta_calendario(frame, anterior, timeout_ms=5000):
     mesma convencao ("Previous year"/"Next year") quando o seletor esta na
     grade de meses - NAO confirmado ainda com HTML real desse estado
     especifico (a 1a falha aconteceu antes de chegar la).
+
+    registrar (17/09/2026, pedido direto da Maria - "registra aqui o
+    print de todos os passos, nao so os erros"): callback opcional
+    chamado depois do clique, pra gravar um print numerado deste passo -
+    ver definir_periodo pra como e montado.
     """
     padrao = re.compile("^Previous", re.IGNORECASE) if anterior else re.compile("^Next", re.IGNORECASE)
     elemento_visivel(frame.get_by_role("button", name=padrao), timeout_ms=timeout_ms).click()
     time.sleep(0.4)
+    if registrar:
+        registrar(f"seta_calendario_{'anterior' if anterior else 'seguinte'}")
 
 
-def _clicar_celula_calendario(frame, texto_exato, timeout_ms=8000):
+def _clicar_celula_calendario(frame, texto_exato, timeout_ms=8000, registrar=None, nome_passo=None):
     """
     Clica numa celula do calendario (mes ou dia) pelo texto exato.
     CORRIGIDO (17/09/2026, mesmo HTML real citado acima): a grade de dias
@@ -597,14 +604,18 @@ def _clicar_celula_calendario(frame, texto_exato, timeout_ms=8000):
     vivo, pode usar uma classe de botao diferente pro mes em si. Casar pelo
     texto exato dentro do mesmo container estavel cobre os dois casos sem
     depender de uma classe nao confirmada.
+
+    registrar/nome_passo: ver _clicar_seta_calendario acima.
     """
     botoes = frame.locator(".calendar-table-container button:not([disabled])")
     alvo = botoes.filter(has_text=re.compile(rf"^\s*{re.escape(texto_exato)}\s*$", re.IGNORECASE))
     elemento_visivel(alvo, timeout_ms=timeout_ms).click()
     time.sleep(0.4)
+    if registrar:
+        registrar(nome_passo or f"celula_calendario_{texto_exato}")
 
 
-def _selecionar_mes_ano_calendario(frame, mes, ano):
+def _selecionar_mes_ano_calendario(frame, mes, ano, registrar=None):
     """
     Abre o "seletor de mes" (clique no botao de periodo, que mostra
     "<mes> <ano>" na grade de dias) e navega ate o ANO certo antes de clicar
@@ -621,6 +632,8 @@ def _selecionar_mes_ano_calendario(frame, mes, ano):
     botao_periodo = elemento_visivel(frame.locator("button.month-year"), timeout_ms=15000)
     botao_periodo.click()
     time.sleep(0.4)
+    if registrar:
+        registrar("seletor_mes_aberto")
 
     for _ in range(24):  # teto generoso (2 anos pra qualquer lado) - nunca deveria precisar de tanto
         texto = elemento_visivel(frame.locator("button.month-year"), timeout_ms=5000).inner_text().strip()
@@ -630,14 +643,14 @@ def _selecionar_mes_ano_calendario(frame, mes, ano):
         ano_mostrado = int(m.group())
         if ano_mostrado == ano:
             break
-        _clicar_seta_calendario(frame, anterior=ano < ano_mostrado)
+        _clicar_seta_calendario(frame, anterior=ano < ano_mostrado, registrar=registrar)
     else:
         raise PWTimeout(f"Nao consegui navegar ate o ano {ano} no seletor de mes/ano")
 
-    _clicar_celula_calendario(frame, MESES_ABREV_EN[mes - 1])
+    _clicar_celula_calendario(frame, MESES_ABREV_EN[mes - 1], registrar=registrar, nome_passo="mes_selecionado")
 
 
-def definir_periodo(frame, data_inicial, data_final):
+def definir_periodo(frame, data_inicial, data_final, pasta_registro=None):
     """
     REESCRITO (17/09/2026, passo a passo exato + prints reais mandados pela
     Maria): o campo "Data Inicial - Data Final" deixou de ser dois <input>
@@ -692,9 +705,23 @@ def definir_periodo(frame, data_inicial, data_final):
     verdade (ver _formatar_data_para_titan, ainda usada por
     titan_preencher_lacunas.py, que roda numa aba diferente e ainda nao foi
     confirmada com este novo fluxo de calendario).
+
+    pasta_registro (17/09/2026, pedido direto da Maria - "registra aqui o
+    print de todos os passos, nao so os erros"): quando informada, grava
+    um print numerado de CADA passo (nao so quando falha - isso ja e
+    salvar_diagnostico) em titan_debug/<pasta_registro>/ - ver
+    registrar_passo.
     """
+    passo = [0]
+
+    def registrar(nome):
+        if pasta_registro is not None:
+            passo[0] += 1
+            registrar_passo(frame, pasta_registro, passo[0], nome)
+
     try:
         elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
+        registrar("tela_inicial")
 
         botao_calendario = elemento_visivel(
             frame.locator('button.calendar-button[aria-label^="Start date"]'),
@@ -702,10 +729,11 @@ def definir_periodo(frame, data_inicial, data_final):
         )
         botao_calendario.click()
         time.sleep(0.5)
+        registrar("calendario_aberto")
 
         dia, mes, ano = (int(p) for p in data_inicial.split("/"))
-        _selecionar_mes_ano_calendario(frame, mes, ano)
-        _clicar_celula_calendario(frame, str(dia))
+        _selecionar_mes_ano_calendario(frame, mes, ano, registrar=registrar)
+        _clicar_celula_calendario(frame, str(dia), registrar=registrar, nome_passo="dia_selecionado")
 
         # O filtro de data em si aplica certinho (print real confirmou
         # "9/16/2026" aplicado e a tabela populada) - mas o passo seguinte
@@ -725,10 +753,12 @@ def definir_periodo(frame, data_inicial, data_final):
         aba_consulta = elemento_visivel(frame.get_by_role("tab", name="Consulta", exact=True), timeout_ms=10000)
         aba_consulta.click()
         time.sleep(0.5)
+        registrar("aba_consulta_reclicada")
 
         painel = localizar_painel(frame, "Informação Pedido")
         painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
         time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
+        registrar("tabela_populada")
     except PWTimeout:
         salvar_diagnostico(frame, "set_filtro_data_nao_encontrado")
         raise
@@ -916,7 +946,7 @@ def rolar_tabela_ate_o_fim(frame):
         pass  # rolagem e so um reforco visual, nao e critica
 
 
-def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
+def exportar_dados_do_painel(frame, titulo_painel, pasta_destino, pasta_registro=None):
     """
     Automatiza "..." -> "Exportar dados" -> "Exportar" num painel do Power BI
     e devolve o caminho do arquivo baixado (.xlsx).
@@ -972,10 +1002,21 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
     estrutural. Um print tirado bem no instante apos o clique (run #66)
     mostrou a tela sem NENHUMA mudanca visivel - confirmando que o clique
     nunca alcancava o botao de verdade.
+
+    pasta_registro: mesmo mecanismo de definir_periodo (pedido direto da
+    Maria, 17/09/2026) - grava um print de cada passo, nao so quando falha.
     """
+    passo = [0]
+
+    def registrar(nome):
+        if pasta_registro is not None:
+            passo[0] += 1
+            registrar_passo(frame, pasta_registro, passo[0], nome)
+
     try:
         painel = localizar_painel(frame, titulo_painel)
         painel.scroll_into_view_if_needed()
+        registrar(f"painel_{titulo_painel}_na_vista")
         # O PASSO QUE FALTAVA: clica no cabecalho do painel (a barra do
         # titulo, role="toolbar" aria-label="Visual container header" -
         # ver docstring acima) pra SELECIONAR o visual antes de mexer nos
@@ -983,6 +1024,7 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
         cabecalho = elemento_visivel(painel.locator(".vcHeader"), timeout_ms=10000)
         cabecalho.click()
         time.sleep(0.3)
+        registrar("cabecalho_clicado")
         # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
         # aria-label do botao "..." de "Mais opcoes" pra "More options",
         # quebrando o get_by_role por nome. Confirmado via titan_debug
@@ -992,6 +1034,7 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
             painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
         )
         botao_opcoes.click()
+        registrar("botao_opcoes_clicado")
 
         # Mesmo idioma trocou aqui tambem (confirmado via titan_debug: o menu
         # do "..." agora mostra "Export data" em vez de "Exportar dados").
@@ -1000,14 +1043,18 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
         item_exportar = elemento_visivel(
             frame.get_by_text(re.compile(r"^(Exportar dados|Export data)$")), timeout_ms=10000
         )
+        registrar("menu_opcoes_aberto")
         item_exportar.click()
+        registrar("exportar_dados_clicado")
 
         botao_exportar_dialogo = elemento_visivel(
             frame.get_by_role("button", name=re.compile(r"^(Exportar|Export)$")), timeout_ms=15000
         )
+        registrar("dialogo_exportar_aberto")
         with frame.page.expect_download(timeout=180000) as download_info:
             botao_exportar_dialogo.click()
         download = download_info.value
+        registrar("download_iniciado")
     except PWTimeout:
         salvar_diagnostico(frame, f"exportar_dados_falhou_{titulo_painel}")
         raise

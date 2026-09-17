@@ -159,6 +159,15 @@ TABELA_FALHAS = "infos_titan_falhas_backfill"
 TAMANHO_LOTE = 200  # registros por chamada ao Supabase - evita 1 request por pedido
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabalho - o arquivo e apagado apos o upload
 
+# DIAGNOSTICO TEMPORARIO (17/09/2026, pedido direto da Maria - "registra
+# aqui o print de todos os passos, nao so os erros, cada passo do titan
+# ate a exportação"): grava um print numerado de CADA passo do filtro de
+# data + exportacao, sucesso ou nao - ver definir_periodo/exportar_dados_
+# do_painel em titan_bi_scraper.py. Tirar depois de confirmar que o fluxo
+# novo do calendario/exportacao esta estavel (isso deixa a run mais lenta
+# e mais pesada, so serve pra depurar ao vivo).
+PASTA_PASSO_A_PASSO = Path(__file__).parent / "titan_debug" / "passo_a_passo"
+
 # Metabase (16/09/2026, ver ITENS VIA METABASE no topo do arquivo) - mesmo
 # banco "Data Mart" ja usado no backfill manual de itens (14-15/09/2026).
 # METABASE_API_KEY vem de um Secret do GitHub (a conta da Maria no Metabase
@@ -768,7 +777,7 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
         sufixo = f" (tentativa {tentativa}/{tentativas})" if tentativa > 1 else ""
         print(f"Definindo periodo {data_inicial} - {data_final}{sufixo}...")
         try:
-            scraper.definir_periodo(frame, data_inicial, data_final)
+            scraper.definir_periodo(frame, data_inicial, data_final, pasta_registro=PASTA_PASSO_A_PASSO)
             # Print SEMPRE (nao so quando falha) - achado real (11/09/2026): sem
             # nenhuma evidencia visual de como o filtro fica depois do
             # definir_periodo, nao da pra saber se o bug e na digitacao (campo
@@ -778,7 +787,9 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
             scraper.salvar_diagnostico(frame, f"periodo_definido_{data_inicial.replace('/', '-')}_t{tentativa}")
 
             print("Exportando dados do painel 'Informação Pedido'...")
-            caminho_export = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
+            caminho_export = scraper.exportar_dados_do_painel(
+                frame, "Informação Pedido", PASTA_EXPORTS, pasta_registro=PASTA_PASSO_A_PASSO
+            )
             print(f"  baixado em {caminho_export}")
             filtro_aplicado, registros = scraper.ler_export_xlsx(caminho_export)
             try:
