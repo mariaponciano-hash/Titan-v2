@@ -945,72 +945,59 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
     todos, entao nao da pra saber qual visual especifico so pelo erro) fica
     por cima do botao.
 
-    CAUSA RAIZ DE VERDADE (17/09/2026, run manual #63 - achado real
-    comparando o log do Playwright): click(force=True) sozinho NAO
-    resolveu (run #63 passou dessa checagem mas o menu "Exportar dados"
-    nunca abriu depois - o clique forcado foi pro elemento ERRADO, ja que
-    force so pula a checagem do Playwright, o clique de verdade do
-    navegador ainda vai pro que estiver fisicamente por cima daquele
-    pixel). O log da tentativa com force mostrava "scrolling into view if
-    needed" ANTES de reportar o bloqueio - ou seja, o proprio Playwright
-    precisa rolar a pagina pra trazer o botao "..." pra vista antes de
-    clicar (a tela "Consulta" ficou mais cheia - 4 paineis - do que quando
-    esta funcao foi escrita, o botao pode nao caber na viewport inicial).
-    Essa rolagem acontece DEPOIS do painel.hover() de baixo - o mouse fica
-    parado no lugar antigo enquanto o CONTEUDO rola por baixo dele, entao
-    o hover que revela os icones do cabecalho (".../Mais opcoes") se perde
-    bem na hora do clique, sobrando so o painel/visual que ficou por baixo
-    do mouse na posicao antiga. Tentado: scroll_into_view_if_needed()
-    proprio ANTES do hover (pra rolagem e hover acontecerem em ordem certa)
-    - NAO resolveu sozinho (run #64, mesmo resultado identico: o botao
-    "..." simplesmente some do DOM entre o clique e a checagem do menu -
-    confirmado comparando o HTML de antes/depois, 0 ocorrencias de
-    "visual-more-options-btn" no HTML da falha). A causa exata continua
-    sem confirmar (layout novo, Angular re-renderizando o header do
-    visual, ou algo mais), mas o comportamento e claramente INTERMITENTE -
-    o mesmo botao existe e e clicavel um instante antes. Em vez de mais
-    uma suposicao de causa raiz, RETRY (17/09/2026): repete hover+clique
-    ate `tentativas` vezes, cada uma com timeout mais curto pro menu abrir
-    - mesmo padrao ja usado em marcar_item_da_lista/_abrir_dropdown_e_
-    pegar_campo_busca pra flakiness real do Power BI sem causa unica
-    identificada. force=True mantido como rede de seguranca extra.
+    CAUSA RAIZ DE VERDADE (17/09/2026 - passo a passo + prints reais da
+    Maria): so hover() no painel NUNCA foi suficiente pra deixar o "..."
+    clicavel de verdade nesta tela - faltava CLICAR no cabecalho do painel
+    (a barra esverdeada com o titulo "Informação Pedido") pra selecionar o
+    visual antes disso. Sem esse clique, o botao "..." existe no DOM (por
+    isso os fixes anteriores - force=True, scroll antes do hover, retry -
+    todos "encontravam" o elemento) mas o clique nele nunca abria o menu:
+    o clique ia pras coordenadas certas, mas sem o visual selecionado
+    primeiro, outro visual-container qualquer (ver "subtree intercepts
+    pointer events" no historico abaixo) recebe o evento de verdade -
+    exatamente o que a Maria confirmou ao vivo, no navegador dela, clicando
+    o titulo ANTES dos 3 pontinhos aparecerem clicaveis.
+
+    HISTORICO da investigacao (3 tentativas antes de descobrir isso, todas
+    incompletas mas registradas aqui pra nao repetir o caminho): (1)
+    force=True sozinho (run #62) - clique "funcionava" sem erro do
+    Playwright mas o menu nunca abria (forcar so pula a checagem do
+    Playwright, o clique de verdade ainda vai pro que estiver fisicamente
+    por cima daquele pixel). (2) scroll_into_view_if_needed() antes do
+    hover (run #63/#64, suspeita: rolagem no meio do clique perdendo o
+    hover) - mesmo resultado identico. (3) retry de 3 tentativas (run #65)
+    - tambem identico, confirmando que NAO era flakiness/timing, era
+    estrutural. Um print tirado bem no instante apos o clique (run #66)
+    mostrou a tela sem NENHUMA mudanca visivel - confirmando que o clique
+    nunca alcancava o botao de verdade.
     """
     try:
-        item_exportar = None
-        ultimo_erro = None
-        for tentativa in range(3):
-            painel = localizar_painel(frame, titulo_painel)
-            painel.scroll_into_view_if_needed()
-            painel.hover()
-            # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
-            # aria-label do botao "..." de "Mais opcoes" pra "More options",
-            # quebrando o get_by_role por nome. Confirmado via titan_debug
-            # artifact: o botao real tem data-testid="visual-more-options-btn"
-            # (classe vcMenuBtn), estavel independente do idioma do aria-label.
-            botao_opcoes = elemento_visivel(
-                painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
-            )
-            botao_opcoes.click(force=True)
-            # DIAGNOSTICO TEMPORARIO (17/09/2026) - salva o estado exato logo
-            # apos o clique, ANTES de checar se o menu abriu (as 3 tentativas
-            # ate agora falharam identico, sem nenhuma pista nova) - tirar
-            # depois de entender o que esta acontecendo de verdade aqui.
-            salvar_diagnostico(frame, f"apos_clique_opcoes_tentativa{tentativa + 1}")
-            try:
-                # Mesmo idioma trocou aqui tambem (confirmado via titan_debug:
-                # o menu do "..." agora mostra "Export data" em vez de
-                # "Exportar dados"). Aceita os dois pra nao quebrar de novo se
-                # o Power BI voltar pro PT-BR em algum momento.
-                item_exportar = elemento_visivel(
-                    frame.get_by_text(re.compile(r"^(Exportar dados|Export data)$")), timeout_ms=4000
-                )
-                break
-            except PWTimeout as e:
-                ultimo_erro = e
-                frame.page.keyboard.press("Escape")  # fecha qualquer menu/estado residual antes de tentar de novo
-                time.sleep(0.5)
-        if item_exportar is None:
-            raise ultimo_erro
+        painel = localizar_painel(frame, titulo_painel)
+        painel.scroll_into_view_if_needed()
+        # O PASSO QUE FALTAVA: clica no cabecalho do painel (a barra do
+        # titulo, role="toolbar" aria-label="Visual container header" -
+        # ver docstring acima) pra SELECIONAR o visual antes de mexer nos
+        # icones dele. So depois disso o "..." fica clicavel de verdade.
+        cabecalho = elemento_visivel(painel.locator(".vcHeader"), timeout_ms=10000)
+        cabecalho.click()
+        time.sleep(0.3)
+        # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
+        # aria-label do botao "..." de "Mais opcoes" pra "More options",
+        # quebrando o get_by_role por nome. Confirmado via titan_debug
+        # artifact: o botao real tem data-testid="visual-more-options-btn"
+        # (classe vcMenuBtn), estavel independente do idioma do aria-label.
+        botao_opcoes = elemento_visivel(
+            painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
+        )
+        botao_opcoes.click()
+
+        # Mesmo idioma trocou aqui tambem (confirmado via titan_debug: o menu
+        # do "..." agora mostra "Export data" em vez de "Exportar dados").
+        # Aceita os dois pra nao quebrar de novo se o Power BI voltar pro
+        # PT-BR em algum momento.
+        item_exportar = elemento_visivel(
+            frame.get_by_text(re.compile(r"^(Exportar dados|Export data)$")), timeout_ms=10000
+        )
         item_exportar.click()
 
         botao_exportar_dialogo = elemento_visivel(
