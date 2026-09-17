@@ -1,0 +1,92 @@
+name: Titan preencher lacunas (diario)
+
+# PORTADO do repo central-tickets (17/09/2026, a pedido direto da Maria) -
+# ver titan_preencher_lacunas.py pro detalhe dos 3 ajustes feitos na
+# portagem (marca "by_samia"/"by samia", formato de data M/d/aaaa, unpacking
+# de ler_export_xlsx). Roda titan_preencher_lacunas.py todo dia - script
+# SEPARADO do titan_backfill.py de proposito (mesmo motivo do repo
+# original: "quero que voce faca isso em outro action, sem ser pelo
+# backfill").
+#
+# Reusa os Secrets METABASE_URL/METABASE_API_KEY ja configurados pro
+# titan_backfill.py (mesmo Metabase, mesma chave - nao precisou cadastrar
+# nada novo).
+#
+# --dias 2 (nao 1): cobre ontem + anteontem toda rodada, de proposito - da
+# uma segunda chance pra qualquer NF que a rodada de ontem tenha perdido
+# (fatia de depositante que falhou, timeout pontual etc.), sem custar muito
+# mais tempo que so 1 dia.
+#
+# CUSTO (numero herdado do repo original, nunca remedido aqui): teste manual
+# real (1 dia x 5 fatias de depositante) levou ~5-10min - bem mais caro que
+# o titan_backfill.py normal (reload completo da pagina por fatia, ver
+# etapa2_rodar), mas --dias 2 (10 fatias) deve ficar por volta de 15-25min/
+# rodada, ~500-750min/mes rodando 1x/dia - dentro do orcamento de 2.000min/
+# mes do plano Free (mesmo aviso ja feito em titan_watcher.yml/titan_backfill
+# .yml). Confira Settings > Billing > Actions depois das primeiras rodadas
+# mesmo assim - o tempo real no runner do GitHub costuma ser maior que no PC
+# (CPU compartilhada).
+#
+# ATENCAO - Etapa 2 (navegacao ate a aba "Exportação - Status por Pedido")
+# nunca foi validada ao vivo (ver aviso grande em titan_preencher_lacunas.py)
+# - recomendado rodar manualmente uma vez (workflow_dispatch, ou na sua
+# maquina sem --headless) antes de confiar cegamente na primeira rodada
+# agendada. Se travar, o diagnostico cai no artifact titan_debug de sempre.
+on:
+  schedule:
+    - cron: '0 8 * * *'  # 05:00 BRT - depois da rodada matinal do titan_backfill (06h), antes do expediente
+  workflow_dispatch:
+    inputs:
+      dias:
+        description: 'Quantos dias corridos pra tras (vazio = padrao de 2)'
+        required: false
+        type: string
+
+jobs:
+  preencher_lacunas:
+    runs-on: ubuntu-latest
+    # Generoso de proposito ate termos um numero real medido neste repo -
+    # ver aviso grande acima. Ajuste depois do primeiro numero real de
+    # producao.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache do Chromium do Playwright
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Instalar dependencias
+        run: |
+          pip install playwright openpyxl
+          playwright install --with-deps chromium
+
+      - name: Rodar
+        env:
+          TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
+          TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
+          METABASE_URL: ${{ secrets.METABASE_URL }}
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+        run: |
+          if [ -n "${{ github.event.inputs.dias }}" ]; then
+            python titan_preencher_lacunas.py --dias "${{ github.event.inputs.dias }}" --headless
+          else
+            python titan_preencher_lacunas.py --dias 2 --headless
+          fi
+
+      # Mesmo motivo dos outros workflows - o runner some ao fim do job,
+      # sem isso o print/HTML de salvar_diagnostico() ficaria inacessivel.
+      - name: Subir diagnostico (se tiver)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: titan_debug
+          path: titan_debug/
+          retention-days: 7
+          if-no-files-found: ignore
