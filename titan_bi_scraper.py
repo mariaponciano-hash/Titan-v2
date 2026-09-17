@@ -707,22 +707,24 @@ def definir_periodo(frame, data_inicial, data_final):
         _selecionar_mes_ano_calendario(frame, mes, ano)
         _clicar_celula_calendario(frame, str(dia))
 
-        # NAO e o mouse (17/09/2026, run manual #62 - HTML/print reais:
-        # titan_debug/exportar_dados_falhou_Informação Pedido.*): o filtro
-        # de data em si funciona (print confirmou "9/16/2026" aplicado e a
-        # tabela populada certinha), mas exportar_dados_do_painel falhava
-        # logo depois com "subtree intercepts pointer events" ao clicar no
-        # "..." de "Informação Pedido". Tentei mover o mouse pra longe do
-        # botao de calendario (suspeita: um tooltip do Power BI ficando
-        # preso) - NAO resolveu (o mesmo tooltip aparecia igual nas duas
-        # rodadas, antes e depois desse fix, sem nenhuma diferenca real).
-        # A causa de verdade nao e o calendario - ver o fix de verdade
-        # (force=True) na docstring de exportar_dados_do_painel: o layout
-        # desta tela ("Consulta", com 4 paineis - Informação Pedido/
-        # Eventos/Itens do pedido/Sem saldo - bem mais cheia do que quando
-        # essa funcao foi escrita) parece ter outro elemento invisivel
-        # sobrepondo o botao "...", independente do calendario.
-        time.sleep(0.3)
+        # O filtro de data em si aplica certinho (print real confirmou
+        # "9/16/2026" aplicado e a tabela populada) - mas o passo seguinte
+        # (exportar_dados_do_painel) vinha falhando com "subtree intercepts
+        # pointer events" bem na regiao de "Informação Pedido", ate no
+        # cabecalho inteiro (barra larga, nao so o botao "..."). Suspeita
+        # (17/09/2026, run manual #67): o proprio visual-container do
+        # slicer de data fica com uma "pegada" (bounding box) maior do que
+        # o visivel depois de abrir/fechar o calendario - o popup chega a
+        # max-height:400px (ver CSS do pbi-tooltip/calendar), e pode nao
+        # encolher de volta na hora certa, sobrando por cima dos paineis
+        # logo abaixo (Informação Pedido comeca bem perto, y~135). Clicar
+        # de novo na propria aba "Consulta" (ja ativa - nao muda de tela)
+        # forca o Power BI a recalcular o layout da pagina, sem precisar
+        # recarregar o dashboard inteiro (o que perderia o filtro de data
+        # que acabamos de aplicar).
+        aba_consulta = elemento_visivel(frame.get_by_role("tab", name="Consulta", exact=True), timeout_ms=10000)
+        aba_consulta.click()
+        time.sleep(0.5)
 
         painel = localizar_painel(frame, "Informação Pedido")
         painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
