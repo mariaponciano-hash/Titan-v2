@@ -1017,10 +1017,19 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino, pasta_registro
         painel = localizar_painel(frame, titulo_painel)
         painel.scroll_into_view_if_needed()
         registrar(f"painel_{titulo_painel}_na_vista")
-        # O PASSO QUE FALTAVA: clica no cabecalho do painel (a barra do
-        # titulo, role="toolbar" aria-label="Visual container header" -
-        # ver docstring acima) pra SELECIONAR o visual antes de mexer nos
-        # icones dele. So depois disso o "..." fica clicavel de verdade.
+        # CORRIGIDO (17/09/2026, run manual #69 - HTML real: 0 ocorrencias
+        # de "vcHeader" na pagina inteira no momento da falha, nem no
+        # proprio CSS): sem hover() antes, o cabecalho do visual (com o
+        # "..." dentro) parece nem chegar a ser RENDERIZADO pelo Power BI -
+        # nao e so uma questao de visibilidade/CSS, o proprio
+        # <visual-container-header> some do DOM. Restaurado o hover() (que
+        # a versao anterior desta funcao ja usava) ANTES de procurar
+        # ".vcHeader" - so depois disso clica no cabecalho (passo que a
+        # Maria confirmou ao vivo) pra selecionar o visual antes de mexer
+        # nos icones dele.
+        painel.hover()
+        time.sleep(0.3)
+        registrar("painel_hover")
         cabecalho = elemento_visivel(painel.locator(".vcHeader"), timeout_ms=10000)
         cabecalho.click()
         time.sleep(0.3)
