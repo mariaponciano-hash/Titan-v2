@@ -548,38 +548,51 @@ MESES_ABREV_PT = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set",
 def _clicar_seta_calendario(frame, anterior, timeout_ms=5000):
     """
     As setas de navegacao do calendario (ano anterior/seguinte no seletor de
-    mes, mes anterior/seguinte na grade de dias) - confirmado por print real
-    (17/09/2026) que a seta de CIMA e "Ano anterior" (voltar) e por simetria
-    a de BAIXO e a de avancar. Tenta por aria-label de verdade primeiro
-    (padrao Angular Material - mesma familia CDK ja confirmada no resto do
-    Titan, ver fechar_popup_calendario) - so cai pra posicao (1a bloco =
-    anterior, 2a = seguinte, classes estaveis do proprio componente) se o
-    aria-label nao bater.
+    mes, mes anterior/seguinte na grade de dias). CORRIGIDO (17/09/2026,
+    HTML real salvo em titan_debug/set_filtro_data_nao_encontrado.html apos
+    a 1a tentativa desta funcao falhar): o calendario NAO e Angular
+    Material (a 1a versao desta funcao supunha isso por causa de outros
+    popups CDK do Titan, mas era suposicao errada) - e um componente
+    PROPRIO do Power BI (classe "pbi-date-picker"). O botao real e
+    <button class="navigate-button" aria-label="Previous month"> (ou
+    "Next month" no lado direito) - confirmado direto no HTML. Usa regex
+    "^Previous"/"^Next" (aria-label sempre em INGLES, mesmo com o resto do
+    relatorio em portugues - mesmo padrao ja confirmado em "Start date"/
+    "End date"/"Select all" no resto deste arquivo) - pelo padrao visto no
+    mes (aria-label="Previous month"/"Next month"), o ano deve seguir a
+    mesma convencao ("Previous year"/"Next year") quando o seletor esta na
+    grade de meses - NAO confirmado ainda com HTML real desse estado
+    especifico (a 1a falha aconteceu antes de chegar la).
     """
-    padrao = re.compile("anterior", re.IGNORECASE) if anterior else re.compile("seguinte|pr[oó]xim", re.IGNORECASE)
-    por_aria = frame.get_by_role("button", name=padrao)
-    if por_aria.count() > 0:
-        elemento_visivel(por_aria, timeout_ms=timeout_ms).click()
-        time.sleep(0.4)
-        return
-    seletor = ".mat-calendar-previous-button" if anterior else ".mat-calendar-next-button"
-    elemento_visivel(frame.locator(seletor), timeout_ms=timeout_ms).click()
+    padrao = re.compile("^Previous", re.IGNORECASE) if anterior else re.compile("^Next", re.IGNORECASE)
+    elemento_visivel(frame.get_by_role("button", name=padrao), timeout_ms=timeout_ms).click()
     time.sleep(0.4)
 
 
 def _clicar_celula_calendario(frame, texto_exato, timeout_ms=8000):
     """
-    Clica numa celula do calendario (mes ou dia) pelo texto exato -
-    ignorando celulas desabilitadas (mat-calendar-body-disabled, classe
-    estavel do Angular Material pra dias fora do mes/intervalo permitido) -
-    sem isso, um dia de "preenchimento" do mes vizinho com o mesmo numero
-    (ex: dia 1 aparecendo tanto no fim do mes anterior quanto no comeco do
-    mes atual) podia bater e clicar na celula errada.
+    Clica numa celula do calendario (mes ou dia) pelo texto exato.
+    CORRIGIDO (17/09/2026, mesmo HTML real citado acima): a grade de dias
+    usa <button class="date-cell" aria-description="Thursday, July 16,
+    2026" [disabled]> 16 </button> dentro de ".calendar-table-container"
+    - dias fora do mes atual (preenchimento) E dias fora do intervalo
+    permitido vem com o atributo "disabled" de verdade (confirmado: 28-30
+    de junho e 1 de agosto, os dias de preenchimento ao redor de julho,
+    tinham "disabled"; 1-11 de julho TAMBEM vinham disabled nesse teste -
+    o Titan parece limitar quanto passado da pra escolher a partir da Data
+    Final atual, nao so mes vizinho). Exclui SEMPRE celulas disabled, senao
+    um dia de preenchimento com o mesmo numero do dia certo (ex: dia "1")
+    podia bater e clicar na celula errada.
+
+    Escopo generico (".calendar-table-container button", nao especifico
+    ".date-cell") de proposito: o HTML real confirmado e da grade de DIAS -
+    a grade de MESES (dentro do "seletor de mes") ainda nao foi vista ao
+    vivo, pode usar uma classe de botao diferente pro mes em si. Casar pelo
+    texto exato dentro do mesmo container estavel cobre os dois casos sem
+    depender de uma classe nao confirmada.
     """
-    conteudos = frame.locator(
-        ".mat-calendar-body-cell:not(.mat-calendar-body-disabled) .mat-calendar-body-cell-content"
-    )
-    alvo = conteudos.filter(has_text=re.compile(rf"^\s*{re.escape(texto_exato)}\s*$", re.IGNORECASE))
+    botoes = frame.locator(".calendar-table-container button:not([disabled])")
+    alvo = botoes.filter(has_text=re.compile(rf"^\s*{re.escape(texto_exato)}\s*$", re.IGNORECASE))
     elemento_visivel(alvo, timeout_ms=timeout_ms).click()
     time.sleep(0.4)
 
@@ -589,13 +602,21 @@ def _selecionar_mes_ano_calendario(frame, mes, ano):
     Abre o "seletor de mes" (clique no botao de periodo, que mostra
     "<mes> <ano>" na grade de dias) e navega ate o ANO certo antes de clicar
     no mes - passo a passo confirmado por print real da Maria (17/09/2026).
+
+    CORRIGIDO (17/09/2026, HTML real - ver _clicar_seta_calendario/
+    _clicar_celula_calendario acima pro mesmo achado): o botao de periodo
+    e <button class="month-year" aria-label="Month Picker"
+    aria-description="July 2026, change month"> July 2026 </button> -
+    aria-label e SEMPRE "Month Picker" (nao muda com o mes/ano mostrado),
+    entao localiza pela classe estavel ".month-year" (confirmada no HTML),
+    nao pelo texto (que muda a cada mes).
     """
-    botao_periodo = elemento_visivel(frame.locator(".mat-calendar-period-button"), timeout_ms=15000)
+    botao_periodo = elemento_visivel(frame.locator("button.month-year"), timeout_ms=15000)
     botao_periodo.click()
     time.sleep(0.4)
 
     for _ in range(24):  # teto generoso (2 anos pra qualquer lado) - nunca deveria precisar de tanto
-        texto = elemento_visivel(frame.locator(".mat-calendar-period-button"), timeout_ms=5000).inner_text().strip()
+        texto = elemento_visivel(frame.locator("button.month-year"), timeout_ms=5000).inner_text().strip()
         m = re.search(r"\d{4}", texto)
         if not m:
             raise PWTimeout(f"Seletor de mes/ano com texto inesperado (sem ano): {texto!r}")
@@ -635,14 +656,26 @@ def definir_periodo(frame, data_inicial, data_final):
        pra grade de dias, agora do mes/ano escolhido.
     6. Clica no numero do dia certo (ex: "16").
 
-    ⚠️ NAO TESTADO AO VIVO - escrito a partir do passo a passo + prints da
-    Maria, sem acesso ao Titan. Os seletores usados (.mat-calendar-*) sao a
-    melhor suposicao baseada no padrao real do componente Angular Material
-    (mesma familia CDK ja confirmada no resto do Titan - ver
-    fechar_popup_calendario), nao HTML capturado ao vivo desta tela
-    especifica. Se travar em qualquer passo, o print/HTML cai em
-    titan_debug/set_filtro_data_nao_encontrado.* do jeito de sempre - manda
-    que eu ajusto o seletor certo.
+    CORRIGIDO (17/09/2026, run manual #59 no GitHub Actions - HTML real
+    salvo em titan_debug/set_filtro_data_nao_encontrado.html): a 1a versao
+    desta funcao supunha um componente Angular Material (mesma familia CDK
+    ja usada em outros popups do Titan) - suposicao ERRADA, confirmada
+    testando ao vivo. O calendario e um componente PROPRIO do Power BI
+    (classe "pbi-date-picker", ainda Angular por baixo mas NAO Material) -
+    o botao de icone e <button class="calendar-button"
+    aria-label="Start date, calendar button, selected: 7/12/2026, choose
+    date">, existe um igual pro "End date" (por isso o filtro por
+    aria-label^="Start date", pra nunca abrir o calendario errado). Todos
+    os seletores abaixo (calendar-button/month-year/navigate-button/
+    date-cell) vem desse HTML real, nao mais de suposicao - so a grade de
+    MESES (dentro do "seletor de mes") ainda nao foi vista ao vivo (a 1a
+    falha aconteceu ANTES de chegar la - ver _clicar_celula_calendario
+    pro motivo do escopo generico usado ali).
+
+    Se travar em qualquer passo (incluindo a grade de meses, ainda nao
+    validada), o print/HTML cai em titan_debug/
+    set_filtro_data_nao_encontrado.* do jeito de sempre - manda que eu
+    ajusto o seletor certo.
 
     HISTORICO (formato antigo, 2 <input> de texto - deixou de valer em
     17/09/2026, ver acima): confirmado com teste real (24/08/2026, periodo
@@ -657,7 +690,7 @@ def definir_periodo(frame, data_inicial, data_final):
         elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
 
         botao_calendario = elemento_visivel(
-            frame.locator('button.mat-datepicker-toggle, button[aria-label*="alend" i]'),
+            frame.locator('button.calendar-button[aria-label^="Start date"]'),
             timeout_ms=15000,
         )
         botao_calendario.click()
