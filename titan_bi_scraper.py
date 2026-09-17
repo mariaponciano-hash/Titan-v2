@@ -960,34 +960,52 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
     parado no lugar antigo enquanto o CONTEUDO rola por baixo dele, entao
     o hover que revela os icones do cabecalho (".../Mais opcoes") se perde
     bem na hora do clique, sobrando so o painel/visual que ficou por baixo
-    do mouse na posicao antiga. Corrigido garantindo a rolagem ANTES do
-    hover (scroll_into_view_if_needed proprio, sem depender do scroll
-    implicito do .click()) - assim o hover acontece com a pagina ja
-    parada, sem rolar de novo no meio do clique. Mantido force=True como
-    rede de seguranca (nao deveria mais ser necessario com o hover
-    estavel, mas nao faz mal manter).
+    do mouse na posicao antiga. Tentado: scroll_into_view_if_needed()
+    proprio ANTES do hover (pra rolagem e hover acontecerem em ordem certa)
+    - NAO resolveu sozinho (run #64, mesmo resultado identico: o botao
+    "..." simplesmente some do DOM entre o clique e a checagem do menu -
+    confirmado comparando o HTML de antes/depois, 0 ocorrencias de
+    "visual-more-options-btn" no HTML da falha). A causa exata continua
+    sem confirmar (layout novo, Angular re-renderizando o header do
+    visual, ou algo mais), mas o comportamento e claramente INTERMITENTE -
+    o mesmo botao existe e e clicavel um instante antes. Em vez de mais
+    uma suposicao de causa raiz, RETRY (17/09/2026): repete hover+clique
+    ate `tentativas` vezes, cada uma com timeout mais curto pro menu abrir
+    - mesmo padrao ja usado em marcar_item_da_lista/_abrir_dropdown_e_
+    pegar_campo_busca pra flakiness real do Power BI sem causa unica
+    identificada. force=True mantido como rede de seguranca extra.
     """
     try:
-        painel = localizar_painel(frame, titulo_painel)
-        painel.scroll_into_view_if_needed()
-        painel.hover()
-        # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
-        # aria-label do botao "..." de "Mais opcoes" pra "More options",
-        # quebrando o get_by_role por nome. Confirmado via titan_debug
-        # artifact: o botao real tem data-testid="visual-more-options-btn"
-        # (classe vcMenuBtn), estavel independente do idioma do aria-label.
-        botao_opcoes = elemento_visivel(
-            painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
-        )
-        botao_opcoes.click(force=True)
-
-        # Mesmo idioma trocou aqui tambem (confirmado via titan_debug: o menu
-        # do "..." agora mostra "Export data" em vez de "Exportar dados").
-        # Aceita os dois pra nao quebrar de novo se o Power BI voltar pro
-        # PT-BR em algum momento.
-        item_exportar = elemento_visivel(
-            frame.get_by_text(re.compile(r"^(Exportar dados|Export data)$")), timeout_ms=10000
-        )
+        item_exportar = None
+        ultimo_erro = None
+        for tentativa in range(3):
+            painel = localizar_painel(frame, titulo_painel)
+            painel.scroll_into_view_if_needed()
+            painel.hover()
+            # Mesmo tipo de bug do login (27/08/2026): o Power BI trocou o
+            # aria-label do botao "..." de "Mais opcoes" pra "More options",
+            # quebrando o get_by_role por nome. Confirmado via titan_debug
+            # artifact: o botao real tem data-testid="visual-more-options-btn"
+            # (classe vcMenuBtn), estavel independente do idioma do aria-label.
+            botao_opcoes = elemento_visivel(
+                painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
+            )
+            botao_opcoes.click(force=True)
+            try:
+                # Mesmo idioma trocou aqui tambem (confirmado via titan_debug:
+                # o menu do "..." agora mostra "Export data" em vez de
+                # "Exportar dados"). Aceita os dois pra nao quebrar de novo se
+                # o Power BI voltar pro PT-BR em algum momento.
+                item_exportar = elemento_visivel(
+                    frame.get_by_text(re.compile(r"^(Exportar dados|Export data)$")), timeout_ms=4000
+                )
+                break
+            except PWTimeout as e:
+                ultimo_erro = e
+                frame.page.keyboard.press("Escape")  # fecha qualquer menu/estado residual antes de tentar de novo
+                time.sleep(0.5)
+        if item_exportar is None:
+            raise ultimo_erro
         item_exportar.click()
 
         botao_exportar_dialogo = elemento_visivel(
