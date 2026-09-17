@@ -707,20 +707,21 @@ def definir_periodo(frame, data_inicial, data_final):
         _selecionar_mes_ano_calendario(frame, mes, ano)
         _clicar_celula_calendario(frame, str(dia))
 
-        # CORRIGIDO (17/09/2026, run manual #61 - HTML/print reais:
+        # NAO e o mouse (17/09/2026, run manual #62 - HTML/print reais:
         # titan_debug/exportar_dados_falhou_Informação Pedido.*): o filtro
-        # de data em si funcionou (print confirmou "9/16/2026" aplicado e a
-        # tabela populada certinha), mas o passo seguinte (exportar_dados_
-        # do_painel, clicar no "..." de "Informação Pedido") falhava com
-        # "subtree intercepts pointer events" - o mouse do Playwright fica
-        # parado bem em cima do botao de calendario apos o ultimo clique
-        # (selecionar o dia), e o tooltip "Calendar button, choose date" do
-        # Power BI continua na tela (visivel nos dois prints, tirados em
-        # momentos diferentes), sobrepondo o menu "..." do painel abaixo.
-        # MESMO PADRAO ja resolvido em outro lugar deste projeto (slicers
-        # de filtro - mover o mouse pra um canto neutro tira o hover e o
-        # tooltip some antes do proximo passo).
-        frame.page.mouse.move(0, 0)
+        # de data em si funciona (print confirmou "9/16/2026" aplicado e a
+        # tabela populada certinha), mas exportar_dados_do_painel falhava
+        # logo depois com "subtree intercepts pointer events" ao clicar no
+        # "..." de "Informação Pedido". Tentei mover o mouse pra longe do
+        # botao de calendario (suspeita: um tooltip do Power BI ficando
+        # preso) - NAO resolveu (o mesmo tooltip aparecia igual nas duas
+        # rodadas, antes e depois desse fix, sem nenhuma diferenca real).
+        # A causa de verdade nao e o calendario - ver o fix de verdade
+        # (force=True) na docstring de exportar_dados_do_painel: o layout
+        # desta tela ("Consulta", com 4 paineis - Informação Pedido/
+        # Eventos/Itens do pedido/Sem saldo - bem mais cheia do que quando
+        # essa funcao foi escrita) parece ter outro elemento invisivel
+        # sobrepondo o botao "...", independente do calendario.
         time.sleep(0.3)
 
         painel = localizar_painel(frame, "Informação Pedido")
@@ -934,6 +935,24 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
     relatorio desativou esta opcao"). Usamos a opcao padrao (ja vem marcada,
     nao precisa clicar em nada antes de "Exportar") - foi a que a Ivna
     confirmou trazer o dataset completo.
+
+    CORRIGIDO (17/09/2026, run manual #62 - HTML/print reais: titan_debug/
+    exportar_dados_falhou_Informação Pedido.*): o clique no "..." comecou a
+    falhar com "subtree intercepts pointer events" - um
+    <div data-testid="visual-style" class="visualWrapper report"> de OUTRO
+    visual-container qualquer (a classe/testid e generica, reaproveitada
+    por todo visual do relatorio - Angular reusa o mesmo componente pra
+    todos, entao nao da pra saber qual visual especifico so pelo erro) fica
+    por cima do botao. Correlaciona no tempo com a tela "Consulta" ter
+    ficado bem mais cheia (Informação Pedido/Eventos/Itens do pedido/Sem
+    saldo juntos, ver print) do que quando esta funcao foi escrita
+    originalmente (so 1-2 paineis) - a suposicao mais provavel e um
+    problema de layout/z-index dessa tela nova, nao algo que o codigo
+    control. click(force=True) ignora a checagem de "recebe eventos de
+    ponteiro" do Playwright e clica direto nas coordenadas do botao mesmo
+    com algo (aparentemente) por cima - resolve na pratica quando o
+    "bloqueio" e um artefato de layout como este, nao um popup de verdade
+    cobrindo o botao (nesse caso o clique iria pro popup por engano).
     """
     try:
         painel = localizar_painel(frame, titulo_painel)
@@ -946,7 +965,7 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
         botao_opcoes = elemento_visivel(
             painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
         )
-        botao_opcoes.click()
+        botao_opcoes.click(force=True)
 
         # Mesmo idioma trocou aqui tambem (confirmado via titan_debug: o menu
         # do "..." agora mostra "Export data" em vez de "Exportar dados").
