@@ -540,65 +540,132 @@ def _formatar_data_para_titan(data_str):
     return f"{int(mes)}/{int(dia)}/{ano}"
 
 
+# Abreviacoes de mes exatamente como o "seletor de mes" do Titan mostra
+# (print real, 17/09/2026) - indice 0 = janeiro.
+MESES_ABREV_PT = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+
+
+def _clicar_seta_calendario(frame, anterior, timeout_ms=5000):
+    """
+    As setas de navegacao do calendario (ano anterior/seguinte no seletor de
+    mes, mes anterior/seguinte na grade de dias) - confirmado por print real
+    (17/09/2026) que a seta de CIMA e "Ano anterior" (voltar) e por simetria
+    a de BAIXO e a de avancar. Tenta por aria-label de verdade primeiro
+    (padrao Angular Material - mesma familia CDK ja confirmada no resto do
+    Titan, ver fechar_popup_calendario) - so cai pra posicao (1a bloco =
+    anterior, 2a = seguinte, classes estaveis do proprio componente) se o
+    aria-label nao bater.
+    """
+    padrao = re.compile("anterior", re.IGNORECASE) if anterior else re.compile("seguinte|pr[oó]xim", re.IGNORECASE)
+    por_aria = frame.get_by_role("button", name=padrao)
+    if por_aria.count() > 0:
+        elemento_visivel(por_aria, timeout_ms=timeout_ms).click()
+        time.sleep(0.4)
+        return
+    seletor = ".mat-calendar-previous-button" if anterior else ".mat-calendar-next-button"
+    elemento_visivel(frame.locator(seletor), timeout_ms=timeout_ms).click()
+    time.sleep(0.4)
+
+
+def _clicar_celula_calendario(frame, texto_exato, timeout_ms=8000):
+    """
+    Clica numa celula do calendario (mes ou dia) pelo texto exato -
+    ignorando celulas desabilitadas (mat-calendar-body-disabled, classe
+    estavel do Angular Material pra dias fora do mes/intervalo permitido) -
+    sem isso, um dia de "preenchimento" do mes vizinho com o mesmo numero
+    (ex: dia 1 aparecendo tanto no fim do mes anterior quanto no comeco do
+    mes atual) podia bater e clicar na celula errada.
+    """
+    conteudos = frame.locator(
+        ".mat-calendar-body-cell:not(.mat-calendar-body-disabled) .mat-calendar-body-cell-content"
+    )
+    alvo = conteudos.filter(has_text=re.compile(rf"^\s*{re.escape(texto_exato)}\s*$", re.IGNORECASE))
+    elemento_visivel(alvo, timeout_ms=timeout_ms).click()
+    time.sleep(0.4)
+
+
+def _selecionar_mes_ano_calendario(frame, mes, ano):
+    """
+    Abre o "seletor de mes" (clique no botao de periodo, que mostra
+    "<mes> <ano>" na grade de dias) e navega ate o ANO certo antes de clicar
+    no mes - passo a passo confirmado por print real da Maria (17/09/2026).
+    """
+    botao_periodo = elemento_visivel(frame.locator(".mat-calendar-period-button"), timeout_ms=15000)
+    botao_periodo.click()
+    time.sleep(0.4)
+
+    for _ in range(24):  # teto generoso (2 anos pra qualquer lado) - nunca deveria precisar de tanto
+        texto = elemento_visivel(frame.locator(".mat-calendar-period-button"), timeout_ms=5000).inner_text().strip()
+        m = re.search(r"\d{4}", texto)
+        if not m:
+            raise PWTimeout(f"Seletor de mes/ano com texto inesperado (sem ano): {texto!r}")
+        ano_mostrado = int(m.group())
+        if ano_mostrado == ano:
+            break
+        _clicar_seta_calendario(frame, anterior=ano < ano_mostrado)
+    else:
+        raise PWTimeout(f"Nao consegui navegar ate o ano {ano} no seletor de mes/ano")
+
+    _clicar_celula_calendario(frame, MESES_ABREV_PT[mes - 1])
+
+
 def definir_periodo(frame, data_inicial, data_final):
     """
-    CONFIRMADO COM TESTE REAL (24/08/2026, periodo 01/06-23/08/2026): o
-    clique-e-digita abaixo ACERTA os dois campos internos do slicer ("Data de
-    inicio"/"Data de termino", confirmados via aria-label) - o bug real do
-    "0 encontrados" nao era o valor setado, era ler a tabela cedo demais.
-    Sem fechar o popup (Escape) e sem esperar a query terminar, a tabela fica
-    vazia por varios segundos depois de mudar o periodo. Corrigido esperando
-    de verdade a 1a linha aparecer em vez de um sleep fixo.
+    REESCRITO (17/09/2026, passo a passo exato + prints reais mandados pela
+    Maria): o campo "Data Inicial - Data Final" deixou de ser dois <input>
+    de texto no formato M/d/aaaa (ver historico desta funcao abaixo) - virou
+    um UNICO seletor com icone de calendario, que abre um popup ao clicar.
+    A "Data Final" NAO e mais configuravel por aqui - a Maria confirmou que
+    ela agora SEMPRE equivale ao dia de hoje automaticamente, entao esta
+    funcao so define a "Data Inicial" (`data_final` e recebido mas
+    IGNORADO de proposito, so pra nao quebrar quem ja chama esta funcao com
+    os dois argumentos - ver aviso abaixo se isso deixar de ser verdade).
 
-    MOVIDO de titan_backfill.py pra ca (01/09/2026, achado real - print
-    salvo em titan_debug/filtro_nao_encontrado.png): o Titan carrega o
-    dashboard com um filtro de periodo padrao ja aplicado (nao "todas as
-    datas"; visto "6/1/2026" numa captura e "7/1/2026" no dia seguinte -
-    parece ser relativo a data de hoje, nao fixo). Usada so pelo backfill
-    pra sua janela especifica - titan_watcher.processar_pedido busca por NF
-    direto, sem chamar esta funcao (ver seu proprio historico: chegou a
-    chamar, foi revertido em 11/09/2026 a pedido da Maria).
+    Passo a passo confirmado pela Maria (prints reais, 17/09/2026):
+    1. Clica no botao de icone de calendario, ao lado do campo de data.
+    2. Abre um popup mostrando o mes atual em grade de dias, com um botao
+       de periodo no topo (ex: "julho 2026") e duas setas (anterior/
+       seguinte).
+    3. Clica no botao de periodo (o texto "<mes> <ano>") pra trocar pra um
+       "seletor de mes" - grade de abreviacoes de mes (jan..dez) pro ano
+       mostrado.
+    4. Navega ate o ANO certo com as setas, se o ano mostrado nao for o ano
+       de data_inicial.
+    5. Clica na abreviacao do mes certo (ex: "set" pra setembro) - volta
+       pra grade de dias, agora do mes/ano escolhido.
+    6. Clica no numero do dia certo (ex: "16").
 
-    REESCRITO (11/09/2026, achado real - ver docstring de
-    _formatar_data_para_titan pra causa raiz completa, com HTML real de
-    evidencia): o clique por coordenada (bounding_box do rotulo + 15px)
-    seguido de Tab pra "pular" pro segundo campo NUNCA foi confiavel pra
-    achar o campo de verdade - so "funcionava" pro campo de INICIO (o
-    primeiro, que recebe o foco direto do clique) e nunca pro de TERMINO,
-    silenciosamente (sem erro nenhum, so um campo que ficava sempre preso
-    em "hoje"). Agora localiza os dois <input class="date-slicer-
-    datepicker"> de verdade via aria-label estavel ("Start date"/"End
-    date" - confirmado em 5 exports reais de dias diferentes que esse
-    texto e sempre em ingles, mesmo com o resto do relatorio em
-    portugues - e string interna do proprio Power BI, nao do autor do
-    relatorio) e clica em CADA UM individualmente, em vez de confiar em
-    Tab pra navegar entre eles.
+    ⚠️ NAO TESTADO AO VIVO - escrito a partir do passo a passo + prints da
+    Maria, sem acesso ao Titan. Os seletores usados (.mat-calendar-*) sao a
+    melhor suposicao baseada no padrao real do componente Angular Material
+    (mesma familia CDK ja confirmada no resto do Titan - ver
+    fechar_popup_calendario), nao HTML capturado ao vivo desta tela
+    especifica. Se travar em qualquer passo, o print/HTML cai em
+    titan_debug/set_filtro_data_nao_encontrado.* do jeito de sempre - manda
+    que eu ajusto o seletor certo.
+
+    HISTORICO (formato antigo, 2 <input> de texto - deixou de valer em
+    17/09/2026, ver acima): confirmado com teste real (24/08/2026, periodo
+    01/06-23/08/2026) que o clique-e-digita acertava os dois campos
+    internos do slicer ("Start date"/"End date", via aria-label) - depois
+    corrigido (11/09/2026) pro formato M/d/aaaa que o campo exigia de
+    verdade (ver _formatar_data_para_titan, ainda usada por
+    titan_preencher_lacunas.py, que roda numa aba diferente e ainda nao foi
+    confirmada com este novo fluxo de calendario).
     """
     try:
-        # timeout_ms=60000 (era o padrao de 30000) - achado real rodando via
-        # GitHub Actions (28/08/2026): o rotulo existe de verdade (confirmado
-        # print real da Ivna no navegador dela) mas nao apareceu NENHUMA VEZ
-        # no HTML capturado apos os 30s padrao - o runner (CPU compartilhada)
-        # parece ser bem mais lento que um PC normal pra este slicer
-        # especifico do Power BI terminar de renderizar.
         elemento_visivel(frame.get_by_text("Data Inicial - Data Final", exact=False), timeout_ms=60000)
 
-        campo_inicio = frame.locator('input.date-slicer-datepicker[aria-label^="Start date"]')
-        campo_fim = frame.locator('input.date-slicer-datepicker[aria-label^="End date"]')
-        campo_inicio.wait_for(state="visible", timeout=10000)
-
-        campo_inicio.click()
-        frame.page.keyboard.press("Control+A")
-        frame.page.keyboard.type(_formatar_data_para_titan(data_inicial), delay=60)
-        frame.page.keyboard.press("Tab")
-        time.sleep(0.3)
-
-        campo_fim.click()
-        frame.page.keyboard.press("Control+A")
-        frame.page.keyboard.type(_formatar_data_para_titan(data_final), delay=60)
-        frame.page.keyboard.press("Enter")
+        botao_calendario = elemento_visivel(
+            frame.locator('button.mat-datepicker-toggle, button[aria-label*="alend" i]'),
+            timeout_ms=15000,
+        )
+        botao_calendario.click()
         time.sleep(0.5)
-        fechar_popup_calendario(frame)
+
+        dia, mes, ano = (int(p) for p in data_inicial.split("/"))
+        _selecionar_mes_ano_calendario(frame, mes, ano)
+        _clicar_celula_calendario(frame, str(dia))
 
         painel = localizar_painel(frame, "Informação Pedido")
         painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
