@@ -707,6 +707,22 @@ def definir_periodo(frame, data_inicial, data_final):
         _selecionar_mes_ano_calendario(frame, mes, ano)
         _clicar_celula_calendario(frame, str(dia))
 
+        # CORRIGIDO (17/09/2026, run manual #61 - HTML/print reais:
+        # titan_debug/exportar_dados_falhou_Informação Pedido.*): o filtro
+        # de data em si funcionou (print confirmou "9/16/2026" aplicado e a
+        # tabela populada certinha), mas o passo seguinte (exportar_dados_
+        # do_painel, clicar no "..." de "Informação Pedido") falhava com
+        # "subtree intercepts pointer events" - o mouse do Playwright fica
+        # parado bem em cima do botao de calendario apos o ultimo clique
+        # (selecionar o dia), e o tooltip "Calendar button, choose date" do
+        # Power BI continua na tela (visivel nos dois prints, tirados em
+        # momentos diferentes), sobrepondo o menu "..." do painel abaixo.
+        # MESMO PADRAO ja resolvido em outro lugar deste projeto (slicers
+        # de filtro - mover o mouse pra um canto neutro tira o hover e o
+        # tooltip some antes do proximo passo).
+        frame.page.mouse.move(0, 0)
+        time.sleep(0.3)
+
         painel = localizar_painel(frame, "Informação Pedido")
         painel.locator("xpath=.//*[self::tr or @role='row']").first.wait_for(timeout=30000)
         time.sleep(1.5)  # da tempo da query terminar de popular as linhas visiveis, nao so a 1a
