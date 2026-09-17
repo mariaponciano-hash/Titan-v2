@@ -991,6 +991,11 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino):
                 painel.locator('[data-testid="visual-more-options-btn"]'), timeout_ms=10000
             )
             botao_opcoes.click(force=True)
+            # DIAGNOSTICO TEMPORARIO (17/09/2026) - salva o estado exato logo
+            # apos o clique, ANTES de checar se o menu abriu (as 3 tentativas
+            # ate agora falharam identico, sem nenhuma pista nova) - tirar
+            # depois de entender o que esta acontecendo de verdade aqui.
+            salvar_diagnostico(frame, f"apos_clique_opcoes_tentativa{tentativa + 1}")
             try:
                 # Mesmo idioma trocou aqui tambem (confirmado via titan_debug:
                 # o menu do "..." agora mostra "Export data" em vez de
