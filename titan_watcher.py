@@ -167,7 +167,9 @@ def marcar_concluido(numero_nf, marca, pedido_data, eventos, itens):
         "observacao": pedido_data.get("Observação"),
         "nome_projeto": pedido_data.get("Nome Projeto"),
         "nome_projeto_antigo": pedido_data.get("Nome Projeto (Antigo)"),
-        "data_importado": pedido_data.get("Data Importado"),
+        # so a data, sem hora (17/09/2026, pedido direto da Maria - ver
+        # scraper.formatar_apenas_data pro formato M/D/AAAA e o motivo)
+        "data_importado": scraper.formatar_apenas_data(pedido_data.get("Data Importado")),
         "data_expedido": pedido_data.get("Data Expedido"),
         "data_conferido": pedido_data.get("Data Conferido"),
         "eventos": eventos or [],

@@ -1233,6 +1233,35 @@ def _normalizar_espacos(valor):
     return " ".join(str(valor or "").split())
 
 
+def formatar_apenas_data(valor):
+    """
+    Reduz um valor de "Data Importado" pra so a data, formato M/D/AAAA (sem
+    zero a esquerda, igual o proprio Titan mostra na tela) - pedido direto
+    da Maria (17/09/2026): o campo nao precisa de horario.
+
+    Existiam DOIS formatos diferentes coexistindo na mesma coluna do
+    Supabase, dependendo de qual caminho escreveu o registro (achado real,
+    17/09/2026, ao normalizar ~1,48 milhao de linhas ja gravadas):
+    1. titan_backfill.py (exportacao em massa via xlsx): ler_export_xlsx
+       converte a celula de data do openpyxl com .isoformat() - string tipo
+       "2026-08-12T21:05:46.140000".
+    2. titan_watcher.py (consulta avulsa por pedido): extrai o valor
+       raspando o DOM (_celulas_da_linha/inner_text), que preserva o texto
+       exatamente como o Titan mostra na tela - "8/23/2026 10:16:25 PM",
+       so que com \\xa0 (non-breaking space) entre data/hora/AM-PM em vez de
+       espaco normal (mesma classe de achado ja documentada em
+       _normalizar_espacos - so que ali o \\xa0 aparecia no MEIO de um nome,
+       aqui no meio de uma data-hora).
+    """
+    if not valor:
+        return valor
+    texto = str(valor)
+    if len(texto) >= 10 and texto[4] == "-" and texto[7] == "-":
+        ano, mes, dia = texto[:10].split("-")
+        return f"{int(mes)}/{int(dia)}/{ano}"
+    return re.split(r"[\s\xa0]", texto, maxsplit=1)[0]
+
+
 def _bate_marca(registro, marca_esperada):
     """Compara "Nome Projeto" (ex: "RITUARIA") com o id de marca da Torre
     (ex: "rituaria") - sem diferenciar caixa nem tipo de espaco. Sem

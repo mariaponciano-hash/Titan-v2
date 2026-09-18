@@ -520,7 +520,9 @@ def registro_para_supabase(r):
         "observacao": r.get("Observação"),
         "nome_projeto": r.get("Nome Projeto"),
         "nome_projeto_antigo": r.get("Nome Projeto (Antigo)"),
-        "data_importado": r.get("Data Importado"),
+        # so a data, sem hora (17/09/2026, pedido direto da Maria - ver
+        # scraper.formatar_apenas_data pro formato M/D/AAAA e o motivo)
+        "data_importado": scraper.formatar_apenas_data(r.get("Data Importado")),
         "data_expedido": r.get("Data Expedido"),
         "data_conferido": r.get("Data Conferido"),
         # Novos (25/08/2026) - so a exportacao nativa expoe texto de verdade
