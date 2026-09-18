@@ -1235,31 +1235,45 @@ def _normalizar_espacos(valor):
 
 def formatar_apenas_data(valor):
     """
-    Reduz um valor de "Data Importado" pra so a data, formato M/D/AAAA (sem
-    zero a esquerda, igual o proprio Titan mostra na tela) - pedido direto
-    da Maria (17/09/2026): o campo nao precisa de horario.
+    Reduz um valor de "Data Importado" pra so a data, formato DD/MM/AAAA
+    (com zero a esquerda - mesmo formato "dd/mm/yyyy" usado no resto deste
+    projeto, ex: --data-inicial/--data-final, ver _formatar_data_para_titan)
+    - pedido direto da Maria (17/09/2026): o campo nao precisa de horario, e
+    deve seguir o padrao brasileiro (dia primeiro), nao o americano que o
+    proprio Titan usa na tela.
 
-    Existiam DOIS formatos diferentes coexistindo na mesma coluna do
-    Supabase, dependendo de qual caminho escreveu o registro (achado real,
-    17/09/2026, ao normalizar ~1,48 milhao de linhas ja gravadas):
+    CORRIGIDO (17/09/2026, mesmo dia - 1a versao desta funcao devolvia
+    M/D/AAAA sem zero, copiando o formato que o Titan mostra na tela em vez
+    de converter pro padrao do projeto - a Maria corrigiu logo depois de eu
+    ja ter normalizado ~1,48 milhao de linhas nesse formato errado, precisou
+    de uma 2a passada pra trocar dia/mes de lugar e adicionar o zero).
+
+    Existiam DOIS formatos diferentes coexistindo na coluna antes desta
+    funcao existir, dependendo de qual caminho escreveu o registro (achado
+    real, 17/09/2026):
     1. titan_backfill.py (exportacao em massa via xlsx): ler_export_xlsx
        converte a celula de data do openpyxl com .isoformat() - string tipo
-       "2026-08-12T21:05:46.140000".
+       "2026-08-12T21:05:46.140000" (ja vem AAAA-MM-DD, zero-padded).
     2. titan_watcher.py (consulta avulsa por pedido): extrai o valor
        raspando o DOM (_celulas_da_linha/inner_text), que preserva o texto
-       exatamente como o Titan mostra na tela - "8/23/2026 10:16:25 PM",
-       so que com \\xa0 (non-breaking space) entre data/hora/AM-PM em vez de
-       espaco normal (mesma classe de achado ja documentada em
-       _normalizar_espacos - so que ali o \\xa0 aparecia no MEIO de um nome,
-       aqui no meio de uma data-hora).
+       exatamente como o Titan mostra na tela - "8/23/2026 10:16:25 PM"
+       (M/D/AAAA, SEM zero a esquerda), so que com \\xa0 (non-breaking
+       space) entre data/hora/AM-PM em vez de espaco normal (mesma classe
+       de achado ja documentada em _normalizar_espacos - so que ali o
+       \\xa0 aparecia no MEIO de um nome, aqui no meio de uma data-hora).
     """
     if not valor:
         return valor
     texto = str(valor)
     if len(texto) >= 10 and texto[4] == "-" and texto[7] == "-":
         ano, mes, dia = texto[:10].split("-")
-        return f"{int(mes)}/{int(dia)}/{ano}"
-    return re.split(r"[\s\xa0]", texto, maxsplit=1)[0]
+        return f"{int(dia):02d}/{int(mes):02d}/{ano}"
+    data_bruta = re.split(r"[\s\xa0]", texto, maxsplit=1)[0]
+    partes = data_bruta.split("/")
+    if len(partes) != 3:
+        return data_bruta  # formato inesperado - devolve como veio, sem arriscar interpretar errado
+    mes, dia, ano = partes
+    return f"{int(dia):02d}/{int(mes):02d}/{ano}"
 
 
 def _bate_marca(registro, marca_esperada):
