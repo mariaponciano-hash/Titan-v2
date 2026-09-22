@@ -194,6 +194,20 @@ METABASE_DATABASE_ID = 43  # "Data Mart"
 # (rituaria, barbours, kokeshi, apice, lescent, aua, yenzah).
 MARCA_PARA_BRAND_SHOPIFY = {"by samia": "by_samia"}
 
+# Marcas cujo "order_name" no Metabase NAO segue o padrao "SH<id><SUFIXO>"
+# das outras - casam por order_number (bigint) em vez disso (ver
+# _buscar_itens_via_metabase). APICE ja era assim (numero_pedido do Titan e
+# um ID proprio, sem NF colada - ver extrair_numero_pedido_torre). DENAVITA
+# entrou aqui (22/09/2026, achado real investigando "0 itens casados pra
+# essa marca" a pedido da Maria): confirmado direto no Metabase que
+# order_name da denavita vem "#168149" (com "#", sem "SH") enquanto
+# order_number e o inteiro limpo "168149" - e o "numero_pedido" gravado no
+# Supabase pra denavita (derivado do "sales_number" da Intelipost pela
+# Etapa 1 de titan_preencher_lacunas.py, ja que nenhum pedido dessa marca
+# foi visitado no Titan ainda) ja vem nesse formato numerico puro, entao
+# nunca batia contra order_name.
+MARCAS_MATCH_POR_ORDER_NUMBER = {"apice", "denavita"}
+
 # RECHECK DE SITUACAO PRESA (28/08/2026, achado real pela Ivna): a janela do
 # backfill acima e sempre "ultimos 5 dias corridos" - um pedido importado ha
 # mais de 5 dias que AINDA nao chegou em situacao final (EMBARCADO/
@@ -907,11 +921,12 @@ def _buscar_itens_via_metabase(pendentes):
     _buscar_pendentes_itens - numero_nf/marca/numero_pedido) e devolve um
     dict {(numero_nf, marca): itens} pros que deu pra casar no Shopify.
 
-    CHAVE DE MATCH: apice casa por order_number (bigint, sem "#") ==
-    numero_pedido; as outras marcas casam por order_name (texto,
-    "SH<id><SUFIXO>") == numero_pedido - o proprio numero_pedido gravado no
-    Supabase JA E esse valor (ver scraper.extrair_numero_pedido_torre/
-    registro_para_supabase), sem transformacao nenhuma aqui.
+    CHAVE DE MATCH: marcas em MARCAS_MATCH_POR_ORDER_NUMBER (apice,
+    denavita) casam por order_number (bigint, sem "#") == numero_pedido; as
+    outras marcas casam por order_name (texto, "SH<id><SUFIXO>") ==
+    numero_pedido - o proprio numero_pedido gravado no Supabase JA E esse
+    valor (ver scraper.extrair_numero_pedido_torre/registro_para_supabase),
+    sem transformacao nenhuma aqui.
 
     FORMATO DO JSON: replica o MESMO schema que "Itens do pedido" tem
     quando vem direto do Titan (Ean/Tipo/Codigo/Quantidade/Descricao/Valor
@@ -940,7 +955,7 @@ def _buscar_itens_via_metabase(pendentes):
         linhas = []
         for i in range(0, len(pedidos_unicos), TAMANHO_LOTE_METABASE):
             fatia = pedidos_unicos[i:i + TAMANHO_LOTE_METABASE]
-            if marca == "apice":
+            if marca in MARCAS_MATCH_POR_ORDER_NUMBER:
                 ids_validos = [v for v in fatia if v.isdigit()]
                 if not ids_validos:
                     continue
