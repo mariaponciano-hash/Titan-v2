@@ -694,9 +694,15 @@ def _buscar_pendentes_itens_filtrado(filtro_data_importado, tamanho_pagina=1000)
                 f"&itens=is.null"
                 f"&select=numero_nf,marca,numero_pedido"
                 f"&limit={tamanho_pagina}&offset={offset}")
+        # 5 tentativas, nao 3 (22/09/2026, achado real - run #86): com
+        # 200+ paginas numa tabela de 1,48 milhao de linhas, os 500 do
+        # Supabase apareceram em RAJADAS de varias paginas seguidas (ex:
+        # offset 173000 a 188000, 16 paginas direto), nao isolados - 3
+        # tentativas (2s+4s+8s=14s de espera) nao bastavam pra atravessar
+        # uma instabilidade mais longa que isso do lado do Supabase.
         pagina = None
         ultimo_erro = None
-        for tentativa in range(1, 4):
+        for tentativa in range(1, 6):
             try:
                 pagina = titan_watcher._supabase_request("GET", path) or []
                 break
@@ -705,7 +711,7 @@ def _buscar_pendentes_itens_filtrado(filtro_data_importado, tamanho_pagina=1000)
                 if e.code < 500:
                     raise
                 print(f"  Supabase respondeu {e.code} buscando pendentes (offset={offset}), "
-                      f"tentativa {tentativa}/3...", file=sys.stderr)
+                      f"tentativa {tentativa}/5...", file=sys.stderr)
                 time.sleep(2 ** tentativa)
         if pagina is None:
             raise ultimo_erro
@@ -725,12 +731,26 @@ def _completar_itens_de_pendentes(buscar_pendentes, descricao):
     reconferir+gravar) e identico.
 
     `buscar_pendentes` e uma funcao SEM ARGUMENTOS (closure ja fechada
-    sobre datas/etc pelo chamador) - chamada DUAS VEZES de proposito: uma
-    pra levantar os candidatos, outra pra reconferir logo antes de gravar
-    (mesmo motivo do "ainda_sem_itens" em exportar_e_gravar_periodo - evita
-    sobrescrever um itens que outra fonte, ex: titan_watcher.py, tenha
-    preenchido nesse meio tempo. Com dezenas de milhares de pendentes e
-    centenas de queries ao Metabase no meio, essa janela de tempo e real).
+    sobre datas/etc pelo chamador), chamada UMA vez pra levantar os
+    candidatos - a reconferencia antes de gravar (mesmo motivo do "ainda_
+    sem_itens" em exportar_e_gravar_periodo, evitar sobrescrever um itens
+    que outra fonte tenha preenchido nesse meio tempo) usa
+    _buscar_pendentes_itens (por lista de NFs, ja testada e sem paginacao)
+    em vez de chamar `buscar_pendentes` de novo.
+
+    CORRIGIDO (22/09/2026, run #86 - achado real): a versao anterior
+    chamava `buscar_pendentes` DUAS vezes (a mesma paginacao grande, por
+    data_importado, tanto pra levantar quanto pra reconferir). Com 203 mil
+    pendentes (--completar-itens-sem-data-importado, contando TODAS as
+    marcas, nao so lescent/aua/apice), a 1a chamada teve sucesso e casou
+    90.759 itens no Metabase - mas a 2a chamada (so pra reconferir) bateu
+    em varios 500 consecutivos no fim da paginacao (offset >170 mil) e
+    derrubou o processo ANTES de gravar qualquer coisa, jogando fora todo
+    o trabalho de match ja feito. _buscar_pendentes_itens pagina por
+    LISTA DE NFs (lotes de 200, mesma consulta pequena e robusta ja usada
+    no backfill diario normal) em vez de OFFSET sobre a tabela inteira -
+    muito mais barato pra reconferir soh os poucos milhares de NFs que
+    realmente casaram, em vez de repetir a varredura inteira.
     """
     pendentes = buscar_pendentes()
     print(f"{len(pendentes)} pedido(s) pendente(s) de itens {descricao}.")
@@ -742,7 +762,8 @@ def _completar_itens_de_pendentes(buscar_pendentes, descricao):
     if not itens_encontrados:
         return 0, len(pendentes)
 
-    ainda_sem_itens = {(p["numero_nf"], p["marca"]) for p in buscar_pendentes()}
+    nfs_casados = [nf for (nf, _marca) in itens_encontrados]
+    ainda_sem_itens = {(p["numero_nf"], p["marca"]) for p in _buscar_pendentes_itens(nfs_casados)}
     payloads = [
         {"numero_nf": nf, "marca": marca, "itens": itens, "atualizado_em": _agora_iso()}
         for (nf, marca), itens in itens_encontrados.items()
