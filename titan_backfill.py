@@ -643,11 +643,43 @@ def _buscar_pendentes_itens_por_data(datas, tamanho_pagina=1000):
     criterio de _supabase_upsert_grupo_uniforme) - e um problema na query
     em si, tentar de novo nao muda o resultado.
     """
-    lista_datas = ",".join(urllib.parse.quote(d) for d in datas)
+    return _buscar_pendentes_itens_filtrado(
+        f"data_importado=in.({','.join(urllib.parse.quote(d) for d in datas)})", tamanho_pagina
+    )
+
+
+def _buscar_pendentes_itens_sem_data_importado(tamanho_pagina=1000):
+    """
+    Irma de _buscar_pendentes_itens_por_data, pro OUTRO jeito de ficar fora
+    do alcance da janela deslizante: linhas com "Data Importado" NULO
+    (22/09/2026, achado real investigando lescent/aua/apice a pedido da
+    Maria - taxa de "sem itens" bem mais alta que kokeshi/barbours/rituaria
+    pra essas 3 marcas). Essas linhas nunca passaram por uma exportacao real
+    do Titan (por isso "Data Importado" nunca foi preenchido) - foram
+    criadas com status='pendente_titan' por uma Etapa 1 (ver
+    titan_preencher_lacunas.py/ou o script irmao do repo central-tickets,
+    que compartilha este mesmo Supabase - mesma origem do bug de marca
+    "by_samia" corrigido antes) a partir de gold.intelipost_orders, que ja
+    inclui numero_pedido - so nunca tiveram Titan/itens processado depois.
+    Confirmado com numero real: 38.765 (apice) + 23.475 (lescent) + 2.794
+    (aua) linhas nesse estado.
+
+    numero_pedido ja vem preenchido nessas linhas (derivado direto do
+    Metabase na Etapa 1, nao do Titan) - da pra tentar casar itens mesmo
+    sem NUNCA ter visitado o Titan pra essas NFs, ja que itens so depende
+    de marca+numero_pedido (ver _buscar_itens_via_metabase).
+    """
+    return _buscar_pendentes_itens_filtrado("data_importado=is.null", tamanho_pagina)
+
+
+def _buscar_pendentes_itens_filtrado(filtro_data_importado, tamanho_pagina=1000):
+    """Paginacao+retry compartilhada por _buscar_pendentes_itens_por_data e
+    _buscar_pendentes_itens_sem_data_importado - so muda o filtro de
+    "Data Importado" (lista explicita de datas vs IS NULL)."""
     pendentes = []
     offset = 0
     while True:
-        path = (f"{TABELA}?data_importado=in.({lista_datas})"
+        path = (f"{TABELA}?{filtro_data_importado}"
                 f"&itens=is.null"
                 f"&select=numero_nf,marca,numero_pedido"
                 f"&limit={tamanho_pagina}&offset={offset}")
@@ -673,23 +705,24 @@ def _buscar_pendentes_itens_por_data(datas, tamanho_pagina=1000):
     return pendentes
 
 
-def completar_itens_atrasados(datas):
+def _completar_itens_de_pendentes(buscar_pendentes, descricao):
     """
-    Roda SO a etapa de itens via Metabase, sem Titan/Playwright nenhum -
-    itens nao depende de navegar no Titan, so de Supabase + Metabase (ver
-    _buscar_itens_via_metabase) - pra um conjunto EXPLICITO de datas de
-    "Data Importado" que ficou fora do alcance da janela deslizante normal
-    do backfill (ver _buscar_pendentes_itens_por_data pro motivo).
+    Casa itens no Metabase pra um conjunto de pendentes e grava o
+    resultado. Compartilhada por completar_itens_atrasados/completar_itens_
+    sem_data_importado - as duas so diferem em COMO levantam os pendentes
+    (ver as duas funcoes _buscar_pendentes_itens_* acima); o resto (casar+
+    reconferir+gravar) e identico.
 
-    Uso pontual/manual via --completar-itens-atrasados (22/09/2026, pedido
-    direto da Maria) - de proposito SEM workflow/cron dedicado: cobrir todo
-    o historico sem filtro de data arriscaria uma varredura enorme sem
-    necessidade real. Rodar quando alguem notar um dia preso (ex: taxa de
-    "sem itens" bem acima do normal de ~10-30% pra aquela data).
+    `buscar_pendentes` e uma funcao SEM ARGUMENTOS (closure ja fechada
+    sobre datas/etc pelo chamador) - chamada DUAS VEZES de proposito: uma
+    pra levantar os candidatos, outra pra reconferir logo antes de gravar
+    (mesmo motivo do "ainda_sem_itens" em exportar_e_gravar_periodo - evita
+    sobrescrever um itens que outra fonte, ex: titan_watcher.py, tenha
+    preenchido nesse meio tempo. Com dezenas de milhares de pendentes e
+    centenas de queries ao Metabase no meio, essa janela de tempo e real).
     """
-    print(f"Buscando pendentes de itens pras datas: {', '.join(datas)}...")
-    pendentes = _buscar_pendentes_itens_por_data(datas)
-    print(f"{len(pendentes)} pedido(s) pendente(s) de itens nessas datas.")
+    pendentes = buscar_pendentes()
+    print(f"{len(pendentes)} pedido(s) pendente(s) de itens {descricao}.")
     if not pendentes:
         return 0, 0
 
@@ -698,10 +731,7 @@ def completar_itens_atrasados(datas):
     if not itens_encontrados:
         return 0, len(pendentes)
 
-    # Reconfere antes de gravar (mesmo motivo do "ainda_sem_itens" em
-    # exportar_e_gravar_periodo) - evita sobrescrever um itens que outra
-    # fonte (titan_watcher.py) tenha preenchido nesse meio tempo.
-    ainda_sem_itens = {(p["numero_nf"], p["marca"]) for p in _buscar_pendentes_itens_por_data(datas)}
+    ainda_sem_itens = {(p["numero_nf"], p["marca"]) for p in buscar_pendentes()}
     payloads = [
         {"numero_nf": nf, "marca": marca, "itens": itens, "atualizado_em": _agora_iso()}
         for (nf, marca), itens in itens_encontrados.items()
@@ -719,6 +749,42 @@ def completar_itens_atrasados(datas):
             print(f"  ERRO no lote (linhas {gravados + 1}-{gravados + len(lote)}), pulando: {e}", file=sys.stderr)
 
     return gravados, len(pendentes) - gravados
+
+
+def completar_itens_atrasados(datas):
+    """
+    Roda SO a etapa de itens via Metabase, sem Titan/Playwright nenhum -
+    itens nao depende de navegar no Titan, so de Supabase + Metabase (ver
+    _buscar_itens_via_metabase) - pra um conjunto EXPLICITO de datas de
+    "Data Importado" que ficou fora do alcance da janela deslizante normal
+    do backfill (ver _buscar_pendentes_itens_por_data pro motivo).
+
+    Uso pontual/manual via --completar-itens-atrasados (22/09/2026, pedido
+    direto da Maria) - de proposito SEM workflow/cron dedicado: cobrir todo
+    o historico sem filtro de data arriscaria uma varredura enorme sem
+    necessidade real. Rodar quando alguem notar um dia preso (ex: taxa de
+    "sem itens" bem acima do normal de ~10-30% pra aquela data).
+    """
+    print(f"Buscando pendentes de itens pras datas: {', '.join(datas)}...")
+    return _completar_itens_de_pendentes(
+        lambda: _buscar_pendentes_itens_por_data(datas), "nessas datas"
+    )
+
+
+def completar_itens_sem_data_importado():
+    """
+    Mesma ideia de completar_itens_atrasados, pro OUTRO jeito de backlog
+    (ver _buscar_pendentes_itens_sem_data_importado) - linhas com "Data
+    Importado" NULO, criadas como placeholder (status='pendente_titan') por
+    uma Etapa 1 que nunca chegou a visitar o Titan pra elas. Achado real
+    (22/09/2026, investigando lescent/aua/apice a pedido da Maria): 38.765
+    (apice) + 23.475 (lescent) + 2.794 (aua) linhas nesse estado - a causa
+    principal da taxa de "sem itens" bem mais alta dessas 3 marcas.
+    """
+    print("Buscando pendentes de itens sem 'Data Importado'...")
+    return _completar_itens_de_pendentes(
+        _buscar_pendentes_itens_sem_data_importado, "sem 'Data Importado'"
+    )
 
 
 def _gerar_lista_datas(data_inicial, data_final):
@@ -1101,6 +1167,15 @@ def main():
     parser.add_argument("--completar-itens-atrasados", action="store_true", default=False,
                          help="pula o Titan inteiro - so tenta casar itens no Metabase pras datas em "
                               "--data-inicial/--data-final (usa 'Data Importado', nao precisa de login)")
+    # --completar-itens-sem-data-importado (22/09/2026, achado real
+    # investigando lescent/aua/apice - ver completar_itens_sem_data_
+    # importado): backlog IRMAO do de cima, mesmo motivo (Playwright/login
+    # nao precisam rodar), so que filtrando por "Data Importado" NULO em
+    # vez de uma lista de datas.
+    parser.add_argument("--completar-itens-sem-data-importado", action="store_true", default=False,
+                         help="pula o Titan inteiro - so tenta casar itens no Metabase pras linhas "
+                              "com 'Data Importado' NULO (placeholders 'pendente_titan' que nunca "
+                              "foram visitados no Titan, nao precisa de login)")
     args = parser.parse_args()
     if args.completar_itens_atrasados:
         if not args.data_inicial or not args.data_final:
@@ -1109,8 +1184,13 @@ def main():
         gravados, restantes = completar_itens_atrasados(datas)
         print(f"\nConcluido - {gravados} pedido(s) com itens gravados, {restantes} continuam sem casar no Metabase.")
         return
+    if args.completar_itens_sem_data_importado:
+        gravados, restantes = completar_itens_sem_data_importado()
+        print(f"\nConcluido - {gravados} pedido(s) com itens gravados, {restantes} continuam sem casar no Metabase.")
+        return
     if not args.so_recheck and (not args.data_inicial or not args.data_final):
-        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck ou --completar-itens-atrasados)")
+        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck, "
+                      "--completar-itens-atrasados ou --completar-itens-sem-data-importado)")
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")

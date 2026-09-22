@@ -36,6 +36,11 @@ on:
         description: 'Data final DD/MM/AAAA (so usado com completar_itens_atrasados)'
         required: false
         type: string
+      completar_itens_sem_data_importado:
+        description: 'Pular o Titan e so tentar casar itens no Metabase pras linhas com Data Importado NULO (placeholders pendente_titan)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   export:
@@ -78,6 +83,8 @@ jobs:
               --completar-itens-atrasados \
               --data-inicial "${{ github.event.inputs.data_inicial_itens }}" \
               --data-final "${{ github.event.inputs.data_final_itens }}"
+          elif [ "${{ github.event.inputs.completar_itens_sem_data_importado }}" = "true" ]; then
+            python titan_backfill.py --completar-itens-sem-data-importado
           else
             python titan_backfill.py \
               --data-inicial "${{ steps.janela.outputs.inicial }}" \
