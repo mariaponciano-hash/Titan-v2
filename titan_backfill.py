@@ -610,6 +610,106 @@ def _buscar_pendentes_itens(nfs):
     return pendentes
 
 
+def _buscar_pendentes_itens_por_data(datas, tamanho_pagina=1000):
+    """
+    Versao de _buscar_pendentes_itens que busca por "Data Importado" (nao
+    por lista de NFs de uma janela ja exportada) - criada (22/09/2026,
+    achado real reportado pela Maria olhando o Supabase direto) pra cobrir
+    backlog que ficou preso: NFs de 14-15/09/2026, importadas ANTES do
+    mecanismo de itens via Metabase existir (16/09/2026 - ver ITENS VIA
+    METABASE no topo do arquivo), nunca mais entram em nfs_desta_janela de
+    nenhuma rodada futura, porque a janela do backfill diario e sempre
+    "ontem ate hoje" - uma vez que a data sai dessa janela deslizante, o
+    pedido fica com itens=NULL pra sempre, sem nenhum mecanismo automatico
+    pra revisitar (mesma classe de limitacao ja documentada pro backlog de
+    eventos, ver RECHECK DE SITUACAO PRESA no topo do arquivo).
+
+    Paginado via limit/offset (diferente de _buscar_pendentes_itens, que
+    nunca precisou disso porque cada lote de ate 200 NFs nunca se aproxima
+    do teto de 1000 linhas por request do PostgREST) - um unico dia pode
+    ter dezenas de milhares de pedidos pendentes (15/09/2026 sozinho: quase
+    15 mil).
+    """
+    lista_datas = ",".join(urllib.parse.quote(d) for d in datas)
+    pendentes = []
+    offset = 0
+    while True:
+        path = (f"{TABELA}?data_importado=in.({lista_datas})"
+                f"&itens=is.null"
+                f"&select=numero_nf,marca,numero_pedido"
+                f"&limit={tamanho_pagina}&offset={offset}")
+        pagina = titan_watcher._supabase_request("GET", path) or []
+        pendentes.extend(pagina)
+        if len(pagina) < tamanho_pagina:
+            break
+        offset += tamanho_pagina
+    return pendentes
+
+
+def completar_itens_atrasados(datas):
+    """
+    Roda SO a etapa de itens via Metabase, sem Titan/Playwright nenhum -
+    itens nao depende de navegar no Titan, so de Supabase + Metabase (ver
+    _buscar_itens_via_metabase) - pra um conjunto EXPLICITO de datas de
+    "Data Importado" que ficou fora do alcance da janela deslizante normal
+    do backfill (ver _buscar_pendentes_itens_por_data pro motivo).
+
+    Uso pontual/manual via --completar-itens-atrasados (22/09/2026, pedido
+    direto da Maria) - de proposito SEM workflow/cron dedicado: cobrir todo
+    o historico sem filtro de data arriscaria uma varredura enorme sem
+    necessidade real. Rodar quando alguem notar um dia preso (ex: taxa de
+    "sem itens" bem acima do normal de ~10-30% pra aquela data).
+    """
+    print(f"Buscando pendentes de itens pras datas: {', '.join(datas)}...")
+    pendentes = _buscar_pendentes_itens_por_data(datas)
+    print(f"{len(pendentes)} pedido(s) pendente(s) de itens nessas datas.")
+    if not pendentes:
+        return 0, 0
+
+    itens_encontrados = _buscar_itens_via_metabase(pendentes)
+    print(f"  {len(itens_encontrados)} casado(s) no Metabase de {len(pendentes)} pendente(s).")
+    if not itens_encontrados:
+        return 0, len(pendentes)
+
+    # Reconfere antes de gravar (mesmo motivo do "ainda_sem_itens" em
+    # exportar_e_gravar_periodo) - evita sobrescrever um itens que outra
+    # fonte (titan_watcher.py) tenha preenchido nesse meio tempo.
+    ainda_sem_itens = {(p["numero_nf"], p["marca"]) for p in _buscar_pendentes_itens_por_data(datas)}
+    payloads = [
+        {"numero_nf": nf, "marca": marca, "itens": itens, "atualizado_em": _agora_iso()}
+        for (nf, marca), itens in itens_encontrados.items()
+        if (nf, marca) in ainda_sem_itens
+    ]
+
+    gravados = 0
+    for i in range(0, len(payloads), TAMANHO_LOTE):
+        lote = payloads[i:i + TAMANHO_LOTE]
+        try:
+            _supabase_upsert_lote(lote)
+            gravados += len(lote)
+            print(f"  {gravados} gravados...")
+        except Exception as e:
+            print(f"  ERRO no lote (linhas {gravados + 1}-{gravados + len(lote)}), pulando: {e}", file=sys.stderr)
+
+    return gravados, len(pendentes) - gravados
+
+
+def _gerar_lista_datas(data_inicial, data_final):
+    """Expande um intervalo DD/MM/AAAA inclusive numa lista de strings no
+    mesmo formato, um item por dia - usado por --completar-itens-atrasados
+    pra montar o filtro data_importado=in.(...) do Supabase."""
+    inicio = datetime.datetime.strptime(data_inicial, "%d/%m/%Y").date()
+    fim = datetime.datetime.strptime(data_final, "%d/%m/%Y").date()
+    if fim < inicio:
+        raise ValueError(f"--data-final ({data_final}) e anterior a --data-inicial ({data_inicial})")
+    datas = []
+    d = inicio
+    while d <= fim:
+        datas.append(d.strftime("%d/%m/%Y"))
+        d += datetime.timedelta(days=1)
+    return datas
+
+
 def _buscar_numero_pedido_ja_preenchido(nfs):
     """
     Devolve o subconjunto de (numero_nf, marca), dentro das NFs desta
@@ -967,9 +1067,23 @@ def main():
                          help="pula a exportacao em massa - so roda rechecar_situacoes_presas")
     parser.add_argument("--recheck-orcamento-situacao-segundos", type=int, default=RECHECK_ORCAMENTO_SEGUNDOS,
                          help=f"orcamento pro recheck de situacao presa (padrao {RECHECK_ORCAMENTO_SEGUNDOS}s)")
+    # --completar-itens-atrasados (22/09/2026, pedido direto da Maria - ver
+    # completar_itens_atrasados): cobre backlog de itens preso fora da
+    # janela deslizante normal. Nao precisa de Titan/Playwright/login - so
+    # Supabase + Metabase - por isso sai ANTES do bloco sync_playwright().
+    parser.add_argument("--completar-itens-atrasados", action="store_true", default=False,
+                         help="pula o Titan inteiro - so tenta casar itens no Metabase pras datas em "
+                              "--data-inicial/--data-final (usa 'Data Importado', nao precisa de login)")
     args = parser.parse_args()
+    if args.completar_itens_atrasados:
+        if not args.data_inicial or not args.data_final:
+            parser.error("--completar-itens-atrasados precisa de --data-inicial e --data-final")
+        datas = _gerar_lista_datas(args.data_inicial, args.data_final)
+        gravados, restantes = completar_itens_atrasados(datas)
+        print(f"\nConcluido - {gravados} pedido(s) com itens gravados, {restantes} continuam sem casar no Metabase.")
+        return
     if not args.so_recheck and (not args.data_inicial or not args.data_final):
-        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck)")
+        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck ou --completar-itens-atrasados)")
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")

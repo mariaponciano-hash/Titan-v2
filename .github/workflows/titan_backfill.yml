@@ -21,7 +21,21 @@ on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
     - cron: '0 23 * * *'  # 20:00 BRT
-  workflow_dispatch: {}   # permite rodar manualmente pela aba Actions, pra testar
+  workflow_dispatch:   # permite rodar manualmente pela aba Actions, pra testar
+    inputs:
+      completar_itens_atrasados:
+        description: 'Pular o Titan e so tentar casar itens no Metabase pro intervalo abaixo (backlog preso fora da janela normal)'
+        required: false
+        type: boolean
+        default: false
+      data_inicial_itens:
+        description: 'Data inicial DD/MM/AAAA (so usado com completar_itens_atrasados)'
+        required: false
+        type: string
+      data_final_itens:
+        description: 'Data final DD/MM/AAAA (so usado com completar_itens_atrasados)'
+        required: false
+        type: string
 
 jobs:
   export:
@@ -59,10 +73,17 @@ jobs:
           METABASE_URL: ${{ secrets.METABASE_URL }}
           METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
         run: |
-          python titan_backfill.py \
-            --data-inicial "${{ steps.janela.outputs.inicial }}" \
-            --data-final "${{ steps.janela.outputs.final }}" \
-            --headless
+          if [ "${{ github.event.inputs.completar_itens_atrasados }}" = "true" ]; then
+            python titan_backfill.py \
+              --completar-itens-atrasados \
+              --data-inicial "${{ github.event.inputs.data_inicial_itens }}" \
+              --data-final "${{ github.event.inputs.data_final_itens }}"
+          else
+            python titan_backfill.py \
+              --data-inicial "${{ steps.janela.outputs.inicial }}" \
+              --data-final "${{ steps.janela.outputs.final }}" \
+              --headless
+          fi
 
       # O runner some ao fim do job - sem isso, o print/HTML que
       # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel
