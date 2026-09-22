@@ -157,6 +157,17 @@ TABELA = "infos_titan"
 # desapareciam sem NENHUM sinal em lugar nenhum que alguem realmente olhe).
 TABELA_FALHAS = "infos_titan_falhas_backfill"
 TAMANHO_LOTE = 200  # registros por chamada ao Supabase - evita 1 request por pedido
+
+# Lote MAIOR so pra consulta ao Metabase (22/09/2026, achado real - run #85
+# de --completar-itens-sem-data-importado estourou os 30min de timeout do
+# job SEM GRAVAR NADA: com ~65 mil pendentes e TAMANHO_LOTE=200, isso vira
+# ~326 chamadas SEQUENCIAIS ao Metabase so pra apice/lescent/aua - o
+# gargalo real nunca foi o Supabase, foi o numero de round-trips ao
+# Metabase). Metabase/Postgres aguentam de boa um IN (...) de milhares de
+# valores numa unica query - nao ha motivo pra usar o mesmo tamanho de
+# lote pensado pro upsert do Supabase (esse sim limitado pelo formato do
+# POST em lote do PostgREST).
+TAMANHO_LOTE_METABASE = 3000
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabalho - o arquivo e apagado apos o upload
 
 # DIAGNOSTICO TEMPORARIO (17/09/2026, pedido direto da Maria - "registra
@@ -906,8 +917,8 @@ def _buscar_itens_via_metabase(pendentes):
         brand = _brand_shopify(marca)
         pedidos_unicos = sorted({numero_pedido for _, numero_pedido in pares})
         linhas = []
-        for i in range(0, len(pedidos_unicos), TAMANHO_LOTE):
-            fatia = pedidos_unicos[i:i + TAMANHO_LOTE]
+        for i in range(0, len(pedidos_unicos), TAMANHO_LOTE_METABASE):
+            fatia = pedidos_unicos[i:i + TAMANHO_LOTE_METABASE]
             if marca == "apice":
                 ids_validos = [v for v in fatia if v.isdigit()]
                 if not ids_validos:

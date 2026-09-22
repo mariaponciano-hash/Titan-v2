@@ -52,7 +52,13 @@ jobs:
     # Titan) foi REMOVIDO junto com essa mudanca: eventos saiu do escopo do
     # backfill, e itens agora vem de uma consulta em lote ao Metabase
     # dentro deste mesmo job, sem precisar de artifact nem de job separado.
-    timeout-minutes: 30
+    # 60 (era 30) - achado real (22/09/2026, run #85): --completar-itens-
+    # sem-data-importado com ~65 mil pendentes bateu no timeout de 30min
+    # sem gravar nada (gargalo era o NUMERO de chamadas ao Metabase, ja
+    # corrigido com TAMANHO_LOTE_METABASE - mas mantem margem maior aqui
+    # tambem, ja que esse modo pode crescer mais que o backfill diario
+    # normal, que sempre processa so 1 dia).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
