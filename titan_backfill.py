@@ -629,6 +629,19 @@ def _buscar_pendentes_itens_por_data(datas, tamanho_pagina=1000):
     do teto de 1000 linhas por request do PostgREST) - um unico dia pode
     ter dezenas de milhares de pedidos pendentes (15/09/2026 sozinho: quase
     15 mil).
+
+    Retry com backoff pra erro 5xx (22/09/2026, achado real - run #81
+    quebrou o processo INTEIRO com um unico HTTP 500 transitorio do
+    Supabase na 1a pagina, reproduzido manualmente logo depois e confirmado
+    que era so uma instabilidade pontual, nao um bug de query - a mesma
+    chamada funcionou normal na tentativa seguinte). Diferente das buscas
+    pequenas de _buscar_pendentes_itens (poucas dezenas de NFs por vez,
+    onde uma falha rara so custa 1 lote pequeno), esta funcao pagina ate
+    dezenas de milhares de linhas numa unica chamada de
+    --completar-itens-atrasados - sem retry, uma unica falha transitoria
+    perdia TODO o trabalho feito ate ali. Erro 4xx nao tenta de novo (mesmo
+    criterio de _supabase_upsert_grupo_uniforme) - e um problema na query
+    em si, tentar de novo nao muda o resultado.
     """
     lista_datas = ",".join(urllib.parse.quote(d) for d in datas)
     pendentes = []
@@ -638,7 +651,21 @@ def _buscar_pendentes_itens_por_data(datas, tamanho_pagina=1000):
                 f"&itens=is.null"
                 f"&select=numero_nf,marca,numero_pedido"
                 f"&limit={tamanho_pagina}&offset={offset}")
-        pagina = titan_watcher._supabase_request("GET", path) or []
+        pagina = None
+        ultimo_erro = None
+        for tentativa in range(1, 4):
+            try:
+                pagina = titan_watcher._supabase_request("GET", path) or []
+                break
+            except urllib.error.HTTPError as e:
+                ultimo_erro = e
+                if e.code < 500:
+                    raise
+                print(f"  Supabase respondeu {e.code} buscando pendentes (offset={offset}), "
+                      f"tentativa {tentativa}/3...", file=sys.stderr)
+                time.sleep(2 ** tentativa)
+        if pagina is None:
+            raise ultimo_erro
         pendentes.extend(pagina)
         if len(pagina) < tamanho_pagina:
             break
