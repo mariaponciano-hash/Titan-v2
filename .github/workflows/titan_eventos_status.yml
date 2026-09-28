@@ -1,0 +1,62 @@
+name: Titan eventos status por pedido
+
+# Alimenta a tabela NOVA eventos_titan (28/09/2026, pedido direto da Maria)
+# a cada 30 minutos, exportando em lote a aba "Exportação - Status por
+# Pedido" do Titan BI - ver titan_eventos_status.py pro detalhe completo
+# (formato da coluna evento, mescla em vez de substituir, etc).
+#
+# MESMA CADENCIA do titan_watcher.py (30 em 30 min) - mesmo motivo:
+# orcamento do plano Free do GitHub (2.000 min/mes). Confira o consumo real
+# em Settings > Billing > Actions depois de alguns dias e ajuste o cron
+# abaixo se precisar.
+#
+# ⚠️ NAVEGACAO NUNCA VALIDADA AO VIVO (ver aviso grande em
+# titan_eventos_status.py) - RECOMENDADO disparar manualmente uma vez
+# (workflow_dispatch, ou na sua maquina sem --headless) antes de confiar
+# cegamente na primeira rodada agendada. Se travar, o diagnostico cai no
+# artifact titan_debug de sempre.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  eventos-status:
+    runs-on: ubuntu-latest
+    # Generoso de proposito ate termos um numero real medido neste repo -
+    # ver aviso grande acima.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache do Chromium do Playwright
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Instalar dependencias
+        run: |
+          pip install playwright openpyxl
+          playwright install --with-deps chromium
+
+      - name: Rodar
+        env:
+          TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
+          TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
+        run: python titan_eventos_status.py --headless
+
+      # O runner some ao fim do job - sem isso, o print/HTML que
+      # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel.
+      - name: Subir diagnostico (se tiver)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: titan_debug_eventos_status
+          path: titan_debug/
+          retention-days: 7
+          if-no-files-found: ignore
