@@ -1337,7 +1337,24 @@ def extrair_numero_pedido_torre(registro):
     saber se e um problema de dado real no Titan (campo "Numero do Pedido"
     veio vazio pra aquele pedido especifico) ou um problema de leitura do
     scraper (celula nao terminou de renderizar/rolar a tempo) - ver conversa
-    com a Ivna, 08/09/2026."""
+    com a Ivna, 08/09/2026.
+
+    CORRIGIDO (28/09/2026, achado real investigando "itens sempre vazio" pra
+    lescent/aua/by samia especificamente): o proprio exemplo desta docstring
+    (NF 1196008 -> "SH38497BS001196008") ja mostrava o problema sem ninguem
+    perceber - cortar so a NF do final deixa "SH38497BS00" (dois digitos
+    sobrando depois do sufixo "BS"), nunca confirmado contra o nome real do
+    pedido no Shopify ate agora. Testado direto no Metabase: o order_name
+    real NUNCA tem esses digitos extras nem sufixos estranhos ("SH632161LC"/
+    "SH13048AU"/"SH47474BS", nunca "...LC0"/"...AU00"/"...BS00" - e ate um
+    caso visto com "-R-1" colado, provavelmente uma marca de reenvio/
+    substituicao do proprio Titan) - o formato real e sempre "SH<numeros>
+    <LETRAS>", nunca nada depois das letras. Kokeshi/rituaria/barbours nunca
+    mostraram esse problema (a NF parece colar direto sem nada no meio pra
+    essas marcas) - a causa exata da diferenca entre marcas nao foi
+    confirmada, mas cortar tudo depois do sufixo de letras e seguro pra
+    QUALQUER marca (nunca corta nada a mais quando o formato ja vem limpo).
+    """
     projeto = _normalizar_espacos(registro.get("Nome Projeto")).upper().replace(" ", "")
     numero_pedido_titan = _normalizar_espacos(registro.get("Número do Pedido"))
     if not projeto:
@@ -1350,6 +1367,9 @@ def extrair_numero_pedido_torre(registro):
               f"Nota Fiscal={nf!r} Numero do Pedido={numero_pedido_titan!r})", file=sys.stderr)
         return None
     resto = numero_pedido_titan[:-len(nf)]
+    match = re.match(r"^SH\d+[A-Z]+", resto)
+    if match:
+        resto = match.group(0)
     return resto or None
 
 
