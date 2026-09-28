@@ -4394,8 +4394,9 @@ export default {
     // pedido da Ivna - existia um POST /api/logistica/titan-solicitar aqui
     // que cadastrava/reenfileirava linha em infos_titan a cada busca da
     // Torre/Unilog CD; removido de proposito - infos_titan agora e povoada
-    // EXCLUSIVAMENTE pelo que o titan_backfill.py/titan-watcher-worker
-    // trazem sozinhos do Titan, 2x/dia e a cada 5min respectivamente, nunca
+    // EXCLUSIVAMENTE pelo que o titan_backfill.py traz sozinho do Titan,
+    // 1x/dia (titan-watcher-worker/titan_watcher.py pausados em 28/09/2026 -
+    // ver commit da remocao dos workflows), nunca
     // por uma busca avulsa daqui). ----
     if (url.pathname === '/api/logistica/titan-status' && request.method === 'GET') {
       try {
@@ -4602,7 +4603,7 @@ export default {
         const numeroNf = (url.searchParams.get('nf') || '').trim();
         if (!numeroNf) return Response.json({ error: 'nf obrigatorio' }, { status: 400 });
         const linhas = await fetchJsonComTimeout(
-          `${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&select=marca,numero_pedido,status,situacao,romaneio,nome_projeto`,
+          `${TITAN_SB_URL}/rest/v1/infos_titan?numero_nf=eq.${encodeURIComponent(numeroNf)}&select=marca,numero_pedido,situacao,romaneio,nome_projeto`,
           { headers: titanHeaders() },
           LOG_TIMEOUT_MS
         );

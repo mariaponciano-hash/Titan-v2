@@ -158,7 +158,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import titan_bi_scraper as scraper
-import titan_watcher  # reusa processar_pedido/marcar_erro do recheck por-NF (28/08/2026, ver rechecar_situacoes_presas)
+import titan_watcher  # reusa _supabase_request (mesmo projeto/chave, so uma tabela)
 
 SUPABASE_URL = "https://ozwcyrkzsqzmavjtsmsp.supabase.co"
 SUPABASE_KEY = "sb_publishable_CPF6bT_HC0jkTvYWnxHmDg_61qaWqSQ"
@@ -181,147 +181,22 @@ PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabal
 # e mais pesada, so serve pra depurar ao vivo).
 PASTA_PASSO_A_PASSO = Path(__file__).parent / "titan_debug" / "passo_a_passo"
 
-# RECHECK DE SITUACAO PRESA (28/08/2026, achado real pela Ivna): a janela do
-# backfill acima e sempre "ultimos 5 dias corridos" - um pedido importado ha
-# mais de 5 dias que AINDA nao chegou em situacao final (EMBARCADO/
-# CANCELADO) cai fora dessa janela e nunca mais seria revisitado. Simetrico
-# ao recheck que ja existe no titan_cf_worker (Cloudflare) pro mesmo
-# problema, so que aqui roda com Playwright de verdade (sem o bloqueio de
-# renderizacao que o Browser Rendering do Cloudflare tem pra esse dashboard
-# Power BI - ver conversa de 28/08/2026).
-STATUS_FINAIS = ["EMBARCADO", "CANCELADO"]
-RECHECK_INTERVALO_HORAS = 2
-RECHECK_ORCAMENTO_SEGUNDOS = 600  # 10min - deixa margem dentro do timeout do job (ver titan_backfill.yml)
-
-# Achado real (01/09/2026, reportado pela Ivna - pedido SH1197313KS/NF
-# 1197313/marca kokeshi sem tabela Eventos na Unilog CD apesar de ja estar
-# EMBARCADO): pedido descoberto so pelo backfill (que de proposito nao
-# coleta Eventos - ver ITENS VIA METABASE, EVENTOS SAIU DO ESCOPO no topo
-# do arquivo) fica com eventos=NULL pra sempre se a situacao ja for final -
-# buscar_situacao_presa acima ignora de proposito EMBARCADO/CANCELADO (a
-# situacao em si esta certa, so falta Eventos). O unico outro caminho
-# (server.ts reenfileirar quando 'concluido' sem eventos, ver commit
-# dad290a) so dispara se alguem repetir a solicitacao daquela NF pela
-# Torre - nao roda sozinho. Confirmado >=1000 pedidos reais nesse estado
-# via query direta no Supabase (bateu o teto de 1000 da API, o numero real
-# pode ser maior) - eventos ficou fora do escopo do backfill de vez em
-# 16/09/2026, esse backlog nao e mais alvo de nenhum mecanismo automatico
-# aqui.
-#
-# Achado real (11/09/2026, pedido da Maria): ordenar a fila so por
-# atualizado_em.asc (mais antigo primeiro) colocava um pedido RECEM-criado
-# pelo backfill no fim de uma fila de ~1,2 milhao de linhas antigas - na
-# pratica ele nunca chegava a vez dele, mesmo rodando titan_recheck_eventos.
-# yml a cada 15min. Um pedido recente (que um agente pode estar atendendo
-# agora) importa mais do que um pedido de semanas atras ja embarcado. A
-# funcao reivindicar_recheck_eventos no banco chegou a priorizar isso
-# (janela de 3 dias) dentro do proprio ORDER BY - REMOVIDO de la em
-# 13/09/2026 (achado real na run #46 manual do --completar-eventos-worker,
-# ver docstring de _completar_eventos_itens_worker): essa expressao usava
-# now(), o que impedia o Postgres de usar o indice existente e forcava
-# Seq Scan + sort em disco sobre 1,37 milhao de linhas (~6,3s, estourando o
-# timeout de 3s do PostgREST). A RPC hoje so ordena por atualizado_em asc
-# (mais antigo primeiro, sem excecao pra recentes) - mais rapida (~5ms via
-# indice), mas SEM a priorizacao de recentes descrita acima. So afeta
-# buscar_concluidos_sem_eventos/--so-recheck (titan_recheck_eventos.yml,
-# ainda desativado) - o worker de eventos/itens do backfill diario nao usa
-# mais esta RPC (ver _completar_eventos_itens_worker, 14/09/2026).
-
-
 def _agora_iso():
     return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
 
 
-def buscar_situacao_presa(limite=500):
-    """
-    Simetrico ao recheck que ja existe no titan_cf_worker (Cloudflare) pro
-    mesmo problema: pedidos status='concluido' com situacao ainda nao-final
-    (ou nula), sem atualizacao ha mais de RECHECK_INTERVALO_HORAS. "or" cobre
-    situacao NULL tambem - "not.in" sozinho nunca bate NULL (semantica de
-    NULL do Postgres).
-    """
-    # order=atualizado_em.asc (08/09/2026, mesmo achado real ja corrigido em
-    # titan_watcher.buscar_pendentes - NF 1295282 ficou 3 dias parada porque,
-    # sem ordenacao explicita, o Postgres/PostgREST nao garante nenhuma ordem
-    # nas linhas devolvidas: um subconjunto podia ficar "escondido" atras de
-    # outro indefinidamente entre rodadas. Mais antigo primeiro garante que
-    # cada rodada avanca a fila de verdade (a linha processada tem
-    # atualizado_em bumped, indo pro fim), em vez de arriscar reprocessar
-    # sempre o mesmo bloco.
-    lista_finais = ",".join(STATUS_FINAIS)
-    cutoff = (
-        datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-        - datetime.timedelta(hours=RECHECK_INTERVALO_HORAS)
-    ).isoformat() + "Z"
-    path = (
-        f"{TABELA}?status=eq.concluido"
-        f"&atualizado_em=lt.{urllib.parse.quote(cutoff)}"
-        f"&or=(situacao.is.null,situacao.not.in.({lista_finais}))"
-        f"&select=numero_nf,marca&order=atualizado_em.asc&limit={limite}"
-    )
-    return titan_watcher._supabase_request("GET", path) or []
-
-
-def rechecar_situacoes_presas(page, orcamento_segundos=RECHECK_ORCAMENTO_SEGUNDOS):
-    """
-    Reconfere um por um (mesma logica ja validada em titan_watcher.
-    processar_pedido - login com Playwright de verdade, sem o bloqueio de
-    renderizacao do Browser Rendering do Cloudflare pra esse dashboard Power
-    BI) os pedidos que ficaram presos numa situacao intermediaria fora da
-    janela fixa de 5 dias do backfill acima. Orcamento de tempo (nao so
-    contagem de itens) pra nao estourar o timeout do job independente de
-    quantos pedidos estiverem presos.
-
-    orcamento_segundos e parametro (nao so a constante direto) desde
-    11/09/2026 - o modo --so-recheck de main() roda SO isto (sem a
-    exportacao em massa antes), varias vezes por hora via
-    titan_recheck_eventos.yml, e passa um orcamento proprio maior que o do
-    job diario (que reparte tempo com a exportacao principal).
-    """
-    # Busca protegida por try/except (11/09/2026, achado real - erro visto em
-    # producao): buscar_situacao_presa/buscar_concluidos_sem_eventos chamam o
-    # Supabase direto via urllib, que joga excecao (nao devolve so um valor de
-    # erro) em qualquer falha HTTP (ex: 500 transitorio do lado do Supabase).
-    # Sem este try/except, isso derrubava o processo INTEIRO com
-    # sys.exit(1) antes mesmo de reconferir um unico pedido - mesmo padrao
-    # ja usado no loop abaixo pra cada item individual, so que faltava aqui
-    # pra chamada inicial.
-    try:
-        presos = buscar_situacao_presa()
-    except Exception as e:
-        print(f"Nao consegui buscar pedidos presos em situacao intermediaria: {e} - "
-              f"pulando este recheck, tenta de novo na proxima rodada.", file=sys.stderr)
-        return
-    if not presos:
-        print("Nenhum pedido preso em situacao intermediaria fora da janela do backfill.")
-        return
-    print(f"{len(presos)} pedido(s) presos em situacao intermediaria - reconferindo (orcamento {orcamento_segundos}s)...")
-    inicio = time.monotonic()
-    processados = 0
-    for item in presos:
-        if time.monotonic() - inicio > orcamento_segundos:
-            print(f"  orcamento de tempo esgotado - {processados}/{len(presos)} reconferido(s), resto fica pra proxima rodada.")
-            break
-        try:
-            # permitir_limpar_dados=False (achado real, 11/09/2026): isto so
-            # roda sobre pedidos ja 'concluido' com dado bom - um "nao
-            # encontrado" transitorio (sessao/scraping, nao o pedido ter
-            # sumido de verdade) nao pode apagar situacao/romaneio/eventos
-            # ja gravados. Ver docstring de titan_watcher.processar_pedido.
-            titan_watcher.processar_pedido(page, item, permitir_limpar_dados=False)
-        except Exception as e:
-            print(f"  [NF {item.get('numero_nf')} / marca {item.get('marca')}] erro no recheck: {e}", file=sys.stderr)
-            if item.get("numero_nf") and item.get("marca"):
-                titan_watcher.marcar_erro(item.get("numero_nf"), item.get("marca"), str(e))
-        processados += 1
-    print(f"Recheck de situacao concluido: {processados} pedido(s) processado(s).")
-
-
-# REMOVIDAS (16/09/2026, ver ITENS VIA METABASE no topo do arquivo):
-# buscar_concluidos_sem_eventos/rechecar_concluidos_sem_eventos - eventos
-# saiu do escopo do backfill de vez, entao o recheck-por-clique dedicado a
-# eventos (usado so pelo modo --so-recheck, hoje ja desativado via
-# titan_recheck_eventos.yml) nao faz mais sentido existir aqui.
+# REMOVIDAS (28/09/2026, pedido direto da Maria - "excluir as colunas
+# status e erro da tabela infos_titan"): buscar_situacao_presa/
+# rechecar_situacoes_presas/STATUS_FINAIS/RECHECK_INTERVALO_HORAS/
+# RECHECK_ORCAMENTO_SEGUNDOS e o modo --so-recheck de main() - todo o
+# mecanismo dependia de status='concluido' pra achar pedidos presos numa
+# situacao intermediaria. Ja era so alcancavel via --so-recheck (nenhum
+# workflow chamava isso automaticamente - titan_recheck_eventos.yml,
+# citado nos comentarios removidos, nunca chegou a existir neste repo),
+# entao a remocao nao tira nenhuma cobertura que estivesse rodando de
+# verdade. buscar_concluidos_sem_eventos/rechecar_concluidos_sem_eventos
+# ja tinham sido removidas antes (16/09/2026, ver ITENS VIA METABASE no
+# topo do arquivo).
 
 
 def _supabase_upsert_lote(registros):
@@ -509,8 +384,6 @@ def registro_para_supabase(r):
     registro = {
         "numero_nf": nf,
         "marca": marca,
-        "status": "concluido",
-        "erro": None,
         "situacao": r.get("Situação"),
         "romaneio": r.get("Romaneio") or None,
         "valor_pedido": r.get("Valor Pedido"),
@@ -773,25 +646,17 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data-inicial", help="formato DD/MM/AAAA, ex: 01/06/2026 (obrigatorio, exceto com --so-recheck)")
-    parser.add_argument("--data-final", help="formato DD/MM/AAAA, ex: 24/08/2026 (obrigatorio, exceto com --so-recheck)")
+    parser.add_argument("--data-inicial", help="formato DD/MM/AAAA, ex: 01/06/2026 (obrigatorio)")
+    parser.add_argument("--data-final", help="formato DD/MM/AAAA, ex: 24/08/2026 (obrigatorio)")
     parser.add_argument("--headless", action="store_true", default=False, help="roda sem abrir janela - so use depois de validar visualmente sem esta flag")
-    # --so-recheck: pula a exportacao em massa e roda so o recheck de
-    # situacao presa (ver rechecar_situacoes_presas). Eventos SAIU do
-    # escopo deste script (16/09/2026, ver ITENS VIA METABASE no topo do
-    # arquivo) - --recheck-orcamento-eventos-segundos e a chamada de
-    # rechecar_concluidos_sem_eventos foram removidos daqui junto com a
-    # funcao em si.
-    parser.add_argument("--so-recheck", action="store_true", default=False,
-                         help="pula a exportacao em massa - so roda rechecar_situacoes_presas")
-    parser.add_argument("--recheck-orcamento-situacao-segundos", type=int, default=RECHECK_ORCAMENTO_SEGUNDOS,
-                         help=f"orcamento pro recheck de situacao presa (padrao {RECHECK_ORCAMENTO_SEGUNDOS}s)")
     args = parser.parse_args()
     # --completar-itens-atrasados/--completar-itens-sem-data-importado/
     # --completar-itens-todos REMOVIDOS (28/09/2026, ver ITENS VIA METABASE
     # no topo do arquivo) junto com toda a integracao de itens via Metabase.
-    if not args.so_recheck and (not args.data_inicial or not args.data_final):
-        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck)")
+    # --so-recheck/--recheck-orcamento-situacao-segundos REMOVIDOS (28/09/2026,
+    # ver nota grande perto de _agora_iso) junto com rechecar_situacoes_presas.
+    if not args.data_inicial or not args.data_final:
+        parser.error("--data-inicial e --data-final sao obrigatorios")
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")
@@ -805,11 +670,6 @@ def main():
         try:
             print("Entrando no Titan BI...")
             scraper.login(page, email, senha)
-
-            if args.so_recheck:
-                print("\n--so-recheck: pulando exportacao em massa, so reconferindo pedidos presos em situacao intermediaria...")
-                rechecar_situacoes_presas(page, orcamento_segundos=args.recheck_orcamento_situacao_segundos)
-                return
 
             frame = scraper.get_dashboard_frame(page)
 
