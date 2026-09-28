@@ -614,9 +614,9 @@ def _buscar_pendentes_itens(nfs):
 
     So cobre pedidos que JA EXISTEM na tabela (linha nova desta propria
     rodada, ainda nao gravada, so entra aqui na PROXIMA rodada do backfill,
-    2x/dia - simplificacao aceita de proposito, evita ter que juntar dois
-    numero_pedido diferentes - o gravado no banco e o derivado nesta mesma
-    exportacao - so pra tentar cobrir o mesmo dia).
+    1x/dia desde 28/09/2026 (era 2x/dia) - simplificacao aceita de proposito,
+    evita ter que juntar dois numero_pedido diferentes - o gravado no banco e
+    o derivado nesta mesma exportacao - so pra tentar cobrir o mesmo dia).
 
     Volume baixo por rodada: a maioria dos pedidos de uma janela de poucos
     dias ja foi vista e completada numa rodada anterior (a janela e

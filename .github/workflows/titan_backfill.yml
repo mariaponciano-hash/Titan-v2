@@ -1,26 +1,32 @@
 name: Titan backfill diario
 
-# Roda o titan_backfill.py duas vezes por dia (06h e 20h horario de Brasilia,
-# = 09h e 23h UTC - Brasil nao tem horario de verao desde 2019, entao esse
-# offset fixo de -3h nao muda ao longo do ano) pra uma janela deslizante do
-# ultimo dia ate hoje, sem depender do PC da Ivna estar ligado - mesmo
-# motivo do titan_watcher.py ter virado titan_cf_worker. Substitui a Tarefa
-# Agendada "TitanBackfillDiario" do Windows (ver rodar_titan_backfill_diario.ps1)
-# - desativar essa tarefa localmente depois de confirmar que isso funciona,
-# pra nao rodar em duplicidade (upsert e idempotente, mas gasta tempo/execucao
-# a toa).
+# Roda o titan_backfill.py 1x por dia, as 06h horario de Brasilia (= 09h UTC -
+# Brasil nao tem horario de verao desde 2019, entao esse offset fixo de -3h
+# nao muda ao longo do ano) pra uma janela deslizante do ultimo dia ate hoje,
+# sem depender do PC da Ivna estar ligado - mesmo motivo do titan_watcher.py
+# ter virado titan_cf_worker. Substitui a Tarefa Agendada "TitanBackfillDiario"
+# do Windows (ver rodar_titan_backfill_diario.ps1) - desativar essa tarefa
+# localmente depois de confirmar que isso funciona, pra nao rodar em
+# duplicidade (upsert e idempotente, mas gasta tempo/execucao a toa).
 #
-# 1 dia (era 2, depois de ter sido 5 - 13/09/2026, pedido direto da Maria):
-# reduz o volume novo de pedidos por rodada - um pedido so tem no maximo 2
-# chances (as 2 rodadas do mesmo dia) antes da janela avancar e ele sair do
-# escopo pra sempre. O motivo original (competir pelos 20 workers do job
-# completar-eventos) nao existe mais desde 16/09/2026 (job removido, itens
-# agora vem de uma consulta em lote ao Metabase - ver ITENS VIA METABASE em
-# titan_backfill.py), mas o tamanho da janela em si nao foi revisto.
+# VOLTOU A SER 1 RODADA/DIA (28/09/2026, pedido direto da Maria - "só precisa
+# rodar uma vez por dia, já que está pegando as informações direitinho"):
+# a rodada extra das 20h BRT foi removida. Antes disso rodava 2x/dia desde
+# 13/09/2026 - motivo original (dar 2 chances por pedido antes da janela de
+# 1 dia avancar) nao existe mais desde 16/09/2026 (itens vem do Metabase, nao
+# depende mais de quantas rodadas o pedido pegou - ver ITENS VIA METABASE em
+# titan_backfill.py).
+#
+# ACHADO REAL (28/09/2026): o GitHub Actions vem atrasando as rodadas
+# agendadas por varias horas em relacao ao cron configurado (rodadas
+# recentes com cron '0 9 * * *'/'0 23 * * *' dispararam de fato por volta de
+# 13h-14h30 e 00h50-01h15 UTC, nao 09h/23h) - comportamento documentado do
+# GitHub pra workflows agendados em repos com pouca atividade, fora do nosso
+# controle. "06:00 BRT" aqui e a hora PEDIDA ao GitHub, nao uma garantia de
+# hora exata de execucao.
 on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
-    - cron: '0 23 * * *'  # 20:00 BRT
   workflow_dispatch:   # permite rodar manualmente pela aba Actions, pra testar
     inputs:
       completar_itens_atrasados:
