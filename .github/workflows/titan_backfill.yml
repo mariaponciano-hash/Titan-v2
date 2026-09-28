@@ -47,6 +47,11 @@ on:
         required: false
         type: boolean
         default: false
+      completar_itens_todos:
+        description: 'Pular o Titan e tentar casar itens no Metabase pra TODO pedido com itens nulo, sem filtro de data (uso pontual)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   export:
@@ -97,6 +102,8 @@ jobs:
               --data-final "${{ github.event.inputs.data_final_itens }}"
           elif [ "${{ github.event.inputs.completar_itens_sem_data_importado }}" = "true" ]; then
             python titan_backfill.py --completar-itens-sem-data-importado
+          elif [ "${{ github.event.inputs.completar_itens_todos }}" = "true" ]; then
+            python titan_backfill.py --completar-itens-todos
           else
             python titan_backfill.py \
               --data-inicial "${{ steps.janela.outputs.inicial }}" \

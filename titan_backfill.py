@@ -833,6 +833,40 @@ def completar_itens_sem_data_importado():
     )
 
 
+def _buscar_pendentes_itens_todos(tamanho_pagina=1000):
+    """
+    Irma de _buscar_pendentes_itens_por_data/_sem_data_importado - SEM
+    filtro nenhum de "Data Importado" (so numero_pedido IS NOT NULL, alem
+    do itens IS NULL ja embutido em _buscar_pendentes_itens_filtrado). Uso
+    pontual/excepcional (28/09/2026, pedido direto da Maria) apos corrigir
+    ~26 mil "numero_pedido" com digito/sufixo sobrando espalhados por TODAS
+    as datas (scraper.extrair_numero_pedido_torre so cortava a NF do final,
+    deixando lixo tipo "SH643162LC0"/"SH1097432KS-R-1" - ver commit da
+    correcao) - esses NFs nunca tinham conseguido casar itens no Metabase
+    por causa do numero_pedido errado, e como sao antigos e espalhados por
+    todo o historico, nao dava pra usar --completar-itens-atrasados (que
+    precisa de um intervalo de datas) nem --completar-itens-sem-data-
+    importado (so cobre "Data Importado" NULO).
+
+    DE PROPOSITO nao tem workflow_dispatch/cron dedicado igual as outras
+    duas variantes - cobrir TODO o historico sem filtro nenhum e exatamente
+    o cenario que a docstring de completar_itens_atrasados avisa pra evitar
+    ("varredura enorme sem necessidade real"), so faz sentido aqui porque
+    e uma correcao pontual de um bug ja identificado e corrigido, nao uma
+    rotina.
+    """
+    return _buscar_pendentes_itens_filtrado("numero_pedido=not.is.null", tamanho_pagina)
+
+
+def completar_itens_todos():
+    """Roda completar_itens_de_pendentes sem filtro de data nenhum - ver
+    _buscar_pendentes_itens_todos pro motivo (uso pontual, nao uma rotina)."""
+    print("Buscando todos os pendentes de itens, sem filtro de data...")
+    return _completar_itens_de_pendentes(
+        _buscar_pendentes_itens_todos, "no total (sem filtro de data)"
+    )
+
+
 def _gerar_lista_datas(data_inicial, data_final):
     """Expande um intervalo DD/MM/AAAA inclusive numa lista de strings no
     mesmo formato, um item por dia - usado por --completar-itens-atrasados
@@ -1223,6 +1257,13 @@ def main():
                          help="pula o Titan inteiro - so tenta casar itens no Metabase pras linhas "
                               "com 'Data Importado' NULO (placeholders 'pendente_titan' que nunca "
                               "foram visitados no Titan, nao precisa de login)")
+    # --completar-itens-todos (28/09/2026, pedido direto da Maria - ver
+    # completar_itens_todos): uso PONTUAL, sem filtro de data nenhum - so
+    # pra reprocessar depois de corrigir um bug em numero_pedido que
+    # afetava NFs espalhados por todo o historico (nao um dia/intervalo so).
+    parser.add_argument("--completar-itens-todos", action="store_true", default=False,
+                         help="pula o Titan inteiro - tenta casar itens no Metabase pra TODO pedido "
+                              "com itens nulo, sem filtro de data (uso pontual, nao roda via cron)")
     args = parser.parse_args()
     if args.completar_itens_atrasados:
         if not args.data_inicial or not args.data_final:
@@ -1235,9 +1276,14 @@ def main():
         gravados, restantes = completar_itens_sem_data_importado()
         print(f"\nConcluido - {gravados} pedido(s) com itens gravados, {restantes} continuam sem casar no Metabase.")
         return
+    if args.completar_itens_todos:
+        gravados, restantes = completar_itens_todos()
+        print(f"\nConcluido - {gravados} pedido(s) com itens gravados, {restantes} continuam sem casar no Metabase.")
+        return
     if not args.so_recheck and (not args.data_inicial or not args.data_final):
         parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck, "
-                      "--completar-itens-atrasados ou --completar-itens-sem-data-importado)")
+                      "--completar-itens-atrasados, --completar-itens-sem-data-importado ou "
+                      "--completar-itens-todos)")
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")
