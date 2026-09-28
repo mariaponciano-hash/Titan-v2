@@ -394,14 +394,29 @@ def registro_para_supabase(r):
         # so a data, sem hora (17/09/2026, pedido direto da Maria - ver
         # scraper.formatar_apenas_data pro formato M/D/AAAA e o motivo)
         "data_importado": scraper.formatar_apenas_data(r.get("Data Importado")),
-        "data_expedido": r.get("Data Expedido"),
-        "data_conferido": r.get("Data Conferido"),
         # Novos (25/08/2026) - so a exportacao nativa expoe texto de verdade
         # pra essas duas colunas (ver comentario grande no topo do arquivo).
         "depositante": r.get("Depositante"),
         "cliente": r.get("Cliente"),
         "atualizado_em": _agora_iso(),
     }
+    # data_expedido/data_conferido so entram no payload QUANDO o Titan tem um
+    # valor de verdade pra elas (28/09/2026, pedido direto da Maria: "atualizar
+    # as colunas data expedido e data conferido quando tiver valor") - nunca
+    # sobrescreve um valor ja gravado com um branco (a linha pode passar por
+    # varias rodadas do backfill antes do Titan preencher essas datas - mesmo
+    # espirito do numero_pedido fill-only-if-empty acima e do permitir_limpar_
+    # dados=False em titan_watcher.processar_pedido). Chave OMITIDA (nao None)
+    # quando vazia - PostgREST so mexe nas colunas presentes no JSON num
+    # upsert por conflito; _supabase_upsert_lote ja agrupa por conjunto de
+    # chaves antes de mandar, entao registros com/sem essas chaves no mesmo
+    # lote nao colidem (ver docstring dela).
+    data_expedido = r.get("Data Expedido")
+    if data_expedido:
+        registro["data_expedido"] = data_expedido
+    data_conferido = r.get("Data Conferido")
+    if data_conferido:
+        registro["data_conferido"] = data_conferido
     # NAO promove direto pra "numero_pedido" aqui (16/09/2026, pedido direto
     # da Maria: "somente para as marcas que nao tem nada") - fica guardado
     # numa chave privada (nunca mandada ao Supabase, ver o pop() em

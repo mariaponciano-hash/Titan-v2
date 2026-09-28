@@ -1,20 +1,25 @@
 name: Titan backfill diario
 
-# Roda o titan_backfill.py 1x por dia, as 06h horario de Brasilia (= 09h UTC -
-# Brasil nao tem horario de verao desde 2019, entao esse offset fixo de -3h
-# nao muda ao longo do ano) pra uma janela deslizante do ultimo dia ate hoje,
-# sem depender do PC da Ivna estar ligado - mesmo motivo do titan_watcher.py
-# ter virado titan_cf_worker. Substitui a Tarefa Agendada "TitanBackfillDiario"
-# do Windows (ver rodar_titan_backfill_diario.ps1) - desativar essa tarefa
-# localmente depois de confirmar que isso funciona, pra nao rodar em
-# duplicidade (upsert e idempotente, mas gasta tempo/execucao a toa).
+# Roda o titan_backfill.py 5x por dia (06h/09h/12h/15h/18h horario de
+# Brasilia = 09h/12h/15h/18h/21h UTC - Brasil nao tem horario de verao desde
+# 2019, entao esse offset fixo de -3h nao muda ao longo do ano) pra uma
+# janela deslizante do ultimo dia ate hoje, sem depender do PC da Ivna estar
+# ligado - mesmo motivo do titan_watcher.py ter virado titan_cf_worker.
+# Substitui a Tarefa Agendada "TitanBackfillDiario" do Windows (ver
+# rodar_titan_backfill_diario.ps1) - desativar essa tarefa localmente depois
+# de confirmar que isso funciona, pra nao rodar em duplicidade (upsert e
+# idempotente, mas gasta tempo/execucao a toa).
 #
-# VOLTOU A SER 1 RODADA/DIA (28/09/2026, pedido direto da Maria - "só precisa
-# rodar uma vez por dia, já que está pegando as informações direitinho"):
-# a rodada extra das 20h BRT foi removida. Antes disso rodava 2x/dia desde
-# 13/09/2026 - motivo original (dar 2 chances por pedido antes da janela de
-# 1 dia avancar) nao existia mais desde 16/09/2026 (itens vinha do Metabase,
-# nao dependia mais de quantas rodadas o pedido pegou).
+# VOLTOU A SER 5 RODADAS/DIA (28/09/2026, pedido direto da Maria - "o
+# backfill precisa rodar 5 vezes ao dia"). Historico: tinha ido pra 1x/dia
+# mais cedo no mesmo dia ("só precisa rodar uma vez por dia, já que está
+# pegando as informações direitinho"), depois de ter rodado 2x/dia desde
+# 13/09/2026 - motivo original daquela reducao (itens vinha do Metabase, nao
+# dependia mais de quantas rodadas o pedido pegou) nao se aplica mais desde
+# que "itens via Metabase" foi removido do backfill (mesma data, ver ITENS
+# VIA METABASE em titan_backfill.py) - rodar mais vezes ao dia volta a
+# importar pra pegar atualizacoes de situacao/romaneio/data_expedido/data_
+# conferido mais cedo.
 #
 # ITENS VIA METABASE REMOVIDO (28/09/2026, pedido direto da Maria - "está
 # dando errado a condição do metabase, não vou deixar configurado dentro do
@@ -37,7 +42,11 @@ name: Titan backfill diario
 # hora exata de execucao.
 on:
   schedule:
-    - cron: '0 9 * * *'   # 06:00 BRT
+    - cron: '0 9 * * *'    # 06:00 BRT
+    - cron: '0 12 * * *'   # 09:00 BRT
+    - cron: '0 15 * * *'   # 12:00 BRT
+    - cron: '0 18 * * *'   # 15:00 BRT
+    - cron: '0 21 * * *'   # 18:00 BRT
   workflow_dispatch: {}   # permite rodar manualmente pela aba Actions, pra testar
 
 jobs:
