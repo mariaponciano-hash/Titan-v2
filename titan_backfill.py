@@ -88,17 +88,30 @@ o mecanismo de clique-por-pedido acima (job completar-eventos, 20
 infraestrutura ao redor) foi REMOVIDO. Eventos deixou de ser
 responsabilidade deste script (nao entrou na lista de colunas que a Maria
 pediu pra manter) - quem ainda tiver eventos=NULL fica assim ate outro
-mecanismo cobrir isso (nenhum decidido ainda). Itens continua sendo
-preenchido, mas agora vem do Metabase (gold.shopify_order_items, banco
-"Data Mart"/database_id 43 - mesma fonte e mesmo schema de JSON usados no
-backfill manual de itens feito em 14-15/09/2026 pra rituaria/barbours/
-kokeshi/apice - ver _buscar_itens_via_metabase) em vez de clicar pedido
-por pedido no Titan: mais rapido (uma query em lote por marca, no mesmo
-job, sem precisar de workers/matrix/artifact) e nao depende mais de
-sessao/navegacao instavel no Power BI pra esse dado especifico. Autenticado
-via API Key (METABASE_API_KEY, Secret do GitHub) - a conta da Maria no
-Metabase nao tinha admin pra criar isso sozinha, uma pessoa com acesso de
-admin gerou a chave e ela foi cadastrada como secret.
+mecanismo cobrir isso (nenhum decidido ainda).
+
+ITENS VIA METABASE REMOVIDO DE VEZ (28/09/2026, pedido direto da Maria -
+"está dando errado a condição do metabase, não vou deixar configurado
+dentro do github, pode remover essa parte para preencher itens"): entre
+16/09 e 28/09/2026 itens vinha de uma consulta em lote ao Metabase
+(gold.shopify_order_items, banco "Data Mart"/database_id 43), rodando
+dentro deste mesmo job a cada rodada do backfill. Descoberto ao vivo
+nesta mesma data que a consulta (`order_name in (...)`, marcas que nao
+casam por order_number - ver MARCAS_MATCH_POR_ORDER_NUMBER, removida
+junto) sofre timeout inconsistente no Metabase pra lotes de texto de
+qualquer tamanho testado (chegou a falhar ate com 5-50 valores, mesmo
+quando um lote de 300-600 tinha acabado de funcionar minutos antes -
+sinal de degradacao do proprio warehouse, nao um problema de sintaxe ou
+tamanho de lote corrigivel daqui) - foi isso que gerou o erro real "ERRO
+consultando itens no Metabase pra marca barbours: The read operation
+timed out" nesta rodada. Removida a funcao inteira
+(_buscar_itens_via_metabase) e tudo em volta dela (_buscar_pendentes_
+itens*, completar_itens_atrasados/sem_data_importado/todos, os 3 flags
+--completar-itens-* e os inputs correspondentes de workflow_dispatch em
+titan_backfill.yml) - itens fica sem nenhum mecanismo automatico de
+preenchimento por enquanto, nenhum decidido ainda (mesma situacao de
+eventos acima). O historico desta secao (16/09/2026) fica registrado
+acima so como contexto de por que "Itens via Metabase" existiu.
 
 numero_pedido virou fill-only-if-empty (16/09/2026, mesmo pedido): antes
 sempre sobrescrevia quando dava pra derivar (ver historico anterior desta
@@ -157,17 +170,6 @@ TABELA = "infos_titan"
 # desapareciam sem NENHUM sinal em lugar nenhum que alguem realmente olhe).
 TABELA_FALHAS = "infos_titan_falhas_backfill"
 TAMANHO_LOTE = 200  # registros por chamada ao Supabase - evita 1 request por pedido
-
-# Lote MAIOR so pra consulta ao Metabase (22/09/2026, achado real - run #85
-# de --completar-itens-sem-data-importado estourou os 30min de timeout do
-# job SEM GRAVAR NADA: com ~65 mil pendentes e TAMANHO_LOTE=200, isso vira
-# ~326 chamadas SEQUENCIAIS ao Metabase so pra apice/lescent/aua - o
-# gargalo real nunca foi o Supabase, foi o numero de round-trips ao
-# Metabase). Metabase/Postgres aguentam de boa um IN (...) de milhares de
-# valores numa unica query - nao ha motivo pra usar o mesmo tamanho de
-# lote pensado pro upsert do Supabase (esse sim limitado pelo formato do
-# POST em lote do PostgREST).
-TAMANHO_LOTE_METABASE = 3000
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabalho - o arquivo e apagado apos o upload
 
 # DIAGNOSTICO TEMPORARIO (17/09/2026, pedido direto da Maria - "registra
@@ -178,35 +180,6 @@ PASTA_EXPORTS = Path(__file__).parent / "titan_exports"  # so um local de trabal
 # novo do calendario/exportacao esta estavel (isso deixa a run mais lenta
 # e mais pesada, so serve pra depurar ao vivo).
 PASTA_PASSO_A_PASSO = Path(__file__).parent / "titan_debug" / "passo_a_passo"
-
-# Metabase (16/09/2026, ver ITENS VIA METABASE no topo do arquivo) - mesmo
-# banco "Data Mart" ja usado no backfill manual de itens (14-15/09/2026).
-# METABASE_API_KEY vem de um Secret do GitHub (a conta da Maria no Metabase
-# nao e admin, entao a chave foi gerada por quem tem acesso de admin e so
-# cadastrada aqui - nunca commitada).
-METABASE_URL = os.environ.get("METABASE_URL", "https://metabase.gobeaute.com.br")
-METABASE_API_KEY = os.environ.get("METABASE_API_KEY")
-METABASE_DATABASE_ID = 43  # "Data Mart"
-
-# "marca" (usado no infos_titan/na Torre) so difere do "brand" do Metabase
-# pra by samia - marca tem espaco, brand tem underscore (mesma pegadinha ja
-# documentada em outros lugares deste projeto). Toda outra marca bate igual
-# (rituaria, barbours, kokeshi, apice, lescent, aua, yenzah).
-MARCA_PARA_BRAND_SHOPIFY = {"by samia": "by_samia"}
-
-# Marcas cujo "order_name" no Metabase NAO segue o padrao "SH<id><SUFIXO>"
-# das outras - casam por order_number (bigint) em vez disso (ver
-# _buscar_itens_via_metabase). APICE ja era assim (numero_pedido do Titan e
-# um ID proprio, sem NF colada - ver extrair_numero_pedido_torre). DENAVITA
-# entrou aqui (22/09/2026, achado real investigando "0 itens casados pra
-# essa marca" a pedido da Maria): confirmado direto no Metabase que
-# order_name da denavita vem "#168149" (com "#", sem "SH") enquanto
-# order_number e o inteiro limpo "168149" - e o "numero_pedido" gravado no
-# Supabase pra denavita (derivado do "sales_number" da Intelipost pela
-# Etapa 1 de titan_preencher_lacunas.py, ja que nenhum pedido dessa marca
-# foi visitado no Titan ainda) ja vem nesse formato numerico puro, entao
-# nunca batia contra order_name.
-MARCAS_MATCH_POR_ORDER_NUMBER = {"apice", "denavita"}
 
 # RECHECK DE SITUACAO PRESA (28/08/2026, achado real pela Ivna): a janela do
 # backfill acima e sempre "ultimos 5 dias corridos" - um pedido importado ha
@@ -597,292 +570,6 @@ def _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_fina
     return True
 
 
-def _buscar_pendentes_itens(nfs):
-    """
-    Consulta o Supabase em lotes (por numero_nf, ate 200 por vez - mesmo
-    tamanho de TAMANHO_LOTE) pra achar, dentro das NFs desta janela de
-    backfill, quais pedidos ja existem na tabela com itens ainda NULO.
-
-    RENOMEADA de _buscar_pendentes_eventos_itens (16/09/2026, ver ITENS VIA
-    METABASE no topo do arquivo) - o "OU eventos.is.null" saiu da condicao
-    porque eventos nao e mais responsabilidade deste script. NAO filtra por
-    status (mesmo comportamento de antes, 14/09/2026 - pedido da Maria).
-
-    Devolve numero_pedido junto (usado por _buscar_itens_via_metabase como
-    chave de match no Shopify) - por isso devolve uma LISTA de dicts (um
-    por pedido), nao um set de tuplas (numero_nf, marca).
-
-    So cobre pedidos que JA EXISTEM na tabela (linha nova desta propria
-    rodada, ainda nao gravada, so entra aqui na PROXIMA rodada do backfill,
-    1x/dia desde 28/09/2026 (era 2x/dia) - simplificacao aceita de proposito,
-    evita ter que juntar dois numero_pedido diferentes - o gravado no banco e
-    o derivado nesta mesma exportacao - so pra tentar cobrir o mesmo dia).
-
-    Volume baixo por rodada: a maioria dos pedidos de uma janela de poucos
-    dias ja foi vista e completada numa rodada anterior (a janela e
-    deslizante e se repete a cada backfill).
-    """
-    pendentes = []
-    nfs_unicas = sorted({str(nf) for nf in nfs if nf})
-    for i in range(0, len(nfs_unicas), TAMANHO_LOTE):
-        lote_nfs = nfs_unicas[i:i + TAMANHO_LOTE]
-        lista = ",".join(urllib.parse.quote(nf) for nf in lote_nfs)
-        path = (f"{TABELA}?numero_nf=in.({lista})"
-                f"&itens=is.null"
-                f"&select=numero_nf,marca,numero_pedido")
-        linhas = titan_watcher._supabase_request("GET", path) or []
-        pendentes.extend(linhas)
-    return pendentes
-
-
-def _buscar_pendentes_itens_por_data(datas, tamanho_pagina=1000):
-    """
-    Versao de _buscar_pendentes_itens que busca por "Data Importado" (nao
-    por lista de NFs de uma janela ja exportada) - criada (22/09/2026,
-    achado real reportado pela Maria olhando o Supabase direto) pra cobrir
-    backlog que ficou preso: NFs de 14-15/09/2026, importadas ANTES do
-    mecanismo de itens via Metabase existir (16/09/2026 - ver ITENS VIA
-    METABASE no topo do arquivo), nunca mais entram em nfs_desta_janela de
-    nenhuma rodada futura, porque a janela do backfill diario e sempre
-    "ontem ate hoje" - uma vez que a data sai dessa janela deslizante, o
-    pedido fica com itens=NULL pra sempre, sem nenhum mecanismo automatico
-    pra revisitar (mesma classe de limitacao ja documentada pro backlog de
-    eventos, ver RECHECK DE SITUACAO PRESA no topo do arquivo).
-
-    Paginado via limit/offset (diferente de _buscar_pendentes_itens, que
-    nunca precisou disso porque cada lote de ate 200 NFs nunca se aproxima
-    do teto de 1000 linhas por request do PostgREST) - um unico dia pode
-    ter dezenas de milhares de pedidos pendentes (15/09/2026 sozinho: quase
-    15 mil).
-
-    Retry com backoff pra erro 5xx (22/09/2026, achado real - run #81
-    quebrou o processo INTEIRO com um unico HTTP 500 transitorio do
-    Supabase na 1a pagina, reproduzido manualmente logo depois e confirmado
-    que era so uma instabilidade pontual, nao um bug de query - a mesma
-    chamada funcionou normal na tentativa seguinte). Diferente das buscas
-    pequenas de _buscar_pendentes_itens (poucas dezenas de NFs por vez,
-    onde uma falha rara so custa 1 lote pequeno), esta funcao pagina ate
-    dezenas de milhares de linhas numa unica chamada de
-    --completar-itens-atrasados - sem retry, uma unica falha transitoria
-    perdia TODO o trabalho feito ate ali. Erro 4xx nao tenta de novo (mesmo
-    criterio de _supabase_upsert_grupo_uniforme) - e um problema na query
-    em si, tentar de novo nao muda o resultado.
-    """
-    return _buscar_pendentes_itens_filtrado(
-        f"data_importado=in.({','.join(urllib.parse.quote(d) for d in datas)})", tamanho_pagina
-    )
-
-
-def _buscar_pendentes_itens_sem_data_importado(tamanho_pagina=1000):
-    """
-    Irma de _buscar_pendentes_itens_por_data, pro OUTRO jeito de ficar fora
-    do alcance da janela deslizante: linhas com "Data Importado" NULO
-    (22/09/2026, achado real investigando lescent/aua/apice a pedido da
-    Maria - taxa de "sem itens" bem mais alta que kokeshi/barbours/rituaria
-    pra essas 3 marcas). Essas linhas nunca passaram por uma exportacao real
-    do Titan (por isso "Data Importado" nunca foi preenchido) - foram
-    criadas com status='pendente_titan' por uma Etapa 1 (ver
-    titan_preencher_lacunas.py/ou o script irmao do repo central-tickets,
-    que compartilha este mesmo Supabase - mesma origem do bug de marca
-    "by_samia" corrigido antes) a partir de gold.intelipost_orders, que ja
-    inclui numero_pedido - so nunca tiveram Titan/itens processado depois.
-    Confirmado com numero real: 38.765 (apice) + 23.475 (lescent) + 2.794
-    (aua) linhas nesse estado.
-
-    numero_pedido ja vem preenchido nessas linhas (derivado direto do
-    Metabase na Etapa 1, nao do Titan) - da pra tentar casar itens mesmo
-    sem NUNCA ter visitado o Titan pra essas NFs, ja que itens so depende
-    de marca+numero_pedido (ver _buscar_itens_via_metabase).
-    """
-    return _buscar_pendentes_itens_filtrado("data_importado=is.null", tamanho_pagina)
-
-
-def _buscar_pendentes_itens_filtrado(filtro_data_importado, tamanho_pagina=1000):
-    """Paginacao+retry compartilhada por _buscar_pendentes_itens_por_data e
-    _buscar_pendentes_itens_sem_data_importado - so muda o filtro de
-    "Data Importado" (lista explicita de datas vs IS NULL)."""
-    pendentes = []
-    offset = 0
-    while True:
-        path = (f"{TABELA}?{filtro_data_importado}"
-                f"&itens=is.null"
-                f"&select=numero_nf,marca,numero_pedido"
-                f"&limit={tamanho_pagina}&offset={offset}")
-        # 5 tentativas, nao 3 (22/09/2026, achado real - run #86): com
-        # 200+ paginas numa tabela de 1,48 milhao de linhas, os 500 do
-        # Supabase apareceram em RAJADAS de varias paginas seguidas (ex:
-        # offset 173000 a 188000, 16 paginas direto), nao isolados - 3
-        # tentativas (2s+4s+8s=14s de espera) nao bastavam pra atravessar
-        # uma instabilidade mais longa que isso do lado do Supabase.
-        pagina = None
-        ultimo_erro = None
-        for tentativa in range(1, 6):
-            try:
-                pagina = titan_watcher._supabase_request("GET", path) or []
-                break
-            except urllib.error.HTTPError as e:
-                ultimo_erro = e
-                if e.code < 500:
-                    raise
-                print(f"  Supabase respondeu {e.code} buscando pendentes (offset={offset}), "
-                      f"tentativa {tentativa}/5...", file=sys.stderr)
-                time.sleep(2 ** tentativa)
-        if pagina is None:
-            raise ultimo_erro
-        pendentes.extend(pagina)
-        if len(pagina) < tamanho_pagina:
-            break
-        offset += tamanho_pagina
-    return pendentes
-
-
-def _completar_itens_de_pendentes(buscar_pendentes, descricao):
-    """
-    Casa itens no Metabase pra um conjunto de pendentes e grava o
-    resultado. Compartilhada por completar_itens_atrasados/completar_itens_
-    sem_data_importado - as duas so diferem em COMO levantam os pendentes
-    (ver as duas funcoes _buscar_pendentes_itens_* acima); o resto (casar+
-    reconferir+gravar) e identico.
-
-    `buscar_pendentes` e uma funcao SEM ARGUMENTOS (closure ja fechada
-    sobre datas/etc pelo chamador), chamada UMA vez pra levantar os
-    candidatos - a reconferencia antes de gravar (mesmo motivo do "ainda_
-    sem_itens" em exportar_e_gravar_periodo, evitar sobrescrever um itens
-    que outra fonte tenha preenchido nesse meio tempo) usa
-    _buscar_pendentes_itens (por lista de NFs, ja testada e sem paginacao)
-    em vez de chamar `buscar_pendentes` de novo.
-
-    CORRIGIDO (22/09/2026, run #86 - achado real): a versao anterior
-    chamava `buscar_pendentes` DUAS vezes (a mesma paginacao grande, por
-    data_importado, tanto pra levantar quanto pra reconferir). Com 203 mil
-    pendentes (--completar-itens-sem-data-importado, contando TODAS as
-    marcas, nao so lescent/aua/apice), a 1a chamada teve sucesso e casou
-    90.759 itens no Metabase - mas a 2a chamada (so pra reconferir) bateu
-    em varios 500 consecutivos no fim da paginacao (offset >170 mil) e
-    derrubou o processo ANTES de gravar qualquer coisa, jogando fora todo
-    o trabalho de match ja feito. _buscar_pendentes_itens pagina por
-    LISTA DE NFs (lotes de 200, mesma consulta pequena e robusta ja usada
-    no backfill diario normal) em vez de OFFSET sobre a tabela inteira -
-    muito mais barato pra reconferir soh os poucos milhares de NFs que
-    realmente casaram, em vez de repetir a varredura inteira.
-    """
-    pendentes = buscar_pendentes()
-    print(f"{len(pendentes)} pedido(s) pendente(s) de itens {descricao}.")
-    if not pendentes:
-        return 0, 0
-
-    itens_encontrados = _buscar_itens_via_metabase(pendentes)
-    print(f"  {len(itens_encontrados)} casado(s) no Metabase de {len(pendentes)} pendente(s).")
-    if not itens_encontrados:
-        return 0, len(pendentes)
-
-    nfs_casados = [nf for (nf, _marca) in itens_encontrados]
-    ainda_sem_itens = {(p["numero_nf"], p["marca"]) for p in _buscar_pendentes_itens(nfs_casados)}
-    payloads = [
-        {"numero_nf": nf, "marca": marca, "itens": itens, "atualizado_em": _agora_iso()}
-        for (nf, marca), itens in itens_encontrados.items()
-        if (nf, marca) in ainda_sem_itens
-    ]
-
-    gravados = 0
-    for i in range(0, len(payloads), TAMANHO_LOTE):
-        lote = payloads[i:i + TAMANHO_LOTE]
-        try:
-            _supabase_upsert_lote(lote)
-            gravados += len(lote)
-            print(f"  {gravados} gravados...")
-        except Exception as e:
-            print(f"  ERRO no lote (linhas {gravados + 1}-{gravados + len(lote)}), pulando: {e}", file=sys.stderr)
-
-    return gravados, len(pendentes) - gravados
-
-
-def completar_itens_atrasados(datas):
-    """
-    Roda SO a etapa de itens via Metabase, sem Titan/Playwright nenhum -
-    itens nao depende de navegar no Titan, so de Supabase + Metabase (ver
-    _buscar_itens_via_metabase) - pra um conjunto EXPLICITO de datas de
-    "Data Importado" que ficou fora do alcance da janela deslizante normal
-    do backfill (ver _buscar_pendentes_itens_por_data pro motivo).
-
-    Uso pontual/manual via --completar-itens-atrasados (22/09/2026, pedido
-    direto da Maria) - de proposito SEM workflow/cron dedicado: cobrir todo
-    o historico sem filtro de data arriscaria uma varredura enorme sem
-    necessidade real. Rodar quando alguem notar um dia preso (ex: taxa de
-    "sem itens" bem acima do normal de ~10-30% pra aquela data).
-    """
-    print(f"Buscando pendentes de itens pras datas: {', '.join(datas)}...")
-    return _completar_itens_de_pendentes(
-        lambda: _buscar_pendentes_itens_por_data(datas), "nessas datas"
-    )
-
-
-def completar_itens_sem_data_importado():
-    """
-    Mesma ideia de completar_itens_atrasados, pro OUTRO jeito de backlog
-    (ver _buscar_pendentes_itens_sem_data_importado) - linhas com "Data
-    Importado" NULO, criadas como placeholder (status='pendente_titan') por
-    uma Etapa 1 que nunca chegou a visitar o Titan pra elas. Achado real
-    (22/09/2026, investigando lescent/aua/apice a pedido da Maria): 38.765
-    (apice) + 23.475 (lescent) + 2.794 (aua) linhas nesse estado - a causa
-    principal da taxa de "sem itens" bem mais alta dessas 3 marcas.
-    """
-    print("Buscando pendentes de itens sem 'Data Importado'...")
-    return _completar_itens_de_pendentes(
-        _buscar_pendentes_itens_sem_data_importado, "sem 'Data Importado'"
-    )
-
-
-def _buscar_pendentes_itens_todos(tamanho_pagina=1000):
-    """
-    Irma de _buscar_pendentes_itens_por_data/_sem_data_importado - SEM
-    filtro nenhum de "Data Importado" (so numero_pedido IS NOT NULL, alem
-    do itens IS NULL ja embutido em _buscar_pendentes_itens_filtrado). Uso
-    pontual/excepcional (28/09/2026, pedido direto da Maria) apos corrigir
-    ~26 mil "numero_pedido" com digito/sufixo sobrando espalhados por TODAS
-    as datas (scraper.extrair_numero_pedido_torre so cortava a NF do final,
-    deixando lixo tipo "SH643162LC0"/"SH1097432KS-R-1" - ver commit da
-    correcao) - esses NFs nunca tinham conseguido casar itens no Metabase
-    por causa do numero_pedido errado, e como sao antigos e espalhados por
-    todo o historico, nao dava pra usar --completar-itens-atrasados (que
-    precisa de um intervalo de datas) nem --completar-itens-sem-data-
-    importado (so cobre "Data Importado" NULO).
-
-    DE PROPOSITO nao tem workflow_dispatch/cron dedicado igual as outras
-    duas variantes - cobrir TODO o historico sem filtro nenhum e exatamente
-    o cenario que a docstring de completar_itens_atrasados avisa pra evitar
-    ("varredura enorme sem necessidade real"), so faz sentido aqui porque
-    e uma correcao pontual de um bug ja identificado e corrigido, nao uma
-    rotina.
-    """
-    return _buscar_pendentes_itens_filtrado("numero_pedido=not.is.null", tamanho_pagina)
-
-
-def completar_itens_todos():
-    """Roda completar_itens_de_pendentes sem filtro de data nenhum - ver
-    _buscar_pendentes_itens_todos pro motivo (uso pontual, nao uma rotina)."""
-    print("Buscando todos os pendentes de itens, sem filtro de data...")
-    return _completar_itens_de_pendentes(
-        _buscar_pendentes_itens_todos, "no total (sem filtro de data)"
-    )
-
-
-def _gerar_lista_datas(data_inicial, data_final):
-    """Expande um intervalo DD/MM/AAAA inclusive numa lista de strings no
-    mesmo formato, um item por dia - usado por --completar-itens-atrasados
-    pra montar o filtro data_importado=in.(...) do Supabase."""
-    inicio = datetime.datetime.strptime(data_inicial, "%d/%m/%Y").date()
-    fim = datetime.datetime.strptime(data_final, "%d/%m/%Y").date()
-    if fim < inicio:
-        raise ValueError(f"--data-final ({data_final}) e anterior a --data-inicial ({data_inicial})")
-    datas = []
-    d = inicio
-    while d <= fim:
-        datas.append(d.strftime("%d/%m/%Y"))
-        d += datetime.timedelta(days=1)
-    return datas
-
-
 def _buscar_numero_pedido_ja_preenchido(nfs):
     """
     Devolve o subconjunto de (numero_nf, marca), dentro das NFs desta
@@ -906,131 +593,6 @@ def _buscar_numero_pedido_ja_preenchido(nfs):
         for linha in linhas:
             preenchidos.add((linha["numero_nf"], linha["marca"]))
     return preenchidos
-
-
-def _brand_shopify(marca):
-    return MARCA_PARA_BRAND_SHOPIFY.get(marca, marca)
-
-
-def _sql_lista_texto(valores):
-    """Monta um IN (...) de literais texto pro Metabase, escapando aspas
-    simples - os valores aqui sao numero_pedido ja validados por
-    scraper.extrair_numero_pedido_torre (formato conhecido), mas escapa do
-    mesmo jeito por seguranca (nunca confia em string concatenada direto em
-    SQL sem escapar, mesmo quando a fonte parece controlada)."""
-    return ", ".join("'" + v.replace("'", "''") + "'" for v in valores)
-
-
-def _metabase_query(sql):
-    """
-    Roda uma query SQL crua no Metabase (banco "Data Mart", ver
-    METABASE_DATABASE_ID) via API, autenticada por API Key
-    (METABASE_API_KEY - Secret do GitHub). Devolve lista de dicts (uma por
-    linha) - a API crua do Metabase (/api/dataset) nao tem o teto de 500
-    linhas que a ferramenta MCP interativa usada pra explorar o schema tem.
-    """
-    body = json.dumps({
-        "database": METABASE_DATABASE_ID,
-        "type": "native",
-        "native": {"query": sql},
-    }).encode("utf-8")
-    req = urllib.request.Request(f"{METABASE_URL}/api/dataset", data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("x-api-key", METABASE_API_KEY)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        resultado = json.loads(resp.read())
-    colunas = [c["name"] for c in resultado["data"]["cols"]]
-    return [dict(zip(colunas, linha)) for linha in resultado["data"]["rows"]]
-
-
-def _buscar_itens_via_metabase(pendentes):
-    """
-    Busca "Itens do pedido" no Metabase (gold.shopify_order_items) em vez
-    de clicar pedido por pedido no Titan (16/09/2026, pedido direto da
-    Maria - ver ITENS VIA METABASE no topo do arquivo) - mesma fonte e
-    mesma logica de match ja validadas no backfill manual de itens feito
-    em 14-15/09/2026 pra rituaria/barbours/kokeshi/apice.
-
-    Recebe a lista de pendentes desta janela (formato de
-    _buscar_pendentes_itens - numero_nf/marca/numero_pedido) e devolve um
-    dict {(numero_nf, marca): itens} pros que deu pra casar no Shopify.
-
-    CHAVE DE MATCH: marcas em MARCAS_MATCH_POR_ORDER_NUMBER (apice,
-    denavita) casam por order_number (bigint, sem "#") == numero_pedido; as
-    outras marcas casam por order_name (texto, "SH<id><SUFIXO>") ==
-    numero_pedido - o proprio numero_pedido gravado no Supabase JA E esse
-    valor (ver scraper.extrair_numero_pedido_torre/registro_para_supabase),
-    sem transformacao nenhuma aqui.
-
-    FORMATO DO JSON: replica o MESMO schema que "Itens do pedido" tem
-    quando vem direto do Titan (Ean/Tipo/Codigo/Quantidade/Descricao/Valor
-    Total/Row Selection/Valor Unitario/Checkout Realizado) - "Row
-    Selection"/"Checkout Realizado" sao so replicados sem significado real
-    (artefato de UI do Titan, mesma convencao ja usada pro schema de
-    eventos), "Ean" repete o SKU do Shopify (o Metabase nao tem EAN de
-    verdade nesta tabela).
-    """
-    if not METABASE_API_KEY:
-        print("METABASE_API_KEY nao configurada - pulando busca de itens via Metabase nesta rodada.", file=sys.stderr)
-        return {}
-
-    por_marca = {}
-    for p in pendentes:
-        marca = (p.get("marca") or "").strip()
-        numero_pedido = (p.get("numero_pedido") or "").strip()
-        if not marca or not numero_pedido:
-            continue
-        por_marca.setdefault(marca, []).append((p["numero_nf"], numero_pedido))
-
-    resultado = {}
-    for marca, pares in por_marca.items():
-        brand = _brand_shopify(marca)
-        pedidos_unicos = sorted({numero_pedido for _, numero_pedido in pares})
-        linhas = []
-        for i in range(0, len(pedidos_unicos), TAMANHO_LOTE_METABASE):
-            fatia = pedidos_unicos[i:i + TAMANHO_LOTE_METABASE]
-            if marca in MARCAS_MATCH_POR_ORDER_NUMBER:
-                ids_validos = [v for v in fatia if v.isdigit()]
-                if not ids_validos:
-                    continue
-                condicao = f"order_number in ({', '.join(ids_validos)})"
-                campo_chave = "order_number"
-            else:
-                condicao = f"order_name in ({_sql_lista_texto(fatia)})"
-                campo_chave = "order_name"
-            sql = (
-                f"select {campo_chave} as pedido_chave, sku, title, quantity, price "
-                f"from gold.shopify_order_items "
-                f"where brand = '{brand}' and {condicao}"
-            )
-            try:
-                linhas.extend(_metabase_query(sql))
-            except Exception as e:
-                print(f"  ERRO consultando itens no Metabase pra marca {marca}: {e}", file=sys.stderr)
-
-        itens_por_pedido = {}
-        for linha in linhas:
-            chave = str(linha["pedido_chave"])
-            preco = float(linha.get("price") or 0)
-            quantidade = linha.get("quantity") or 0
-            sku = linha.get("sku") or ""
-            itens_por_pedido.setdefault(chave, []).append({
-                "Ean": sku,
-                "Tipo": "UN",
-                "Código": sku,
-                "Quantidade": str(quantidade),
-                "Descrição": linha.get("title") or "",
-                "Valor Total": f"{preco * float(quantidade):.2f}",
-                "Row Selection": "Select Row",
-                "Valor Unitário": f"{preco:.2f}",
-                "Checkout Realizado": "1",
-            })
-
-        for numero_nf, numero_pedido in pares:
-            itens = itens_por_pedido.get(numero_pedido)
-            if itens:
-                resultado[(numero_nf, marca)] = itens
-    return resultado
 
 
 def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
@@ -1165,28 +727,11 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
         if derivado and (payload["numero_nf"], payload["marca"]) not in ja_tem_numero_pedido:
             payload["numero_pedido"] = derivado
 
-    # Itens via Metabase (16/09/2026, ver ITENS VIA METABASE no topo do
-    # arquivo) - substitui o clique-por-pedido no Titan que rodava aqui
-    # antes (job completar-eventos separado, removido junto com esta
-    # mudanca). So busca pra quem AINDA esta com itens nulo no Supabase
-    # (_buscar_pendentes_itens so cobre pedidos que ja existem na tabela -
-    # ver docstring dela).
-    nfs_desta_janela = [p["numero_nf"] for p in payloads]
-    pendentes_itens = _buscar_pendentes_itens(nfs_desta_janela)
-    print(f"{len(pendentes_itens)} pedido(s) desta janela sem itens - buscando no Metabase...")
-    itens_encontrados = _buscar_itens_via_metabase(pendentes_itens)
-    print(f"  {len(itens_encontrados)} casado(s) no Metabase de {len(pendentes_itens)} pendente(s).")
-    if itens_encontrados:
-        # Reconfere bem antes de gravar (mesmo motivo do "ainda_vazio" usado
-        # no backfill manual de itens/eventos - ver upsert_itens.py/
-        # upsert_eventos.py) - evita sobrescrever um itens que
-        # titan_watcher.py (consulta avulsa da Torre) tenha preenchido com
-        # dado real do Titan nesse meio tempo.
-        ainda_sem_itens = {(p["numero_nf"], p["marca"]) for p in _buscar_pendentes_itens(nfs_desta_janela)}
-        for payload in payloads:
-            chave = (payload["numero_nf"], payload["marca"])
-            if chave in itens_encontrados and chave in ainda_sem_itens:
-                payload["itens"] = itens_encontrados[chave]
+    # Itens via Metabase REMOVIDO (28/09/2026, ver ITENS VIA METABASE no
+    # topo do arquivo) - a consulta em lote ao Metabase que rodava aqui
+    # (16/09/2026 a 28/09/2026) sofria timeout inconsistente no warehouse;
+    # itens fica sem nenhum mecanismo automatico de preenchimento por
+    # enquanto.
 
     lote = []
     gravados = 0
@@ -1241,49 +786,12 @@ def main():
                          help="pula a exportacao em massa - so roda rechecar_situacoes_presas")
     parser.add_argument("--recheck-orcamento-situacao-segundos", type=int, default=RECHECK_ORCAMENTO_SEGUNDOS,
                          help=f"orcamento pro recheck de situacao presa (padrao {RECHECK_ORCAMENTO_SEGUNDOS}s)")
-    # --completar-itens-atrasados (22/09/2026, pedido direto da Maria - ver
-    # completar_itens_atrasados): cobre backlog de itens preso fora da
-    # janela deslizante normal. Nao precisa de Titan/Playwright/login - so
-    # Supabase + Metabase - por isso sai ANTES do bloco sync_playwright().
-    parser.add_argument("--completar-itens-atrasados", action="store_true", default=False,
-                         help="pula o Titan inteiro - so tenta casar itens no Metabase pras datas em "
-                              "--data-inicial/--data-final (usa 'Data Importado', nao precisa de login)")
-    # --completar-itens-sem-data-importado (22/09/2026, achado real
-    # investigando lescent/aua/apice - ver completar_itens_sem_data_
-    # importado): backlog IRMAO do de cima, mesmo motivo (Playwright/login
-    # nao precisam rodar), so que filtrando por "Data Importado" NULO em
-    # vez de uma lista de datas.
-    parser.add_argument("--completar-itens-sem-data-importado", action="store_true", default=False,
-                         help="pula o Titan inteiro - so tenta casar itens no Metabase pras linhas "
-                              "com 'Data Importado' NULO (placeholders 'pendente_titan' que nunca "
-                              "foram visitados no Titan, nao precisa de login)")
-    # --completar-itens-todos (28/09/2026, pedido direto da Maria - ver
-    # completar_itens_todos): uso PONTUAL, sem filtro de data nenhum - so
-    # pra reprocessar depois de corrigir um bug em numero_pedido que
-    # afetava NFs espalhados por todo o historico (nao um dia/intervalo so).
-    parser.add_argument("--completar-itens-todos", action="store_true", default=False,
-                         help="pula o Titan inteiro - tenta casar itens no Metabase pra TODO pedido "
-                              "com itens nulo, sem filtro de data (uso pontual, nao roda via cron)")
     args = parser.parse_args()
-    if args.completar_itens_atrasados:
-        if not args.data_inicial or not args.data_final:
-            parser.error("--completar-itens-atrasados precisa de --data-inicial e --data-final")
-        datas = _gerar_lista_datas(args.data_inicial, args.data_final)
-        gravados, restantes = completar_itens_atrasados(datas)
-        print(f"\nConcluido - {gravados} pedido(s) com itens gravados, {restantes} continuam sem casar no Metabase.")
-        return
-    if args.completar_itens_sem_data_importado:
-        gravados, restantes = completar_itens_sem_data_importado()
-        print(f"\nConcluido - {gravados} pedido(s) com itens gravados, {restantes} continuam sem casar no Metabase.")
-        return
-    if args.completar_itens_todos:
-        gravados, restantes = completar_itens_todos()
-        print(f"\nConcluido - {gravados} pedido(s) com itens gravados, {restantes} continuam sem casar no Metabase.")
-        return
+    # --completar-itens-atrasados/--completar-itens-sem-data-importado/
+    # --completar-itens-todos REMOVIDOS (28/09/2026, ver ITENS VIA METABASE
+    # no topo do arquivo) junto com toda a integracao de itens via Metabase.
     if not args.so_recheck and (not args.data_inicial or not args.data_final):
-        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck, "
-                      "--completar-itens-atrasados, --completar-itens-sem-data-importado ou "
-                      "--completar-itens-todos)")
+        parser.error("--data-inicial e --data-final sao obrigatorios (a nao ser que use --so-recheck)")
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")

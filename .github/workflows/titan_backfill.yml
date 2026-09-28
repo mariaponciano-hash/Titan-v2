@@ -13,9 +13,20 @@ name: Titan backfill diario
 # rodar uma vez por dia, já que está pegando as informações direitinho"):
 # a rodada extra das 20h BRT foi removida. Antes disso rodava 2x/dia desde
 # 13/09/2026 - motivo original (dar 2 chances por pedido antes da janela de
-# 1 dia avancar) nao existe mais desde 16/09/2026 (itens vem do Metabase, nao
-# depende mais de quantas rodadas o pedido pegou - ver ITENS VIA METABASE em
-# titan_backfill.py).
+# 1 dia avancar) nao existia mais desde 16/09/2026 (itens vinha do Metabase,
+# nao dependia mais de quantas rodadas o pedido pegou).
+#
+# ITENS VIA METABASE REMOVIDO (28/09/2026, pedido direto da Maria - "está
+# dando errado a condição do metabase, não vou deixar configurado dentro do
+# github, pode remover essa parte para preencher itens"): a consulta em
+# lote ao Metabase (rodava dentro do job export, mais os 3 modos manuais
+# completar_itens_atrasados/sem_data_importado/todos abaixo) sofria timeout
+# inconsistente no warehouse - erro real visto numa rodada: "ERRO
+# consultando itens no Metabase pra marca barbours: The read operation
+# timed out". Ver ITENS VIA METABASE em titan_backfill.py pro detalhe
+# completo. METABASE_URL/METABASE_API_KEY saem deste workflow (continuam
+# em uso por titan_preencher_lacunas.yml - NAO remover esses secrets do
+# repo).
 #
 # ACHADO REAL (28/09/2026): o GitHub Actions vem atrasando as rodadas
 # agendadas por varias horas em relacao ao cron configurado (rodadas
@@ -27,48 +38,16 @@ name: Titan backfill diario
 on:
   schedule:
     - cron: '0 9 * * *'   # 06:00 BRT
-  workflow_dispatch:   # permite rodar manualmente pela aba Actions, pra testar
-    inputs:
-      completar_itens_atrasados:
-        description: 'Pular o Titan e so tentar casar itens no Metabase pro intervalo abaixo (backlog preso fora da janela normal)'
-        required: false
-        type: boolean
-        default: false
-      data_inicial_itens:
-        description: 'Data inicial DD/MM/AAAA (so usado com completar_itens_atrasados)'
-        required: false
-        type: string
-      data_final_itens:
-        description: 'Data final DD/MM/AAAA (so usado com completar_itens_atrasados)'
-        required: false
-        type: string
-      completar_itens_sem_data_importado:
-        description: 'Pular o Titan e so tentar casar itens no Metabase pras linhas com Data Importado NULO (placeholders pendente_titan)'
-        required: false
-        type: boolean
-        default: false
-      completar_itens_todos:
-        description: 'Pular o Titan e tentar casar itens no Metabase pra TODO pedido com itens nulo, sem filtro de data (uso pontual)'
-        required: false
-        type: boolean
-        default: false
+  workflow_dispatch: {}   # permite rodar manualmente pela aba Actions, pra testar
 
 jobs:
   export:
     runs-on: ubuntu-latest
     # Exportacao nativa de 'Informação Pedido' pra janela inteira + upsert
-    # no Supabase + busca de Itens no Metabase (16/09/2026, ver ITENS VIA
-    # METABASE em titan_backfill.py) - tudo num job so agora. O job
-    # completar-eventos (20 "workers" em sequencia, clique-por-pedido no
-    # Titan) foi REMOVIDO junto com essa mudanca: eventos saiu do escopo do
-    # backfill, e itens agora vem de uma consulta em lote ao Metabase
-    # dentro deste mesmo job, sem precisar de artifact nem de job separado.
-    # 60 (era 30) - achado real (22/09/2026, run #85): --completar-itens-
-    # sem-data-importado com ~65 mil pendentes bateu no timeout de 30min
-    # sem gravar nada (gargalo era o NUMERO de chamadas ao Metabase, ja
-    # corrigido com TAMANHO_LOTE_METABASE - mas mantem margem maior aqui
-    # tambem, ja que esse modo pode crescer mais que o backfill diario
-    # normal, que sempre processa so 1 dia).
+    # no Supabase - um job so. O job completar-eventos (20 "workers" em
+    # sequencia, clique-por-pedido no Titan) foi REMOVIDO em 16/09/2026;
+    # itens via Metabase (que rodava aqui entre 16/09 e 28/09/2026) tambem
+    # foi removido - ver ITENS VIA METABASE em titan_backfill.py.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -92,24 +71,11 @@ jobs:
         env:
           TITAN_EMAIL: ${{ secrets.TITAN_EMAIL }}
           TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
-          METABASE_URL: ${{ secrets.METABASE_URL }}
-          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
         run: |
-          if [ "${{ github.event.inputs.completar_itens_atrasados }}" = "true" ]; then
-            python titan_backfill.py \
-              --completar-itens-atrasados \
-              --data-inicial "${{ github.event.inputs.data_inicial_itens }}" \
-              --data-final "${{ github.event.inputs.data_final_itens }}"
-          elif [ "${{ github.event.inputs.completar_itens_sem_data_importado }}" = "true" ]; then
-            python titan_backfill.py --completar-itens-sem-data-importado
-          elif [ "${{ github.event.inputs.completar_itens_todos }}" = "true" ]; then
-            python titan_backfill.py --completar-itens-todos
-          else
-            python titan_backfill.py \
-              --data-inicial "${{ steps.janela.outputs.inicial }}" \
-              --data-final "${{ steps.janela.outputs.final }}" \
-              --headless
-          fi
+          python titan_backfill.py \
+            --data-inicial "${{ steps.janela.outputs.inicial }}" \
+            --data-final "${{ steps.janela.outputs.final }}" \
+            --headless
 
       # O runner some ao fim do job - sem isso, o print/HTML que
       # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel
