@@ -577,7 +577,10 @@ def _clicar_seta_calendario(frame, anterior, timeout_ms=5000, registrar=None):
     ver definir_periodo pra como e montado.
     """
     padrao = re.compile("^Previous", re.IGNORECASE) if anterior else re.compile("^Next", re.IGNORECASE)
-    elemento_visivel(frame.get_by_role("button", name=padrao), timeout_ms=timeout_ms).click()
+    # dispatch_event em vez de click() normal (29/09/2026, ver comentario
+    # grande no botao "Start date" em definir_periodo - mesma classe de
+    # bloqueio, um overlay/tooltip fisicamente por cima rouba o clique).
+    elemento_visivel(frame.get_by_role("button", name=padrao), timeout_ms=timeout_ms).dispatch_event("click")
     time.sleep(0.4)
     if registrar:
         registrar(f"seta_calendario_{'anterior' if anterior else 'seguinte'}")
@@ -609,7 +612,9 @@ def _clicar_celula_calendario(frame, texto_exato, timeout_ms=8000, registrar=Non
     """
     botoes = frame.locator(".calendar-table-container button:not([disabled])")
     alvo = botoes.filter(has_text=re.compile(rf"^\s*{re.escape(texto_exato)}\s*$", re.IGNORECASE))
-    elemento_visivel(alvo, timeout_ms=timeout_ms).click()
+    # dispatch_event em vez de click() normal (29/09/2026, mesmo motivo do
+    # botao "Start date" em definir_periodo).
+    elemento_visivel(alvo, timeout_ms=timeout_ms).dispatch_event("click")
     time.sleep(0.4)
     if registrar:
         registrar(nome_passo or f"celula_calendario_{texto_exato}")
@@ -630,7 +635,11 @@ def _selecionar_mes_ano_calendario(frame, mes, ano, registrar=None):
     nao pelo texto (que muda a cada mes).
     """
     botao_periodo = elemento_visivel(frame.locator("button.month-year"), timeout_ms=15000)
-    botao_periodo.click()
+    # dispatch_event em vez de click() normal (29/09/2026, achado real - run
+    # #105: um overlay CDK ficou por cima deste botao especifico e
+    # interceptou o clique - mesmo motivo do botao "Start date" em
+    # definir_periodo, ver comentario grande la).
+    botao_periodo.dispatch_event("click")
     time.sleep(0.4)
     if registrar:
         registrar("seletor_mes_aberto")
