@@ -41,12 +41,24 @@ name: Titan backfill diario
 # controle. "06:00 BRT" aqui e a hora PEDIDA ao GitHub, nao uma garantia de
 # hora exata de execucao.
 on:
+  # ACHADO REAL (29/09/2026): so a run #101 (28/09, 14:24 BRT) disparou
+  # sozinha como "Scheduled" desde que o cron virou 5x/dia - nenhuma rodada
+  # agendada disparou depois disso (nem no resto de 28/09 nem nos horarios
+  # de 29/09 ate a manha), so manual. O arquivo publicado em main confere
+  # certinho (sem erro de sintaxe) - o motor de agendamento do proprio
+  # GitHub e quem esta falhando. A documentacao oficial deles diz: "o evento
+  # de agendamento pode atrasar durante periodos de alta carga... em alguns
+  # casos a execucao pode simplesmente nao rodar" - e recomenda EXPLICITAMENTE
+  # nao agendar exatamente no minuto ':00' de cada hora, por ser o pico de
+  # contencao. Os 5 horarios abaixo saem do ':00' por isso (minuto 7) -
+  # mitigacao oficial, nao elimina o problema de vez (ver titan_eventos_
+  # status.yml/titan_romaneio_links.yml, que tambem podem sofrer do mesmo).
   schedule:
-    - cron: '0 9 * * *'    # 06:00 BRT
-    - cron: '0 12 * * *'   # 09:00 BRT
-    - cron: '0 15 * * *'   # 12:00 BRT
-    - cron: '0 18 * * *'   # 15:00 BRT
-    - cron: '0 21 * * *'   # 18:00 BRT
+    - cron: '7 9 * * *'    # ~06:07 BRT
+    - cron: '7 12 * * *'   # ~09:07 BRT
+    - cron: '7 15 * * *'   # ~12:07 BRT
+    - cron: '7 18 * * *'   # ~15:07 BRT
+    - cron: '7 21 * * *'   # ~18:07 BRT
   workflow_dispatch: {}   # permite rodar manualmente pela aba Actions, pra testar
 
 jobs:
