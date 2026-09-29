@@ -727,7 +727,19 @@ def definir_periodo(frame, data_inicial, data_final, pasta_registro=None):
             frame.locator('button.calendar-button[aria-label^="Start date"]'),
             timeout_ms=15000,
         )
-        botao_calendario.click()
+        # dispatch_event em vez de click() normal (29/09/2026, achado real -
+        # run #104: um tooltip do Power BI, "pbi-tooltip-content" de algum
+        # outro elemento, ficou parado sobre este botao e interceptou o
+        # clique por 30s ate desistir - "subtree intercepts pointer
+        # events"). MESMO bloqueio de raiz ja resolvido antes em
+        # exportar_dados_do_painel (ver comentario grande la, 17/09/2026):
+        # click() normal (mesmo com force=True) calcula coordenada de tela e
+        # deixa o NAVEGADOR decidir quem recebe o evento naquele pixel - se
+        # outro elemento estiver fisicamente por cima (tooltip, visual-
+        # container generico), o evento vai pra ele, nao pro nosso alvo.
+        # dispatch_event("click") dispara o evento DIRETO no elemento via
+        # JS, sem depender de coordenada nem de quem esta por cima.
+        botao_calendario.dispatch_event("click")
         time.sleep(0.5)
         registrar("calendario_aberto")
 
