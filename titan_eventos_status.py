@@ -22,7 +22,7 @@ scraper.extrair_eventos, que le a mesma informacao pedido-por-pedido no
 Titan em vez de via exportacao em lote).
 
 FILTRO DE DATA (pedido direto da Maria, 28/09/2026): so Data Inicial =
-ontem (mesmo "dia anterior" que titan_backfill.py usa) - Data Final fica
+HOJE em Brasilia (antes das 06h BRT, ontem) - ver _data_inicial_do_filtro - Data Final fica
 com o valor padrao que a propria tela do Titan ja mostra (hoje), sem
 digitar nada nesse campo ("Não precisa selecionar a data final") - ver
 _definir_apenas_data_inicial abaixo, variante de
@@ -75,6 +75,29 @@ import titan_watcher  # reusa _supabase_request/SUPABASE_URL/SUPABASE_KEY
 
 TABELA = "eventos_titan"
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"
+
+
+def _data_inicial_do_filtro():
+    """
+    Data Inicial do filtro = HOJE (horario de Brasilia), nao mais "ontem"
+    (14/10/2026, achado real - eventos de infos_titan defasados em ~12% dos
+    pedidos recentes). O Titan gera ~57-79 mil eventos por dia (hoje fecha
+    perto de 100 mil); "ontem ate hoje" passa de ~130 mil linhas no comeco da
+    tarde e bate no teto de 150 mil do Power BI ao longo da tarde - e a
+    exportacao sai em ordem de horario, entao o corte derruba exatamente os
+    eventos MAIS RECENTES (os que mudam a situacao). Com so hoje fica abaixo
+    do teto o dia inteiro. Como a rodada roda de 30 em 30 min, o que
+    aconteceu ontem ja foi capturado ontem; so a madrugada precisa olhar
+    pra tras - antes das 06h BRT usa ontem pra nao perder os ultimos eventos
+    da noite (nesse horario hoje ainda tem pouca coisa, entao nao estoura).
+    O runner do GitHub esta em UTC, por isso o fuso e fixado aqui (Brasil nao
+    tem horario de verao desde 2019).
+    """
+    agora_brt = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
+    dia = agora_brt.date()
+    if agora_brt.hour < 6:
+        dia -= datetime.timedelta(days=1)
+    return dia
 
 
 def _agora_iso():
@@ -142,6 +165,12 @@ def _exportar_eventos(page, data_inicial):
         caminho.unlink()
     except OSError:
         pass
+    if scraper.ultimo_aviso_exportacao:
+        # O corte do Power BI derruba os eventos mais recentes (ver
+        # _data_inicial_do_filtro). Grava o que veio - a mescla nunca apaga
+        # nada - mas avisa alto, porque situacao/eventos ficam defasados.
+        print(f"AVISO: exportacao TRUNCADA pelo Power BI ({scraper.ultimo_aviso_exportacao!r}, "
+              f"{len(registros)} linha(s)) - os eventos mais recentes ficaram de fora.", file=sys.stderr)
     return lacunas._checar_truncamento(registros)
 
 
@@ -251,7 +280,7 @@ def main():
         print("Defina TITAN_EMAIL e TITAN_SENHA como variaveis de ambiente antes de rodar.", file=sys.stderr)
         sys.exit(1)
 
-    ontem = datetime.date.today() - datetime.timedelta(days=1)
+    ontem = _data_inicial_do_filtro()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
