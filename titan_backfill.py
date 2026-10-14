@@ -522,10 +522,13 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
             )
             print(f"  baixado em {caminho_export}")
             filtro_aplicado, registros = scraper.ler_export_xlsx(caminho_export)
+            # Guarda o xlsx de cada dia (sobe como artifact no workflow) pra
+            # conferir a exportacao depois - 14/10/2026, pedido direto da
+            # Maria. Renomeia por dia pra um nao sobrescrever o outro.
             try:
-                caminho_export.unlink()
+                caminho_export.rename(PASTA_EXPORTS / f"backfill_{data_inicial.replace('/', '-')}.xlsx")
             except OSError:
-                pass  # nao critico - so um arquivo de trabalho
+                pass  # nao critico - so conferencia manual
             if scraper.ultimo_aviso_exportacao:
                 # Janela larga demais pro teto de 150 mil linhas do Power BI
                 # (ver DIAS_ATRAS no titan_backfill.yml): os dados vieram

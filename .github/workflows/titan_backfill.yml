@@ -119,6 +119,16 @@ jobs:
             --data-final "${{ steps.janela.outputs.final }}" \
             --headless
 
+      # Exportacoes xlsx do dia (uma por data) pra conferencia manual.
+      - name: Subir exportacoes do backfill
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backfill_exportacoes
+          path: titan_exports/
+          retention-days: 2
+          if-no-files-found: ignore
+
       # O runner some ao fim do job - sem isso, o print/HTML que
       # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel
       # (diferente de rodar no PC, onde a pasta fica ali pra abrir direto).
