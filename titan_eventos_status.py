@@ -21,24 +21,20 @@ lista de dicts {"Situação": ..., "Horário da Situação": ...} (ver
 scraper.extrair_eventos, que le a mesma informacao pedido-por-pedido no
 Titan em vez de via exportacao em lote).
 
-FILTRO DE DATA (pedido direto da Maria, 28/09/2026): so Data Inicial =
-HOJE em Brasilia (antes das 06h BRT, ontem) - ver _data_inicial_do_filtro - Data Final fica
-com o valor padrao que a propria tela do Titan ja mostra (hoje), sem
-digitar nada nesse campo ("Não precisa selecionar a data final") - ver
-_definir_apenas_data_inicial abaixo, variante de
-titan_preencher_lacunas._definir_periodo_evento que pula a digitacao da
-Data Final.
+FILTRO DE DATA (corrigido 14/10/2026): o filtro "Data Inicial - Data Final"
+desta aba e a data de IMPORTACAO do pedido, nao a data do evento - cada
+exportacao traz o historico completo de eventos dos pedidos importados na
+janela (ver _exportar_eventos_dia). Por isso a rodada exporta UM DIA de Data
+Importado por vez (hoje e ate --dias dias antes; padrao 1 = hoje e ontem) e
+grava cada dia logo apos exportar. O workflow roda --dias 1 a cada 30 min e
+--dias 7 de 3 em 3 horas (pedidos embarcam ate uma semana depois de
+importados, e so entao ganham o evento EMBARCADO).
 
-MESCLA EM VEZ DE SUBSTITUIR (pedido direto da Maria, 28/09/2026): como o
-filtro e sempre "a partir de ontem", cada exportacao so traz eventos cuja
-PROPRIA data cai nessa janela - um evento "IMPORTADO" de 5 dias atras nao
-aparece mais numa exportacao filtrada so a partir de ontem. Se cada rodada
-SUBSTITUISSE a coluna evento inteira, eventos antigos que ja tinham sido
-capturados em rodadas passadas seriam apagados assim que saissem da janela.
-Por isso _buscar_eventos_existentes busca o evento[] ja salvo pra cada
-pedido deste lote ANTES de gravar, e _mesclar_eventos combina com o que
-vier da exportacao nova (sem duplicar por (Situação, Horário da Situação)),
-preservando o historico completo pra sempre.
+MESCLA EM VEZ DE SUBSTITUIR (pedido direto da Maria, 28/09/2026): a coluna
+evento nunca e substituida - _buscar_eventos_existentes busca o evento[] ja
+salvo pra cada pedido deste lote ANTES de gravar, e _mesclar_eventos combina
+com o que vier da exportacao nova (sem duplicar por (Situação, Horário da
+Situação)), preservando o historico completo pra sempre.
 
 RODA A CADA 30 MINUTOS (GitHub Actions, titan_eventos_status.yml) - mesma
 cadencia do titan_watcher.py.
@@ -77,27 +73,10 @@ TABELA = "eventos_titan"
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"
 
 
-def _data_inicial_do_filtro():
-    """
-    Data Inicial do filtro = HOJE (horario de Brasilia), nao mais "ontem"
-    (14/10/2026, achado real - eventos de infos_titan defasados em ~12% dos
-    pedidos recentes). O Titan gera ~57-79 mil eventos por dia (hoje fecha
-    perto de 100 mil); "ontem ate hoje" passa de ~130 mil linhas no comeco da
-    tarde e bate no teto de 150 mil do Power BI ao longo da tarde - e a
-    exportacao sai em ordem de horario, entao o corte derruba exatamente os
-    eventos MAIS RECENTES (os que mudam a situacao). Com so hoje fica abaixo
-    do teto o dia inteiro. Como a rodada roda de 30 em 30 min, o que
-    aconteceu ontem ja foi capturado ontem; so a madrugada precisa olhar
-    pra tras - antes das 06h BRT usa ontem pra nao perder os ultimos eventos
-    da noite (nesse horario hoje ainda tem pouca coisa, entao nao estoura).
-    O runner do GitHub esta em UTC, por isso o fuso e fixado aqui (Brasil nao
-    tem horario de verao desde 2019).
-    """
-    agora_brt = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
-    dia = agora_brt.date()
-    if agora_brt.hour < 6:
-        dia -= datetime.timedelta(days=1)
-    return dia
+def _hoje_brt():
+    """Dia de hoje em Brasilia (o runner do GitHub esta em UTC; Brasil nao
+    tem horario de verao desde 2019, entao o offset -3h e fixo)."""
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3))).date()
 
 
 def _agora_iso():
@@ -147,42 +126,48 @@ def _definir_apenas_data_inicial(frame, data_inicial):
         raise
 
 
-def _exportar_eventos(page, data_inicial):
+def _abrir_aba_status(page):
     frame = scraper.get_dashboard_frame(page)
     try:
         lacunas._navegar_status_por_pedido(frame)
     except Exception:
         scraper.salvar_diagnostico(page, "titan_eventos_status_aba_status_por_pedido")
         raise
-    data_str = data_inicial.strftime("%d/%m/%Y")
-    _definir_apenas_data_inicial(frame, data_str)
+    return frame
+
+
+def _exportar_eventos_dia(frame, dia):
+    """
+    Exporta 'Informação Pedido' da aba Status por Pedido pra UM dia de
+    Data Importado (Data Inicial = Data Final = dia).
+
+    ACHADO REAL (14/10/2026): o filtro de data desta aba e a data de
+    IMPORTACAO DO PEDIDO, nao a data do evento - a exportacao traz o
+    historico completo de eventos dos pedidos importados na janela. Prova:
+    163 de 163 NFs amostradas de uma exportacao "a partir de hoje" eram
+    pedidos importados hoje, e so ~1.100 dos ~15.600 pedidos embarcados hoje
+    tinham o evento EMBARCADO nela. Por isso "so a partir de hoje" (versao
+    de 14/10) e "a partir de ontem" (versao anterior) nunca atualizavam o
+    evento de um pedido importado antes - ficava preso no ultimo evento
+    que ele tinha na epoca. Um dia por exportacao tambem mantem cada
+    arquivo bem abaixo do teto de 150 mil linhas do Power BI.
+    """
+    data_str = dia.strftime("%d/%m/%Y")
+    lacunas._definir_periodo_evento(frame, data_str, data_str)
     caminho = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
     # scraper.ler_export_xlsx devolve (filtro_aplicado, registros) neste
     # repo - filtro_aplicado nao e usado aqui de proposito, mesmo criterio
     # ja aplicado em titan_preencher_lacunas.etapa2_exportar_eventos_fatia.
     _filtro_aplicado, registros = scraper.ler_export_xlsx(caminho)
     # O xlsx fica em titan_exports/ (sobe como artifact no workflow) pra
-    # poder conferir a ultima exportacao - 14/10/2026, pedido direto da
-    # Maria. Mantem so a mais recente: apaga as anteriores.
-    for antigo in PASTA_EXPORTS.glob("*.xlsx"):
-        if antigo != caminho:
-            try:
-                antigo.unlink()
-            except OSError:
-                pass
-    # Distribuicao por dia dos eventos exportados - pra ver no log se o
-    # filtro de Data Inicial esta valendo (esperado: so hoje).
-    contagem_dias = {}
-    for r in registros:
-        d = str(r.get("Data_Evento") or r.get("Data Evento") or "")[:10]
-        contagem_dias[d] = contagem_dias.get(d, 0) + 1
-    print(f"Exportacao: {len(registros)} linha(s); filtro Data Inicial={data_str}; "
-          f"linhas por dia do evento: {dict(sorted(contagem_dias.items()))}")
+    # conferir a exportacao - 14/10/2026, pedido direto da Maria. Um arquivo
+    # por dia de importacao.
+    try:
+        caminho.rename(PASTA_EXPORTS / f"eventos_{dia.strftime('%d-%m-%Y')}.xlsx")
+    except OSError:
+        pass
     if scraper.ultimo_aviso_exportacao:
-        # O corte do Power BI derruba os eventos mais recentes (ver
-        # _data_inicial_do_filtro). Grava o que veio - a mescla nunca apaga
-        # nada - mas avisa alto, porque situacao/eventos ficam defasados.
-        print(f"AVISO: exportacao TRUNCADA pelo Power BI ({scraper.ultimo_aviso_exportacao!r}, "
+        print(f"AVISO: exportacao de {data_str} TRUNCADA pelo Power BI ({scraper.ultimo_aviso_exportacao!r}, "
               f"{len(registros)} linha(s)) - os eventos mais recentes ficaram de fora.", file=sys.stderr)
     return lacunas._checar_truncamento(registros)
 
@@ -282,10 +267,22 @@ def _upsert_lote(registros):
     return gravados
 
 
+def _gravar_registros(registros):
+    por_pedido = _agrupar_por_pedido(registros)
+    print(f"  {len(registros)} linha(s) de evento, {len(por_pedido)} pedido(s) distinto(s).")
+    if not por_pedido:
+        return 0
+    existentes = _buscar_eventos_existentes(list(por_pedido.keys()))
+    payloads = _montar_payloads(por_pedido, existentes)
+    return _upsert_lote(payloads)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--headless", action="store_true", default=False, help="roda sem abrir janela - so use depois de validar visualmente sem esta flag")
+    parser.add_argument("--dias", type=int, default=1, help="quantos dias de Data Importado antes de hoje tambem atualizar (padrao 1 = hoje e ontem; maximo 8)")
     args = parser.parse_args()
+    dias = max(0, min(args.dias, 8))
 
     email = os.environ.get("TITAN_EMAIL")
     senha = os.environ.get("TITAN_SENHA")
@@ -293,7 +290,10 @@ def main():
         print("Defina TITAN_EMAIL e TITAN_SENHA como variaveis de ambiente antes de rodar.", file=sys.stderr)
         sys.exit(1)
 
-    ontem = _data_inicial_do_filtro()
+    hoje = _hoje_brt()
+    lista_dias = [hoje - datetime.timedelta(days=i) for i in range(dias + 1)]  # hoje primeiro
+    total_gravados = 0
+    falhas = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
@@ -301,22 +301,25 @@ def main():
         try:
             print("Entrando no Titan BI...")
             scraper.login(page, email, senha)
-            print(f"Exportando 'Status por Pedido' a partir de {ontem.strftime('%d/%m/%Y')}...")
-            registros = _exportar_eventos(page, ontem)
+            frame = _abrir_aba_status(page)
+            for dia in lista_dias:
+                print(f"Exportando 'Status por Pedido' - Data Importado {dia.strftime('%d/%m/%Y')}...")
+                try:
+                    registros = _exportar_eventos_dia(frame, dia)
+                except Exception as e:
+                    falhas += 1
+                    print(f"  ERRO exportando {dia.strftime('%d/%m/%Y')}, pulando este dia - {e}", file=sys.stderr)
+                    continue
+                # grava cada dia assim que exporta - se um dia seguinte falhar,
+                # o que ja veio nao se perde
+                total_gravados += _gravar_registros(registros)
         finally:
             browser.close()
 
-    print(f"{len(registros)} linha(s) de evento exportada(s).")
-    por_pedido = _agrupar_por_pedido(registros)
-    print(f"{len(por_pedido)} pedido(s) distinto(s) nesta exportacao.")
-    if not por_pedido:
-        print("Concluido - nada pra gravar.")
-        return
-
-    existentes = _buscar_eventos_existentes(list(por_pedido.keys()))
-    payloads = _montar_payloads(por_pedido, existentes)
-    gravados = _upsert_lote(payloads)
-    print(f"Concluido - {gravados} pedido(s) gravado(s)/atualizado(s) em {TABELA}.")
+    print(f"Concluido - {total_gravados} pedido(s) gravado(s)/atualizado(s) em {TABELA} "
+          f"({len(lista_dias) - falhas}/{len(lista_dias)} dia(s) exportado(s)).")
+    if falhas == len(lista_dias):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
