@@ -1100,6 +1100,9 @@ def exportar_dados_do_painel(frame, titulo_painel, pasta_destino, pasta_registro
     return destino
 
 
+ultimo_aviso_exportacao = None  # texto do aviso de truncamento do ultimo ler_export_xlsx (ou None)
+
+
 def ler_export_xlsx(caminho):
     """
     Le um .xlsx baixado via exportar_dados_do_painel e devolve
@@ -1149,6 +1152,9 @@ def ler_export_xlsx(caminho):
     import datetime as _datetime
     from openpyxl import load_workbook
 
+    global ultimo_aviso_exportacao
+    ultimo_aviso_exportacao = None
+
     wb = load_workbook(str(caminho), data_only=True)
     try:
         linhas = wb.worksheets[0].iter_rows(values_only=True)
@@ -1160,6 +1166,16 @@ def ler_export_xlsx(caminho):
                 continue  # linha em branco entre o preambulo e o cabecalho
             if primeira_celula.startswith("Filtros aplicados"):
                 filtro_aplicado = primeira_celula
+                continue
+            # Aviso de truncamento do Power BI no preambulo (14/10/2026, achado
+            # real lendo exports manuais de historico): "Exported data limited
+            # to 150000 rows. Some data may have been omitted." vem ANTES do
+            # cabecalho de verdade - sem pular essa linha ela virava o
+            # "cabecalho" e todo registro saia com chaves lixo (nenhum pedido
+            # reconhecido). Guarda o texto em ultimo_aviso_exportacao pra quem
+            # chama poder avisar que o periodo veio incompleto.
+            if primeira_celula.startswith("Exported data"):
+                ultimo_aviso_exportacao = primeira_celula
                 continue
             cabecalho = linha
             break

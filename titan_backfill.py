@@ -430,6 +430,10 @@ def registro_para_supabase(r):
 
 LINHA_TRUNCAMENTO = "Exported data exceeded the allowed volume"
 
+# Prefixos de "Numero do Pedido" que nunca entram em infos_titan (ver comentario
+# no loop de exportar_e_gravar_periodo).
+PREFIXOS_PEDIDO_EXCLUIDOS = ("IN", "GC")
+
 
 def _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_final):
     """
@@ -522,6 +526,14 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
                 caminho_export.unlink()
             except OSError:
                 pass  # nao critico - so um arquivo de trabalho
+            if scraper.ultimo_aviso_exportacao:
+                # Janela larga demais pro teto de 150 mil linhas do Power BI
+                # (ver DIAS_ATRAS no titan_backfill.yml): os dados vieram
+                # incompletos. Grava o que veio (melhor que nada - o upsert e
+                # idempotente), mas avisa alto pra diminuir a janela.
+                print(f"\n  AVISO: exportacao TRUNCADA pelo Power BI ({scraper.ultimo_aviso_exportacao!r}, "
+                      f"{len(registros)} linha(s)) - parte do periodo {data_inicial} a {data_final} ficou de fora. "
+                      f"Reduza a janela (dias_atras) no workflow.", file=sys.stderr)
 
             filtro_ok = _validar_filtro_aplicado(filtro_aplicado, registros, data_inicial, data_final)
             if filtro_ok:
@@ -586,7 +598,18 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     payloads = []
     ignorados_lote = []
     ignorados = 0
+    prefixos_excluidos = 0
     for r in registros:
+        # Pedidos cujo "Numero do Pedido" comeca com IN ou GC NAO entram em
+        # infos_titan (14/10/2026, pedido direto da Maria - "todas as linhas
+        # cujo numero_pedido comeca com IN devem ser removidas" / "tudo que
+        # comeca com GC tambem"). A exclusao pontual no banco nao bastava: o
+        # backfill os reinseria a cada rodada (343 IN + 932 GC voltaram em
+        # menos de 1 dia). Pula aqui de proposito, sem gravar em TABELA_FALHAS
+        # (nao e falha, e filtro).
+        if str(r.get("Número do Pedido") or "").strip().upper().startswith(PREFIXOS_PEDIDO_EXCLUIDOS):
+            prefixos_excluidos += 1
+            continue
         payload = registro_para_supabase(r)
         if payload is None:
             # Antes so incrementava esse contador e a linha sumia - agora
@@ -602,6 +625,8 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
         payloads.append(payload)
     if ignorados_lote:
         _registrar_falhas("sem_nf_ou_marca", ignorados_lote)
+    if prefixos_excluidos:
+        print(f"{prefixos_excluidos} pedido(s) com Numero do Pedido IN/GC pulado(s) (filtro, nao gravados).")
 
     # numero_pedido fill-only-if-empty (16/09/2026, pedido direto da Maria -
     # ver ITENS VIA METABASE/registro_para_supabase): promove o valor

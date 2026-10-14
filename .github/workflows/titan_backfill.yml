@@ -59,7 +59,12 @@ on:
     - cron: '7 15 * * *'   # ~12:07 BRT
     - cron: '7 18 * * *'   # ~15:07 BRT
     - cron: '7 21 * * *'   # ~18:07 BRT
-  workflow_dispatch: {}   # permite rodar manualmente pela aba Actions, pra testar
+  workflow_dispatch:   # permite rodar manualmente pela aba Actions, pra testar
+    inputs:
+      dias_atras:
+        description: 'Quantos dias pra tras da Data Importado (vazio = 7, maximo 8 - acima disso estoura o teto de 150 mil linhas do Power BI)'
+        required: false
+        type: string
 
 jobs:
   export:
@@ -82,10 +87,26 @@ jobs:
           pip install playwright openpyxl
           playwright install --with-deps chromium
 
-      - name: Calcular janela de 1 dia
+      # JANELA DE 7 DIAS (14/10/2026, pedido direto da Maria): com "ontem ate
+      # hoje" um pedido so era atualizado nas rodadas do dia da importacao e
+      # do dia seguinte - quem embarcava depois disso ficava parado pra
+      # sempre (ex: NF 1211802, importada em 21/09 e embarcada em 22/09
+      # 16:54, ficou AGUARDANDO_EMBARQUE; ~273 mil pedidos nao finais com
+      # mais de 3 dias nessa situacao). Teto: o Power BI trunca a exportacao
+      # em 150 mil linhas - com ~12-15 mil pedidos/dia, 7 dias (8 datas) sao
+      # ~90 mil linhas (60% do teto), 8 dias ~121 mil, 9 ja chega a ~134 mil.
+      # Por isso o maximo aceito aqui e 8.
+      - name: Calcular janela
         id: janela
+        env:
+          DIAS_INPUT: ${{ github.event.inputs.dias_atras }}
         run: |
-          echo "inicial=$(date -d '-1 days' +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
+          DIAS="${DIAS_INPUT:-7}"
+          case "$DIAS" in ''|*[!0-9]*) echo "dias_atras invalido ($DIAS) - usando 7"; DIAS=7 ;; esac
+          if [ "$DIAS" -gt 8 ]; then echo "dias_atras=$DIAS acima do maximo seguro (8) - usando 8"; DIAS=8; fi
+          if [ "$DIAS" -lt 1 ]; then DIAS=1; fi
+          echo "Janela: $DIAS dia(s) pra tras"
+          echo "inicial=$(date -d "-$DIAS days" +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
           echo "final=$(date +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
 
       - name: Rodar backfill
