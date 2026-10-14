@@ -22,13 +22,12 @@ scraper.extrair_eventos, que le a mesma informacao pedido-por-pedido no
 Titan em vez de via exportacao em lote).
 
 FILTRO DE DATA (corrigido 14/10/2026): o filtro "Data Inicial - Data Final"
-desta aba e a data de IMPORTACAO do pedido, nao a data do evento - cada
-exportacao traz o historico completo de eventos dos pedidos importados na
-janela (ver _exportar_eventos_dia). Por isso a rodada exporta UM DIA de Data
-Importado por vez (hoje e ate --dias dias antes; padrao 1 = hoje e ontem) e
-grava cada dia logo apos exportar. O workflow roda --dias 1 a cada 30 min e
---dias 7 de 6 em 6 horas (pedidos embarcam ate uma semana depois de
-importados, e so entao ganham o evento EMBARCADO).
+desta aba e a data de IMPORTACAO do pedido, nao a data do evento, e a Data
+Final e sempre hoje - cada exportacao traz o historico completo de eventos
+dos pedidos importados de Data Inicial ate hoje (ver
+_exportar_janela_por_depositante). A rodada usa Data Inicial = hoje - 2 dias
+(--dias 2, padrao) e fatia por Depositante pra ficar abaixo do teto de 150 mil
+linhas do Power BI. O workflow roda de hora em hora.
 
 MESCLA EM VEZ DE SUBSTITUIR (pedido direto da Maria, 28/09/2026): a coluna
 evento nunca e substituida - _buscar_eventos_existentes busca o evento[] ja
@@ -36,8 +35,7 @@ salvo pra cada pedido deste lote ANTES de gravar, e _mesclar_eventos combina
 com o que vier da exportacao nova (sem duplicar por (Situação, Horário da
 Situação)), preservando o historico completo pra sempre.
 
-RODA A CADA 30 MINUTOS (GitHub Actions, titan_eventos_status.yml) - mesma
-cadencia do titan_watcher.py.
+RODA DE HORA EM HORA (GitHub Actions, titan_eventos_status.yml).
 
 ⚠️ NAVEGACAO ATE A ABA "Exportação - Status por Pedido" HERDA O MESMO AVISO
 de titan_preencher_lacunas.py: nunca validada ao vivo por mim (sem acesso
@@ -157,48 +155,57 @@ def _exportar_uma(frame, dia, rotulo_arquivo, depositante=None):
     return lacunas._checar_truncamento(registros), truncou
 
 
-def _exportar_eventos_dia(page, dia):
+def _exportar_janela_por_depositante(page, data_inicial, hoje):
     """
-    Exporta 'Informação Pedido' da aba Status por Pedido pra UM dia de
-    Data Importado (Data Inicial = Data Final = dia).
+    Exporta 'Informação Pedido' da aba Status por Pedido, uma vez por
+    Depositante, com Data Inicial = data_inicial (a Data Final e sempre hoje).
 
-    ACHADO REAL (14/10/2026): o filtro de data desta aba e a data de
-    IMPORTACAO DO PEDIDO, nao a data do evento - a exportacao traz o
-    historico completo de eventos dos pedidos importados na janela. Prova:
-    163 de 163 NFs amostradas de uma exportacao "a partir de hoje" eram
-    pedidos importados hoje, e so ~1.100 dos ~15.600 pedidos embarcados hoje
-    tinham o evento EMBARCADO nela. Por isso "so a partir de hoje" (versao
-    de 14/10) e "a partir de ontem" (versao anterior) nunca atualizavam o
-    evento de um pedido importado antes - ficava preso no ultimo evento
-    que ele tinha na epoca.
+    ACHADOS REAIS (14/10/2026, planilhas da run #78):
+    - O filtro de data desta aba e a data de IMPORTACAO do pedido, nao a do
+      evento: a exportacao traz o historico completo de eventos dos pedidos
+      importados de data_inicial ate hoje. Por isso "a partir de hoje" nunca
+      atualizava o evento de um pedido importado antes (ficava preso no
+      ultimo evento que ele tinha na epoca).
+    - A "Data Final" nao e configuravel (sempre hoje), entao nao da pra
+      exportar um dia isolado: cada exportacao e "de D ate hoje".
+    - O teto de 150 mil linhas do Power BI corta a exportacao; as linhas
+      saem em ordem de NF crescente, entao o corte derruba as NFs mais NOVAS.
+      3 dias de todos os depositantes juntos passam do teto (o arquivo de
+      D = hoje-2 veio com exatamente 150.000 linhas). Por isso fatia por
+      Depositante (DEPOSITANTES_PARA_FATIAR, mesmo criterio de
+      titan_preencher_lacunas.etapa2_exportar_eventos_fatia) - cada fatia
+      reabre o dashboard do zero (get_dashboard_frame faz page.goto) pra
+      nenhum filtro vazar pra proxima.
 
-    TRUNCAMENTO: um dia de importacao com todo o historico de eventos pode
-    passar do teto de 150 mil linhas do Power BI (achado real, 14/10/2026,
-    run #78: varios dias truncaram) - e o corte derruba justamente os
-    eventos mais recentes (EMBARCADO). Quando truncar, descarta essa
-    exportacao e refaz fatiando por Depositante (DEPOSITANTES_PARA_FATIAR,
-    mesmo criterio de titan_preencher_lacunas.etapa2_exportar_eventos_fatia).
-    Cada exportacao reabre o dashboard do zero (get_dashboard_frame faz
-    page.goto) pra nenhum filtro de Depositante vazar pra proxima.
+    Devolve [(depositante, registros)] das fatias que deram certo.
     """
-    nome = dia.strftime("%d-%m-%Y")
-    frame = _abrir_aba_status(page)
-    registros, truncou = _exportar_uma(frame, dia, nome)
-    if not truncou:
-        return registros
-
-    print(f"  AVISO: {dia.strftime('%d/%m/%Y')} truncou ({len(registros)} linha(s)) - refazendo por Depositante.", file=sys.stderr)
-    todos = []
+    nome = data_inicial.strftime("%d-%m-%Y")
+    fatias = []
     for dep in lacunas.DEPOSITANTES_PARA_FATIAR:
         try:
             frame = _abrir_aba_status(page)
-            regs, trunc_dep = _exportar_uma(frame, dia, f"{nome}_{dep.replace(' ', '_')}", depositante=dep)
+            lacunas._definir_periodo_evento(frame, data_inicial.strftime("%d/%m/%Y"), hoje.strftime("%d/%m/%Y"))
+            lacunas._filtrar_depositante(frame, dep)
+            caminho = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
+            # scraper.ler_export_xlsx devolve (filtro_aplicado, registros) neste
+            # repo - filtro_aplicado nao e usado aqui de proposito.
+            _filtro_aplicado, registros = scraper.ler_export_xlsx(caminho)
+            truncou = scraper.ultimo_aviso_exportacao is not None
+            # O xlsx fica em titan_exports/ (sobe como artifact no workflow)
+            # pra conferir a exportacao - pedido direto da Maria, 14/10/2026.
+            try:
+                caminho.rename(PASTA_EXPORTS / f"eventos_{nome}_{dep.replace(' ', '_')}.xlsx")
+            except OSError:
+                pass
+            registros = lacunas._checar_truncamento(registros)
         except Exception as e:
-            print(f"  ERRO fatia {dep} de {dia.strftime('%d/%m/%Y')}, pulando - {e}", file=sys.stderr)
+            print(f"ERRO na fatia {dep}, pulando - {e}", file=sys.stderr)
             continue
-        print(f"  fatia {dep}: {len(regs)} linha(s){' - TRUNCOU AINDA' if trunc_dep else ''}.")
-        todos.extend(regs)
-    return todos
+        print(f"  {dep}: {len(registros)} linha(s){' - TRUNCOU (as NFs mais novas desta fatia ficaram de fora)' if truncou else ''}.")
+        if truncou:
+            print(f"AVISO: fatia {dep} truncada pelo Power BI - reduza --dias.", file=sys.stderr)
+        fatias.append((dep, registros))
+    return fatias
 
 
 def _agrupar_por_pedido(registros):
@@ -333,7 +340,7 @@ def _gravar_registros(registros):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--headless", action="store_true", default=False, help="roda sem abrir janela - so use depois de validar visualmente sem esta flag")
-    parser.add_argument("--dias", type=int, default=1, help="quantos dias de Data Importado antes de hoje tambem atualizar (padrao 1 = hoje e ontem; maximo 8)")
+    parser.add_argument("--dias", type=int, default=2, help="Data Inicial = hoje - N dias (padrao 2 = hoje e os 2 dias anteriores; maximo 8). Mais dias = fatias que podem passar de 150 mil linhas")
     args = parser.parse_args()
     dias = max(0, min(args.dias, 8))
 
@@ -344,9 +351,8 @@ def main():
         sys.exit(1)
 
     hoje = _hoje_brt()
-    lista_dias = [hoje - datetime.timedelta(days=i) for i in range(dias + 1)]  # hoje primeiro
-    total_gravados = 0
-    falhas = 0
+    data_inicial = hoje - datetime.timedelta(days=dias)
+    print(f"Janela de Data Importado: {data_inicial.strftime('%d/%m/%Y')} ate {hoje.strftime('%d/%m/%Y')} ({dias} dia(s) antes de hoje), fatiada por Depositante.")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
@@ -354,23 +360,19 @@ def main():
         try:
             print("Entrando no Titan BI...")
             scraper.login(page, email, senha)
-            for dia in lista_dias:
-                print(f"Exportando 'Status por Pedido' - Data Importado {dia.strftime('%d/%m/%Y')}...")
-                try:
-                    registros = _exportar_eventos_dia(page, dia)
-                except Exception as e:
-                    falhas += 1
-                    print(f"  ERRO exportando {dia.strftime('%d/%m/%Y')}, pulando este dia - {e}", file=sys.stderr)
-                    continue
-                # grava cada dia assim que exporta - se um dia seguinte falhar,
-                # o que ja veio nao se perde
-                total_gravados += _gravar_registros(registros)
+            fatias = _exportar_janela_por_depositante(page, data_inicial, hoje)
         finally:
             browser.close()
 
+    total_gravados = 0
+    for dep, registros in fatias:
+        # grava cada fatia separadamente (a mescla com o que ja existe e por pedido)
+        print(f"Gravando {dep}...")
+        total_gravados += _gravar_registros(registros)
+
     print(f"Concluido - {total_gravados} pedido(s) gravado(s)/atualizado(s) em {TABELA} "
-          f"({len(lista_dias) - falhas}/{len(lista_dias)} dia(s) exportado(s)).")
-    if falhas == len(lista_dias):
+          f"({len(fatias)}/{len(lacunas.DEPOSITANTES_PARA_FATIAR)} fatia(s) exportada(s)).")
+    if not fatias:
         sys.exit(1)
 
 

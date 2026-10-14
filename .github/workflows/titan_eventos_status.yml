@@ -17,21 +17,24 @@ name: Titan eventos status por pedido
 # artifact titan_debug de sempre.
 on:
   schedule:
-    - cron: '*/30 * * * *'   # hoje + ontem (--dias 1)
-    - cron: '17 */6 * * *'   # ultimos 7 dias de importacao (--dias 7)
+    - cron: '7 * * * *'   # de hora em hora (minuto 7: fora do pico do :00) - hoje e 2 dias antes
   workflow_dispatch:
     inputs:
       dias_atras:
-        description: 'Dias de Data Importado antes de hoje (vazio = 7, maximo 8). Cada dia e uma exportacao (~2 min)'
+        description: 'Data Inicial = hoje menos N dias (vazio = 2, maximo 8). Mais dias podem passar de 150 mil linhas por fatia'
         required: false
         type: string
+
+concurrency:
+  group: titan-eventos-status
+  cancel-in-progress: false
 
 jobs:
   eventos-status:
     runs-on: ubuntu-latest
     # Generoso de proposito ate termos um numero real medido neste repo -
     # ver aviso grande acima.
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
@@ -57,16 +60,11 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
           DIAS_INPUT: ${{ github.event.inputs.dias_atras }}
         run: |
-          # agendado a cada 30 min = hoje + ontem; agendado de 6 em 6 h = 7 dias;
-          # manual (workflow_dispatch) = o informado, vazio = 7
-          case "$SCHEDULE" in
-            "*/30 * * * *") DIAS=1 ;;
-            "17 */6 * * *") DIAS=7 ;;
-            *) DIAS="${DIAS_INPUT:-7}" ;;
-          esac
-          case "$DIAS" in ''|*[!0-9]*) DIAS=7 ;; esac
+          # agendado (de hora em hora) = 2 dias; manual = o informado, vazio = 2
+          DIAS="${DIAS_INPUT:-2}"
+          case "$DIAS" in ''|*[!0-9]*) DIAS=2 ;; esac
           if [ "$DIAS" -gt 8 ]; then DIAS=8; fi
-          echo "Janela: hoje + $DIAS dia(s) de Data Importado"
+          echo "Janela: Data Inicial = hoje - $DIAS dia(s)"
           python titan_eventos_status.py --headless --dias "$DIAS"
 
       # Ultima exportacao de eventos (xlsx) pra conferencia manual.
