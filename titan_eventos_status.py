@@ -27,7 +27,7 @@ exportacao traz o historico completo de eventos dos pedidos importados na
 janela (ver _exportar_eventos_dia). Por isso a rodada exporta UM DIA de Data
 Importado por vez (hoje e ate --dias dias antes; padrao 1 = hoje e ontem) e
 grava cada dia logo apos exportar. O workflow roda --dias 1 a cada 30 min e
---dias 7 de 3 em 3 horas (pedidos embarcam ate uma semana depois de
+--dias 7 de 6 em 6 horas (pedidos embarcam ate uma semana depois de
 importados, e so entao ganham o evento EMBARCADO).
 
 MESCLA EM VEZ DE SUBSTITUIR (pedido direto da Maria, 28/09/2026): a coluna
@@ -136,7 +136,28 @@ def _abrir_aba_status(page):
     return frame
 
 
-def _exportar_eventos_dia(frame, dia):
+def _exportar_uma(frame, dia, rotulo_arquivo, depositante=None):
+    """Define o periodo (e, se pedido, o Depositante), exporta e le UM xlsx."""
+    data_str = dia.strftime("%d/%m/%Y")
+    lacunas._definir_periodo_evento(frame, data_str, data_str)
+    if depositante:
+        lacunas._filtrar_depositante(frame, depositante)
+    caminho = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
+    # scraper.ler_export_xlsx devolve (filtro_aplicado, registros) neste
+    # repo - filtro_aplicado nao e usado aqui de proposito, mesmo criterio
+    # ja aplicado em titan_preencher_lacunas.etapa2_exportar_eventos_fatia.
+    _filtro_aplicado, registros = scraper.ler_export_xlsx(caminho)
+    truncou = scraper.ultimo_aviso_exportacao is not None
+    # O xlsx fica em titan_exports/ (sobe como artifact no workflow) pra
+    # conferir a exportacao - 14/10/2026, pedido direto da Maria.
+    try:
+        caminho.rename(PASTA_EXPORTS / f"eventos_{rotulo_arquivo}.xlsx")
+    except OSError:
+        pass
+    return lacunas._checar_truncamento(registros), truncou
+
+
+def _exportar_eventos_dia(page, dia):
     """
     Exporta 'Informação Pedido' da aba Status por Pedido pra UM dia de
     Data Importado (Data Inicial = Data Final = dia).
@@ -149,27 +170,35 @@ def _exportar_eventos_dia(frame, dia):
     tinham o evento EMBARCADO nela. Por isso "so a partir de hoje" (versao
     de 14/10) e "a partir de ontem" (versao anterior) nunca atualizavam o
     evento de um pedido importado antes - ficava preso no ultimo evento
-    que ele tinha na epoca. Um dia por exportacao tambem mantem cada
-    arquivo bem abaixo do teto de 150 mil linhas do Power BI.
+    que ele tinha na epoca.
+
+    TRUNCAMENTO: um dia de importacao com todo o historico de eventos pode
+    passar do teto de 150 mil linhas do Power BI (achado real, 14/10/2026,
+    run #78: varios dias truncaram) - e o corte derruba justamente os
+    eventos mais recentes (EMBARCADO). Quando truncar, descarta essa
+    exportacao e refaz fatiando por Depositante (DEPOSITANTES_PARA_FATIAR,
+    mesmo criterio de titan_preencher_lacunas.etapa2_exportar_eventos_fatia).
+    Cada exportacao reabre o dashboard do zero (get_dashboard_frame faz
+    page.goto) pra nenhum filtro de Depositante vazar pra proxima.
     """
-    data_str = dia.strftime("%d/%m/%Y")
-    lacunas._definir_periodo_evento(frame, data_str, data_str)
-    caminho = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
-    # scraper.ler_export_xlsx devolve (filtro_aplicado, registros) neste
-    # repo - filtro_aplicado nao e usado aqui de proposito, mesmo criterio
-    # ja aplicado em titan_preencher_lacunas.etapa2_exportar_eventos_fatia.
-    _filtro_aplicado, registros = scraper.ler_export_xlsx(caminho)
-    # O xlsx fica em titan_exports/ (sobe como artifact no workflow) pra
-    # conferir a exportacao - 14/10/2026, pedido direto da Maria. Um arquivo
-    # por dia de importacao.
-    try:
-        caminho.rename(PASTA_EXPORTS / f"eventos_{dia.strftime('%d-%m-%Y')}.xlsx")
-    except OSError:
-        pass
-    if scraper.ultimo_aviso_exportacao:
-        print(f"AVISO: exportacao de {data_str} TRUNCADA pelo Power BI ({scraper.ultimo_aviso_exportacao!r}, "
-              f"{len(registros)} linha(s)) - os eventos mais recentes ficaram de fora.", file=sys.stderr)
-    return lacunas._checar_truncamento(registros)
+    nome = dia.strftime("%d-%m-%Y")
+    frame = _abrir_aba_status(page)
+    registros, truncou = _exportar_uma(frame, dia, nome)
+    if not truncou:
+        return registros
+
+    print(f"  AVISO: {dia.strftime('%d/%m/%Y')} truncou ({len(registros)} linha(s)) - refazendo por Depositante.", file=sys.stderr)
+    todos = []
+    for dep in lacunas.DEPOSITANTES_PARA_FATIAR:
+        try:
+            frame = _abrir_aba_status(page)
+            regs, trunc_dep = _exportar_uma(frame, dia, f"{nome}_{dep.replace(' ', '_')}", depositante=dep)
+        except Exception as e:
+            print(f"  ERRO fatia {dep} de {dia.strftime('%d/%m/%Y')}, pulando - {e}", file=sys.stderr)
+            continue
+        print(f"  fatia {dep}: {len(regs)} linha(s){' - TRUNCOU AINDA' if trunc_dep else ''}.")
+        todos.extend(regs)
+    return todos
 
 
 def _agrupar_por_pedido(registros):
@@ -247,23 +276,47 @@ def _montar_payloads(por_pedido, existentes):
     return payloads
 
 
+def _upsert_um_lote(lote):
+    """POST de um lote; devolve (gravados, erro_texto|None)."""
+    url = f"{titan_watcher.SUPABASE_URL}/rest/v1/{TABELA}?on_conflict=nota_fiscal_saida_numero,numero"
+    data = json.dumps(lote).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("apikey", titan_watcher.SUPABASE_KEY)
+    req.add_header("Authorization", f"Bearer {titan_watcher.SUPABASE_KEY}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+        return len(lote), None
+    except urllib.error.HTTPError as e:
+        return 0, e.read().decode("utf-8", errors="replace")[:500]
+    except (urllib.error.URLError, TimeoutError) as e:
+        return 0, str(e)
+
+
+def _upsert_lote_dividindo(lote):
+    """
+    Cada linha gravada aqui dispara triggers no Supabase (sync pra
+    infos_titan, regra da situacao, espelho de volta) e o papel anon tem
+    statement_timeout de 3s - um lote de 200 estourou (57014) varias vezes
+    em 14/10/2026 e essas linhas se perdiam. Ao falhar, divide o lote ao
+    meio e tenta de novo, ate chegar numa linha so.
+    """
+    gravados, erro = _upsert_um_lote(lote)
+    if erro is None:
+        return gravados
+    if len(lote) == 1:
+        print(f"ERRO gravando 1 linha ({lote[0].get('nota_fiscal_saida_numero')}/{lote[0].get('numero')}): {erro}", file=sys.stderr)
+        return 0
+    meio = len(lote) // 2
+    return _upsert_lote_dividindo(lote[:meio]) + _upsert_lote_dividindo(lote[meio:])
+
+
 def _upsert_lote(registros):
     gravados = 0
-    for lote in lacunas._chunks(registros, 200):
-        url = f"{titan_watcher.SUPABASE_URL}/rest/v1/{TABELA}?on_conflict=nota_fiscal_saida_numero,numero"
-        data = json.dumps(lote).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header("apikey", titan_watcher.SUPABASE_KEY)
-        req.add_header("Authorization", f"Bearer {titan_watcher.SUPABASE_KEY}")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp.read()
-            gravados += len(lote)
-        except urllib.error.HTTPError as e:
-            corpo = e.read().decode("utf-8", errors="replace")[:500]
-            print(f"ERRO no lote de upsert ({len(lote)} linha(s)): {corpo}", file=sys.stderr)
+    for lote in lacunas._chunks(registros, 100):
+        gravados += _upsert_lote_dividindo(lote)
     return gravados
 
 
@@ -301,11 +354,10 @@ def main():
         try:
             print("Entrando no Titan BI...")
             scraper.login(page, email, senha)
-            frame = _abrir_aba_status(page)
             for dia in lista_dias:
                 print(f"Exportando 'Status por Pedido' - Data Importado {dia.strftime('%d/%m/%Y')}...")
                 try:
-                    registros = _exportar_eventos_dia(frame, dia)
+                    registros = _exportar_eventos_dia(page, dia)
                 except Exception as e:
                     falhas += 1
                     print(f"  ERRO exportando {dia.strftime('%d/%m/%Y')}, pulando este dia - {e}", file=sys.stderr)

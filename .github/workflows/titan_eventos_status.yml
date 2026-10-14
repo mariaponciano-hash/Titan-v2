@@ -18,7 +18,7 @@ name: Titan eventos status por pedido
 on:
   schedule:
     - cron: '*/30 * * * *'   # hoje + ontem (--dias 1)
-    - cron: '17 */3 * * *'   # ultimos 7 dias de importacao (--dias 7)
+    - cron: '17 */6 * * *'   # ultimos 7 dias de importacao (--dias 7)
   workflow_dispatch:
     inputs:
       dias_atras:
@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     # Generoso de proposito ate termos um numero real medido neste repo -
     # ver aviso grande acima.
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
 
@@ -57,11 +57,11 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
           DIAS_INPUT: ${{ github.event.inputs.dias_atras }}
         run: |
-          # agendado a cada 30 min = hoje + ontem; agendado de 3 em 3 h = 7 dias;
+          # agendado a cada 30 min = hoje + ontem; agendado de 6 em 6 h = 7 dias;
           # manual (workflow_dispatch) = o informado, vazio = 7
           case "$SCHEDULE" in
             "*/30 * * * *") DIAS=1 ;;
-            "17 */3 * * *") DIAS=7 ;;
+            "17 */6 * * *") DIAS=7 ;;
             *) DIAS="${DIAS_INPUT:-7}" ;;
           esac
           case "$DIAS" in ''|*[!0-9]*) DIAS=7 ;; esac
