@@ -50,6 +50,16 @@ jobs:
           TITAN_SENHA: ${{ secrets.TITAN_SENHA }}
         run: python titan_eventos_status.py --headless
 
+      # Ultima exportacao de eventos (xlsx) pra conferencia manual.
+      - name: Subir ultima exportacao de eventos
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eventos_ultima_exportacao
+          path: titan_exports/
+          retention-days: 2
+          if-no-files-found: ignore
+
       # O runner some ao fim do job - sem isso, o print/HTML que
       # salvar_diagnostico() grava em titan_debug/ ficaria inacessivel.
       - name: Subir diagnostico (se tiver)

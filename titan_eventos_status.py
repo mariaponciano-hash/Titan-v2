@@ -161,10 +161,23 @@ def _exportar_eventos(page, data_inicial):
     # repo - filtro_aplicado nao e usado aqui de proposito, mesmo criterio
     # ja aplicado em titan_preencher_lacunas.etapa2_exportar_eventos_fatia.
     _filtro_aplicado, registros = scraper.ler_export_xlsx(caminho)
-    try:
-        caminho.unlink()
-    except OSError:
-        pass
+    # O xlsx fica em titan_exports/ (sobe como artifact no workflow) pra
+    # poder conferir a ultima exportacao - 14/10/2026, pedido direto da
+    # Maria. Mantem so a mais recente: apaga as anteriores.
+    for antigo in PASTA_EXPORTS.glob("*.xlsx"):
+        if antigo != caminho:
+            try:
+                antigo.unlink()
+            except OSError:
+                pass
+    # Distribuicao por dia dos eventos exportados - pra ver no log se o
+    # filtro de Data Inicial esta valendo (esperado: so hoje).
+    contagem_dias = {}
+    for r in registros:
+        d = str(r.get("Data_Evento") or r.get("Data Evento") or "")[:10]
+        contagem_dias[d] = contagem_dias.get(d, 0) + 1
+    print(f"Exportacao: {len(registros)} linha(s); filtro Data Inicial={data_str}; "
+          f"linhas por dia do evento: {dict(sorted(contagem_dias.items()))}")
     if scraper.ultimo_aviso_exportacao:
         # O corte do Power BI derruba os eventos mais recentes (ver
         # _data_inicial_do_filtro). Grava o que veio - a mescla nunca apaga
