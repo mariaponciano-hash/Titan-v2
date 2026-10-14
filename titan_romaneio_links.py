@@ -130,6 +130,14 @@ PAGINA = 1000
 # ha cursor salvo (primeira execucao, ou logo apos uma volta completa) -
 # ver CURSOR PERSISTIDO no docstring acima.
 JANELA_DIAS = 45
+# Romaneios com numero menor que este nao tem PDF na pasta Romaneios do Drive
+# (14/10/2026, pedido direto da Maria - "vamos esquecer esses mais antigos"):
+# as subpastas de transportadora foram criadas em 21/09/2026 e o PDF mais
+# antigo la e de 22/09 (romaneio ~179.4xx). Uma run de 14/10 gastou os 25min
+# inteiros (79 mil pedidos, 3.135 romaneios 177xxx-178xxx) sem achar nenhum.
+# Todos os romaneios tem 6 digitos, entao a comparacao de texto do PostgREST
+# (gte) equivale a comparacao numerica.
+ROMANEIO_MINIMO = 179400
 
 
 def _http_json(method, url, headers=None, data=None, form=False, tentativas=3):
@@ -217,6 +225,7 @@ def resetar_cursor():
 def buscar_pagina(cutoff, operador):
     q = (
         f"{TABELA}?situacao=eq.EMBARCADO&romaneio=not.is.null"
+        f"&romaneio=gte.{ROMANEIO_MINIMO}"
         f"&romaneio_link=is.null&atualizado_em={operador}.{urllib.parse.quote(cutoff)}"
         f"&select=numero_nf,marca,romaneio,atualizado_em"
         f"&order=atualizado_em.asc&limit={PAGINA}"
