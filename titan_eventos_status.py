@@ -25,7 +25,7 @@ FILTRO DE DATA (corrigido 14/10/2026): o filtro "Data Inicial - Data Final"
 desta aba e a data de IMPORTACAO do pedido, nao a data do evento, e a Data
 Final e sempre hoje - cada exportacao traz o historico completo de eventos
 dos pedidos importados de Data Inicial ate hoje (ver
-_exportar_janela_por_depositante). A rodada usa Data Inicial = hoje - 2 dias
+_exportar_fatia). A rodada usa Data Inicial = hoje - 2 dias
 (--dias 2, padrao) e fatia por Depositante pra ficar abaixo do teto de 150 mil
 linhas do Power BI. O workflow roda de hora em hora.
 
@@ -69,6 +69,16 @@ import titan_watcher  # reusa _supabase_request/SUPABASE_URL/SUPABASE_KEY
 
 TABELA = "eventos_titan"
 PASTA_EXPORTS = Path(__file__).parent / "titan_exports"
+
+# Ordem das fatias (19/10/2026, achado real: a rodada das 10:01 gravou so
+# APICE RJ e BEAUTY HUB RJ - as fatias grandes ficaram de fora e a rodada
+# passou como "sucesso"). As GRANDES vem primeiro: se o job for interrompido
+# (timeout, queda), o que mais importa ja foi gravado. APICE ES fica por
+# ultimo: desde 10/10 nao ha pedido nenhum com esse depositante (a Apice
+# passou a sair por APICE RJ), entao a fatia falha em toda rodada e perde
+# minutos - mantida so pra o caso de a Apice voltar pro ES.
+FATIAS_GRANDES = ["GOBEAUTY ES", "BEAUTY HUB ES"]
+ORDEM_FATIAS = FATIAS_GRANDES + ["BEAUTY HUB RJ", "APICE RJ", "APICE ES"]
 
 
 def _hoje_brt():
@@ -155,10 +165,10 @@ def _exportar_uma(frame, dia, rotulo_arquivo, depositante=None):
     return lacunas._checar_truncamento(registros), truncou
 
 
-def _exportar_janela_por_depositante(page, data_inicial, hoje):
+def _exportar_fatia(page, dep, data_inicial, hoje):
     """
-    Exporta 'Informação Pedido' da aba Status por Pedido, uma vez por
-    Depositante, com Data Inicial = data_inicial (a Data Final e sempre hoje).
+    Exporta 'Informação Pedido' da aba Status por Pedido pra UM Depositante
+    (dep), com Data Inicial = data_inicial (a Data Final e sempre hoje).
 
     ACHADOS REAIS (14/10/2026, planilhas da run #78):
     - O filtro de data desta aba e a data de IMPORTACAO do pedido, nao a do
@@ -177,35 +187,25 @@ def _exportar_janela_por_depositante(page, data_inicial, hoje):
       reabre o dashboard do zero (get_dashboard_frame faz page.goto) pra
       nenhum filtro vazar pra proxima.
 
-    Devolve [(depositante, registros)] das fatias que deram certo.
+    Devolve (registros, truncou) de UMA fatia; levanta excecao se a fatia
+    falhar (quem chama decide o que fazer - ver main).
     """
     nome = data_inicial.strftime("%d-%m-%Y")
-    fatias = []
-    for dep in lacunas.DEPOSITANTES_PARA_FATIAR:
-        try:
-            frame = _abrir_aba_status(page)
-            lacunas._definir_periodo_evento(frame, data_inicial.strftime("%d/%m/%Y"), hoje.strftime("%d/%m/%Y"))
-            lacunas._filtrar_depositante(frame, dep)
-            caminho = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
-            # scraper.ler_export_xlsx devolve (filtro_aplicado, registros) neste
-            # repo - filtro_aplicado nao e usado aqui de proposito.
-            _filtro_aplicado, registros = scraper.ler_export_xlsx(caminho)
-            truncou = scraper.ultimo_aviso_exportacao is not None
-            # O xlsx fica em titan_exports/ (sobe como artifact no workflow)
-            # pra conferir a exportacao - pedido direto da Maria, 14/10/2026.
-            try:
-                caminho.rename(PASTA_EXPORTS / f"eventos_{nome}_{dep.replace(' ', '_')}.xlsx")
-            except OSError:
-                pass
-            registros = lacunas._checar_truncamento(registros)
-        except Exception as e:
-            print(f"ERRO na fatia {dep}, pulando - {e}", file=sys.stderr)
-            continue
-        print(f"  {dep}: {len(registros)} linha(s){' - TRUNCOU (as NFs mais novas desta fatia ficaram de fora)' if truncou else ''}.")
-        if truncou:
-            print(f"AVISO: fatia {dep} truncada pelo Power BI - reduza --dias.", file=sys.stderr)
-        fatias.append((dep, registros))
-    return fatias
+    frame = _abrir_aba_status(page)
+    lacunas._definir_periodo_evento(frame, data_inicial.strftime("%d/%m/%Y"), hoje.strftime("%d/%m/%Y"))
+    lacunas._filtrar_depositante(frame, dep)
+    caminho = scraper.exportar_dados_do_painel(frame, "Informação Pedido", PASTA_EXPORTS)
+    # scraper.ler_export_xlsx devolve (filtro_aplicado, registros) neste
+    # repo - filtro_aplicado nao e usado aqui de proposito.
+    _filtro_aplicado, registros = scraper.ler_export_xlsx(caminho)
+    truncou = scraper.ultimo_aviso_exportacao is not None
+    # O xlsx fica em titan_exports/ (sobe como artifact no workflow)
+    # pra conferir a exportacao - pedido direto da Maria, 14/10/2026.
+    try:
+        caminho.rename(PASTA_EXPORTS / f"eventos_{nome}_{dep.replace(' ', '_')}.xlsx")
+    except OSError:
+        pass
+    return lacunas._checar_truncamento(registros), truncou
 
 
 def _agrupar_por_pedido(registros):
@@ -354,25 +354,52 @@ def main():
     data_inicial = hoje - datetime.timedelta(days=dias)
     print(f"Janela de Data Importado: {data_inicial.strftime('%d/%m/%Y')} ate {hoje.strftime('%d/%m/%Y')} ({dias} dia(s) antes de hoje), fatiada por Depositante.")
 
+    total_gravados = 0
+    ok = []          # fatias exportadas e gravadas
+    falharam = []    # (dep, motivo) - excecao na fatia
+    truncadas = []   # fatias que bateram no teto de 150 mil linhas (gravadas, mas incompletas)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
         page = browser.new_page()
         try:
             print("Entrando no Titan BI...")
             scraper.login(page, email, senha)
-            fatias = _exportar_janela_por_depositante(page, data_inicial, hoje)
+            for dep in ORDEM_FATIAS:
+                print(f"=== Fatia {dep} ===")
+                try:
+                    registros, truncou = _exportar_fatia(page, dep, data_inicial, hoje)
+                except Exception as e:
+                    print(f"ERRO na fatia {dep}, pulando - {e}", file=sys.stderr)
+                    falharam.append((dep, str(e)[:200]))
+                    continue
+                print(f"  {dep}: {len(registros)} linha(s){' - TRUNCOU (as NFs mais novas desta fatia ficaram de fora)' if truncou else ''}.")
+                if truncou:
+                    print(f"AVISO: fatia {dep} truncada pelo Power BI - reduza --dias.", file=sys.stderr)
+                    truncadas.append(dep)
+                # Grava ja (nao no fim): uma rodada interrompida no meio nao
+                # perde o que as fatias anteriores ja exportaram. A mescla com
+                # o que ja existe e por pedido.
+                print(f"Gravando {dep}...")
+                total_gravados += _gravar_registros(registros)
+                ok.append(dep)
         finally:
             browser.close()
 
-    total_gravados = 0
-    for dep, registros in fatias:
-        # grava cada fatia separadamente (a mescla com o que ja existe e por pedido)
-        print(f"Gravando {dep}...")
-        total_gravados += _gravar_registros(registros)
-
     print(f"Concluido - {total_gravados} pedido(s) gravado(s)/atualizado(s) em {TABELA} "
-          f"({len(fatias)}/{len(lacunas.DEPOSITANTES_PARA_FATIAR)} fatia(s) exportada(s)).")
-    if not fatias:
+          f"({len(ok)}/{len(ORDEM_FATIAS)} fatia(s) gravada(s): {', '.join(ok) or 'nenhuma'}).")
+    if falharam:
+        print("Fatias que falharam: " + "; ".join(f"{d} ({m})" for d, m in falharam), file=sys.stderr)
+
+    # Falha VISIVEL no Actions (antes so saia com erro se NENHUMA fatia desse
+    # certo - rodada parcial passava como sucesso): erro se alguma fatia GRANDE
+    # falhou ou truncou. As pequenas/APICE ES so avisam (APICE ES falha sempre
+    # enquanto a Apice sair por APICE RJ - ver FATIAS_GRANDES).
+    grandes_com_problema = [d for d, _ in falharam if d in FATIAS_GRANDES] + [d for d in truncadas if d in FATIAS_GRANDES]
+    if grandes_com_problema:
+        print("ERRO: fatia(s) grande(s) com problema (falha ou truncamento): " + ", ".join(sorted(set(grandes_com_problema))), file=sys.stderr)
+        sys.exit(1)
+    if not ok:
         sys.exit(1)
 
 
