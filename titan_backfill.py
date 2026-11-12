@@ -491,8 +491,8 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
     """
     Faz um export + upsert de 'Informação Pedido' pro periodo
     (data_inicial, data_final) inteiro. Devolve (gravados, ignorados,
-    lotes_com_erro) - (0, 0, 0) se o filtro de periodo nunca bater mesmo
-    apos `tentativas` (ver _validar_filtro_aplicado - melhor pular esta
+    lotes_com_erro) - None se o filtro de periodo nunca bater mesmo
+    apos `tentativas` (main() termina com erro) (ver _validar_filtro_aplicado - melhor pular esta
     rodada e tentar de novo na proxima do que arriscar gravar dado de um
     periodo errado ou incompleto).
 
@@ -563,7 +563,11 @@ def exportar_e_gravar_periodo(frame, data_inicial, data_final, tentativas=2):
               f"esse dia fica pra proxima rodada do backfill (nao grava nada agora, pra nao arriscar "
               f"gravar dado de um periodo errado). Ver titan_debug/periodo_definido_{data_inicial.replace('/', '-')}_t*"
               f" no artifact do job pra diagnosticar.", file=sys.stderr)
-        return 0, 0, 0
+        # None (e nao (0, 0, 0)) pra main() terminar com erro: de 10/11 a
+        # 12/11/2026 a janela de 7 dias passou do teto de 150 mil linhas, o
+        # backfill descartou tudo em toda rodada e o job seguia "sucesso" no
+        # GitHub - ninguem viu a infos_titan parada por 2 dias.
+        return None
 
     print(f"{len(registros)} linha(s) encontradas no periodo.")
     if not registros:
@@ -726,11 +730,18 @@ def main():
             # linhas - exportar por dia so multiplicava o tempo do job sem
             # necessidade. _validar_filtro_aplicado ainda pega qualquer
             # truncamento de verdade (volume real crescendo no futuro),
-            # devolvendo (0, 0, 0) sem gravar nada errado.
+            # devolvendo None sem gravar nada errado (e o job falha).
             print(f"Exportando periodo {args.data_inicial} - {args.data_final}...")
-            gravados_total, ignorados_total, lotes_com_erro_total = exportar_e_gravar_periodo(
-                frame, args.data_inicial, args.data_final
-            )
+            resultado = exportar_e_gravar_periodo(frame, args.data_inicial, args.data_final)
+            if resultado is None:
+                # Falha de proposito (12/11/2026): nada foi gravado. Com o job
+                # vermelho no GitHub a quebra aparece, em vez de passar como
+                # "sucesso" com 0 pedidos. Se o motivo for truncamento,
+                # diminuir a janela (dias_atras) no titan_backfill.yml.
+                print("\nFALHOU - nenhum pedido gravado: o periodo nao foi aplicado ou a exportacao veio "
+                      "truncada (teto de 150 mil linhas do Power BI). Ver AVISO acima.", file=sys.stderr)
+                sys.exit(1)
+            gravados_total, ignorados_total, lotes_com_erro_total = resultado
 
             print(f"\nConcluido - {gravados_total} pedido(s) gravados no Supabase.")
             if lotes_com_erro_total:

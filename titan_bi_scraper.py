@@ -550,6 +550,8 @@ def _formatar_data_para_titan(data_str):
 # "Start date"/"End date"/"Select all"/"Previous month" etc.). Indice 0 =
 # janeiro.
 MESES_ABREV_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+MESES_COMPLETOS_EN = ["January", "February", "March", "April", "May", "June", "July", "August",
+                      "September", "October", "November", "December"]
 
 
 def _clicar_seta_calendario(frame, anterior, timeout_ms=5000, registrar=None):
@@ -656,7 +658,23 @@ def _selecionar_mes_ano_calendario(frame, mes, ano, registrar=None):
     else:
         raise PWTimeout(f"Nao consegui navegar ate o ano {ano} no seletor de mes/ano")
 
-    _clicar_celula_calendario(frame, MESES_ABREV_EN[mes - 1], registrar=registrar, nome_passo="mes_selecionado")
+    # CORRIGIDO (04/11/2026, backfill gravando 0 pedidos desde 28/10 - HTML
+    # real em titan_debug/set_filtro_data_nao_encontrado.html): na grade de
+    # MESES cada mes e <div role="gridcell" class="month-cell"
+    # aria-label="November 2026"> Nov </div>, nao um <button> - por isso o
+    # seletor generico de _clicar_celula_calendario (so "button") nunca achava
+    # o mes. Agora clica pela aria-label exata ("<Month> <ano>"); o caminho
+    # antigo fica de reserva caso o Power BI volte a usar botao.
+    celula_mes = frame.locator(
+        f'.month-cell[aria-label="{MESES_COMPLETOS_EN[mes - 1]} {ano}"]:not([aria-disabled="true"])'
+    )
+    try:
+        elemento_visivel(celula_mes, timeout_ms=8000).dispatch_event("click")
+        time.sleep(0.4)
+        if registrar:
+            registrar("mes_selecionado")
+    except PWTimeout:
+        _clicar_celula_calendario(frame, MESES_ABREV_EN[mes - 1], registrar=registrar, nome_passo="mes_selecionado")
 
 
 def definir_periodo(frame, data_inicial, data_final, pasta_registro=None):
