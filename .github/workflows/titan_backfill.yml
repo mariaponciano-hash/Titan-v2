@@ -62,7 +62,7 @@ on:
   workflow_dispatch:   # permite rodar manualmente pela aba Actions, pra testar
     inputs:
       dias_atras:
-        description: 'Quantos dias pra tras da Data Importado (vazio = 4, maximo 5 - acima disso estoura o teto de 150 mil linhas do Power BI)'
+        description: 'Quantos dias pra tras da Data Importado (vazio = 3, maximo 4 - acima disso estoura o teto de 150 mil linhas do Power BI)'
         required: false
         type: string
 
@@ -101,14 +101,18 @@ jobs:
       # em diante a exportacao veio truncada em toda rodada - o backfill
       # descartava tudo e a infos_titan ficou parada de 10/11 09h a 12/11.
       # 4 dias (5 datas) ficam em ~100 mil; maximo aceito agora e 5.
+      # JANELA DE 3 DIAS (12/11/2026, mesmo dia): as rodadas reais de 12/11
+      # leram ~25 mil linhas por data - 4 dias deram 126.795 linhas (85% do
+      # teto) e 5 dias 149.009 (a menos de mil do teto). Com o volume da Black
+      # Friday isso trunca. 3 dias (4 datas) ficam em ~100 mil; maximo agora 4.
       - name: Calcular janela
         id: janela
         env:
           DIAS_INPUT: ${{ github.event.inputs.dias_atras }}
         run: |
-          DIAS="${DIAS_INPUT:-4}"
-          case "$DIAS" in ''|*[!0-9]*) echo "dias_atras invalido ($DIAS) - usando 4"; DIAS=4 ;; esac
-          if [ "$DIAS" -gt 5 ]; then echo "dias_atras=$DIAS acima do maximo seguro (5) - usando 5"; DIAS=5; fi
+          DIAS="${DIAS_INPUT:-3}"
+          case "$DIAS" in ''|*[!0-9]*) echo "dias_atras invalido ($DIAS) - usando 3"; DIAS=3 ;; esac
+          if [ "$DIAS" -gt 4 ]; then echo "dias_atras=$DIAS acima do maximo seguro (4) - usando 4"; DIAS=4; fi
           if [ "$DIAS" -lt 1 ]; then DIAS=1; fi
           echo "Janela: $DIAS dia(s) pra tras"
           echo "inicial=$(date -d "-$DIAS days" +'%d/%m/%Y')" >> "$GITHUB_OUTPUT"
