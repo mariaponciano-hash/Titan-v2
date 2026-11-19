@@ -1,0 +1,70 @@
+name: Titan numero do pedido
+
+# Desde o fim de outubro de 2026 o Titan exporta a coluna "Numero do Pedido" so
+# com a NF, sem o SH da Torre, e infos_titan.numero_pedido ficou vazio nos
+# pedidos novos (o Portal de Cancelamento e o bot procuram por ele). Este job
+# preenche o numero_pedido pelo Data Mart da Intelipost logo depois de cada
+# carga do Titan, sem mexer no titan_backfill.py (que fica identico ao do
+# Titan-v2). Ver o cabecalho do titan_numero_pedido.py.
+#
+# Travas (revisao por IA do PR #23):
+# - So roda o codigo da main: o "Run workflow" em outra branch e a carga de
+#   outra branch nao disparam o job, e o checkout e sempre da main.
+# - So grava com a variavel do repositorio TITAN_NUMERO_PEDIDO_GRAVAR = 1
+#   (Settings > Secrets and variables > Actions > Variables). Sem ela, toda
+#   rodada e simulacao. Teto de gravacoes por rodada (padrao 50 mil).
+on:
+  workflow_run:
+    workflows: ['Titan backfill diario']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      dias:
+        description: 'Dias para tras pela data de criacao no Data Mart (vazio = 7, maximo 45)'
+        required: false
+        default: ''
+      limite:
+        description: 'Teto de gravacoes nesta rodada (vazio = 50000, maximo 200000)'
+        required: false
+        default: ''
+      simular:
+        description: 'So contar o que seria gravado, sem gravar'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: titan-numero-pedido
+  cancel-in-progress: false
+
+jobs:
+  numero-pedido:
+    # Depois de uma carga que falhou nao ha pedido novo para casar.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Testes dos scripts
+        run: python -m unittest discover -s tests/python
+
+      - name: Rodar
+        env:
+          METABASE_KEY_GOBEAUTE: ${{ secrets.METABASE_KEY_GOBEAUTE }}
+          GRAVAR: ${{ vars.TITAN_NUMERO_PEDIDO_GRAVAR }}
+          DIAS: ${{ github.event.inputs.dias }}
+          LIMITE: ${{ github.event.inputs.limite }}
+          SIMULAR: ${{ github.event.inputs.simular == 'true' && '1' || '' }}
+        run: python titan_numero_pedido.py
