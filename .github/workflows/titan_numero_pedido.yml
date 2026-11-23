@@ -62,7 +62,10 @@ jobs:
 
       - name: Rodar
         env:
-          METABASE_KEY_GOBEAUTE: ${{ secrets.METABASE_KEY_GOBEAUTE }}
+          # Neste repo (Titan-v2) a chave do Metabase da Gobeaute ja existe como
+          # METABASE_API_KEY (a do titan_preencher_lacunas.py). Usa ela quando o
+          # METABASE_KEY_GOBEAUTE nao esta cadastrado (23/11/2026, pedido da Ivna).
+          METABASE_KEY_GOBEAUTE: ${{ secrets.METABASE_KEY_GOBEAUTE || secrets.METABASE_API_KEY }}
           GRAVAR: ${{ vars.TITAN_NUMERO_PEDIDO_GRAVAR }}
           DIAS: ${{ github.event.inputs.dias }}
           LIMITE: ${{ github.event.inputs.limite }}
